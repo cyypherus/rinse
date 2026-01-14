@@ -101,53 +101,28 @@ impl LinkProof {
     }
 }
 
-// Link RTT: 99 bytes on wire
-// Context: LinkRtt (0xFE)
-// Data: 64 bytes of timing data
-pub(crate) struct LinkRtt {
-    pub data: [u8; 64],
+pub(crate) const KEEPALIVE_REQUEST: u8 = 0xFF;
+pub(crate) const KEEPALIVE_RESPONSE: u8 = 0xFE;
+
+const MSGPACK_FLOAT64: u8 = 0xcb;
+
+pub(crate) fn encode_rtt(seconds: f64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(9);
+    buf.push(MSGPACK_FLOAT64);
+    buf.extend_from_slice(&seconds.to_be_bytes());
+    buf
 }
 
-impl LinkRtt {
-    pub fn new(data: [u8; 64]) -> Self {
-        Self { data }
-    }
-
-    pub fn to_bytes(&self) -> Vec<u8> {
-        self.data.to_vec()
-    }
-
-    pub fn parse(data: &[u8]) -> Option<Self> {
-        if data.len() < 64 {
-            return None;
-        }
-        let mut arr = [0u8; 64];
-        arr.copy_from_slice(&data[..64]);
-        Some(Self { data: arr })
-    }
-}
-
-// Link Keepalive: 20 bytes on wire
-// Context: Keepalive (0xFA)
-// Data: 1 byte sequence number
-pub(crate) struct LinkKeepalive {
-    pub sequence: u8,
-}
-
-impl LinkKeepalive {
-    pub fn new(sequence: u8) -> Self {
-        Self { sequence }
-    }
-
-    pub fn to_bytes(&self) -> Vec<u8> {
-        vec![self.sequence]
-    }
-
-    pub fn parse(data: &[u8]) -> Option<Self> {
-        if data.is_empty() {
-            return None;
-        }
-        Some(Self { sequence: data[0] })
+pub(crate) fn decode_rtt(data: &[u8]) -> Option<f64> {
+    if data.len() >= 9 && data[0] == MSGPACK_FLOAT64 {
+        let bytes: [u8; 8] = data[1..9].try_into().ok()?;
+        Some(f64::from_be_bytes(bytes))
+    } else if data.len() >= 5 && data[0] == 0xca {
+        // float32
+        let bytes: [u8; 4] = data[1..5].try_into().ok()?;
+        Some(f32::from_be_bytes(bytes) as f64)
+    } else {
+        None
     }
 }
 
@@ -421,22 +396,27 @@ mod tests {
     }
 
     #[test]
-    fn link_keepalive_roundtrip() {
-        let keepalive = LinkKeepalive::new(42);
-        let bytes = keepalive.to_bytes();
-        let parsed = LinkKeepalive::parse(&bytes).unwrap();
-        assert_eq!(parsed.sequence, 42);
+    fn keepalive_constants() {
+        assert_eq!(super::KEEPALIVE_REQUEST, 0xFF);
+        assert_eq!(super::KEEPALIVE_RESPONSE, 0xFE);
     }
 
     #[test]
-    fn link_rtt_roundtrip() {
-        let mut data = [0u8; 64];
-        data[0] = 0xAB;
-        data[63] = 0xCD;
-        let rtt = LinkRtt::new(data);
-        let bytes = rtt.to_bytes();
-        let parsed = LinkRtt::parse(&bytes).unwrap();
-        assert_eq!(parsed.data[0], 0xAB);
-        assert_eq!(parsed.data[63], 0xCD);
+    fn rtt_encode_decode_roundtrip() {
+        let rtt = 0.05; // 50ms
+        let encoded = super::encode_rtt(rtt);
+        assert_eq!(encoded[0], 0xcb); // msgpack float64
+        let decoded = super::decode_rtt(&encoded).unwrap();
+        assert!((decoded - rtt).abs() < 1e-10);
+    }
+
+    #[test]
+    fn rtt_decode_float32() {
+        // msgpack float32: 0xca + big-endian f32
+        let rtt: f32 = 0.025;
+        let mut data = vec![0xca];
+        data.extend_from_slice(&rtt.to_be_bytes());
+        let decoded = super::decode_rtt(&data).unwrap();
+        assert!((decoded - 0.025).abs() < 1e-6);
     }
 }

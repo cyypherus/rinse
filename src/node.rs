@@ -433,13 +433,14 @@ impl<T: Transport, R: RngCore> Node<T, R> {
 
             // "It can now also use the X25519 public key contained in the link proof to perform
             // it's own Diffie Hellman Key Exchange and derive the symmetric key"
-            let rtt_ms = now.duration_since(pending.request_time).as_millis() as u32;
+            let rtt_secs = now.duration_since(pending.request_time).as_secs_f64();
             let mut established =
                 EstablishedLink::from_initiator(pending, &proof.encryption_public, now);
-            established.rtt_ms = Some(rtt_ms as u64);
+            established.rtt_ms = Some((rtt_secs * 1000.0) as u64);
             self.established_links.insert(link_id, established);
 
-            self.send_link_packet(link_id, Context::LinkRtt, &rtt_ms.to_be_bytes(), now);
+            let rtt_data = crate::link::encode_rtt(rtt_secs);
+            self.send_link_packet(link_id, Context::LinkRtt, &rtt_data, now);
             return;
         }
 
@@ -554,11 +555,9 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 if !link.is_initiator
                     && link.state == LinkState::Handshake
                     && let Some(plaintext) = link.decrypt(&packet.data)
-                    && plaintext.len() >= 4
+                    && let Some(rtt_secs) = crate::link::decode_rtt(&plaintext)
                 {
-                    let rtt_bytes: [u8; 4] = plaintext[..4].try_into().unwrap_or([0; 4]);
-                    let rtt_ms = u32::from_be_bytes(rtt_bytes) as u64;
-                    link.rtt_ms = Some(rtt_ms);
+                    link.rtt_ms = Some((rtt_secs * 1000.0) as u64);
                     link.state = LinkState::Active;
                     link.activated_at = Some(now);
                 }
@@ -567,9 +566,14 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             Context::Keepalive => {
                 if let Some(plaintext) = link.decrypt(&packet.data)
                     && !link.is_initiator
-                    && plaintext == [0xFF]
+                    && plaintext == [crate::link::KEEPALIVE_REQUEST]
                 {
-                    self.send_link_packet(link_id, Context::Keepalive, &[0xFE], now);
+                    self.send_link_packet(
+                        link_id,
+                        Context::Keepalive,
+                        &[crate::link::KEEPALIVE_RESPONSE],
+                        now,
+                    );
                 }
             }
 
@@ -773,7 +777,12 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         }
 
         for link_id in to_keepalive {
-            self.send_link_packet(link_id, Context::Keepalive, &[0xFF], now);
+            self.send_link_packet(
+                link_id,
+                Context::Keepalive,
+                &[crate::link::KEEPALIVE_REQUEST],
+                now,
+            );
         }
 
         for link_id in to_close {

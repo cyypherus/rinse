@@ -11,6 +11,11 @@ hkdf = "0.12.4"
 hmac = "0.12.1"
 log = "0.4"
 rand = "0.8"
+rmp-serde = "1.3"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_bytes = "0.11"
 sha2 = "0.10.9"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+
+[dev-dependencies]
+hex = "0.4"
