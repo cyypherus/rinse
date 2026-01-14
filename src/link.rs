@@ -1,10 +1,13 @@
+use std::time::Instant;
+
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+use rand::RngCore;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 use crate::Address;
-use crate::crypto::{sha256, sign, verify};
+use crate::crypto::{LinkEncryption, LinkKeys, sha256, sign, verify};
 
-pub(crate) type LinkId = [u8; 16];
+pub type LinkId = [u8; 16];
 
 // Link Request: 83 bytes on wire
 // Header Type 2, destination + transport_id addresses
@@ -41,8 +44,8 @@ impl LinkRequest {
         })
     }
 
-    pub fn link_id(&self, packet_bytes: &[u8]) -> LinkId {
-        sha256(packet_bytes)[..16].try_into().unwrap()
+    pub fn link_id(hashable_part: &[u8]) -> LinkId {
+        sha256(hashable_part)[..16].try_into().unwrap()
     }
 }
 
@@ -153,24 +156,54 @@ pub(crate) struct PendingLink {
     pub initiator_encryption_secret: StaticSecret,
     pub initiator_encryption_public: X25519Public,
     pub destination: Address,
+    pub request_time: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkState {
+    Handshake,
+    Active,
+    Stale,
+    Closed,
 }
 
 pub(crate) struct EstablishedLink {
     pub link_id: LinkId,
-    pub shared_key: [u8; 32],
     pub destination: Address,
+    pub is_initiator: bool,
+    pub state: LinkState,
+    pub activated_at: Option<Instant>,
+    pub last_inbound: Instant,
+    pub last_outbound: Instant,
+    pub rtt_ms: Option<u64>,
+    keys: LinkKeys,
 }
 
+const KEEPALIVE_MAX_SECS: u64 = 360;
+const KEEPALIVE_MIN_SECS: u64 = 5;
+const STALE_FACTOR: u64 = 2;
+
 impl EstablishedLink {
-    pub fn from_initiator(pending: PendingLink, responder_public: &X25519Public) -> Self {
+    pub fn from_initiator(
+        pending: PendingLink,
+        responder_public: &X25519Public,
+        now: Instant,
+    ) -> Self {
         let shared_key = pending
             .initiator_encryption_secret
             .diffie_hellman(responder_public)
             .to_bytes();
+        let keys = LinkEncryption::derive_keys(&shared_key, &pending.link_id);
         Self {
             link_id: pending.link_id,
-            shared_key,
             destination: pending.destination,
+            is_initiator: true,
+            state: LinkState::Active,
+            activated_at: Some(now),
+            last_inbound: now,
+            last_outbound: now,
+            rtt_ms: None,
+            keys,
         }
     }
 
@@ -179,13 +212,55 @@ impl EstablishedLink {
         responder_secret: &StaticSecret,
         initiator_public: &X25519Public,
         destination: Address,
+        now: Instant,
     ) -> Self {
         let shared_key = responder_secret.diffie_hellman(initiator_public).to_bytes();
+        let keys = LinkEncryption::derive_keys(&shared_key, &link_id);
         Self {
             link_id,
-            shared_key,
             destination,
+            is_initiator: false,
+            state: LinkState::Handshake,
+            activated_at: None,
+            last_inbound: now,
+            last_outbound: now,
+            rtt_ms: None,
+            keys,
         }
+    }
+
+    pub(crate) fn encrypt<R: RngCore>(&self, rng: &mut R, plaintext: &[u8]) -> Vec<u8> {
+        LinkEncryption::encrypt(rng, &self.keys, plaintext)
+    }
+
+    pub(crate) fn decrypt(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
+        LinkEncryption::decrypt(&self.keys, ciphertext)
+    }
+
+    pub(crate) fn touch_inbound(&mut self, now: Instant) {
+        self.last_inbound = now;
+        if self.state == LinkState::Stale {
+            self.state = LinkState::Active;
+        }
+    }
+
+    pub(crate) fn touch_outbound(&mut self, now: Instant) {
+        self.last_outbound = now;
+    }
+
+    pub(crate) fn keepalive_interval_secs(&self) -> u64 {
+        if let Some(rtt_ms) = self.rtt_ms {
+            // rtt * (KEEPALIVE_MAX / KEEPALIVE_MAX_RTT) where KEEPALIVE_MAX_RTT = 1.75s = 1750ms
+            // = rtt_ms * 360 / 1750
+            let scaled = (rtt_ms * KEEPALIVE_MAX_SECS) / 1750;
+            scaled.clamp(KEEPALIVE_MIN_SECS, KEEPALIVE_MAX_SECS)
+        } else {
+            KEEPALIVE_MAX_SECS
+        }
+    }
+
+    pub(crate) fn stale_time_secs(&self) -> u64 {
+        self.keepalive_interval_secs() * STALE_FACTOR
     }
 }
 
@@ -260,35 +335,51 @@ mod tests {
     }
 
     #[test]
-    fn established_link_shared_key_matches() {
+    fn established_link_can_encrypt_decrypt() {
         let mut rng = test_rng();
         let initiator_keypair = EphemeralKeyPair::generate(&mut rng);
         let responder_keypair = EphemeralKeyPair::generate(&mut rng);
         let dest: Address = [0xAB; 16];
         let link_id: LinkId = [0xCD; 16];
+        let now = Instant::now();
 
         let pending = PendingLink {
             link_id,
             initiator_encryption_secret: initiator_keypair.secret,
             initiator_encryption_public: initiator_keypair.public,
             destination: dest,
+            request_time: now,
         };
 
-        let initiator_link = EstablishedLink::from_initiator(pending, &responder_keypair.public);
+        let initiator_link =
+            EstablishedLink::from_initiator(pending, &responder_keypair.public, now);
         let responder_link = EstablishedLink::from_responder(
             link_id,
             &responder_keypair.secret,
             &initiator_keypair.public,
             dest,
+            now,
         );
 
-        assert_eq!(initiator_link.shared_key, responder_link.shared_key);
+        let plaintext = b"hello over the link";
+        let ciphertext = initiator_link.encrypt(&mut rng, plaintext);
+        let decrypted = responder_link.decrypt(&ciphertext).expect("decrypt");
+        assert_eq!(decrypted, plaintext);
+
+        let response = b"response message";
+        let response_ciphertext = responder_link.encrypt(&mut rng, response);
+        let response_decrypted = initiator_link
+            .decrypt(&response_ciphertext)
+            .expect("decrypt");
+        assert_eq!(response_decrypted, response);
+
         assert_eq!(initiator_link.link_id, responder_link.link_id);
     }
 
     #[test]
     fn full_link_establishment_flow() {
         let mut rng = test_rng();
+        let now = Instant::now();
 
         let initiator_enc = EphemeralKeyPair::generate(&mut rng);
         let initiator_sig = SigningKey::generate(&mut rng);
@@ -298,8 +389,7 @@ mod tests {
             initiator_enc.public,
             initiator_sig.verifying_key().to_bytes(),
         );
-        let request_bytes = request.to_bytes();
-        let link_id = request.link_id(&request_bytes);
+        let link_id = LinkRequest::link_id(&request.to_bytes());
 
         let responder_enc = EphemeralKeyPair::generate(&mut rng);
         let responder_sig = SigningKey::generate(&mut rng);
@@ -312,17 +402,22 @@ mod tests {
             initiator_encryption_secret: initiator_enc.secret,
             initiator_encryption_public: initiator_enc.public,
             destination: dest,
+            request_time: now,
         };
-        let initiator_link = EstablishedLink::from_initiator(pending, &responder_enc.public);
+        let initiator_link = EstablishedLink::from_initiator(pending, &responder_enc.public, now);
 
         let responder_link = EstablishedLink::from_responder(
             link_id,
             &responder_enc.secret,
             &initiator_enc.public,
             dest,
+            now,
         );
 
-        assert_eq!(initiator_link.shared_key, responder_link.shared_key);
+        let plaintext = b"full flow test";
+        let ciphertext = initiator_link.encrypt(&mut rng, plaintext);
+        let decrypted = responder_link.decrypt(&ciphertext).expect("decrypt");
+        assert_eq!(decrypted, plaintext);
     }
 
     #[test]

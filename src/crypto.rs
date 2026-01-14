@@ -35,6 +35,13 @@ fn derive_key(shared_secret: &[u8], salt: &[u8]) -> [u8; AES_KEY_LEN] {
     key
 }
 
+fn derive_link_key(shared_secret: &[u8], link_id: &[u8; 16]) -> [u8; 64] {
+    let hk = Hkdf::<Sha256>::new(Some(link_id), shared_secret);
+    let mut key = [0u8; 64];
+    hk.expand(b"", &mut key).expect("valid length");
+    key
+}
+
 fn pad_pkcs7(data: &[u8], block_size: usize) -> Vec<u8> {
     let padding_len = block_size - (data.len() % block_size);
     let mut padded = data.to_vec();
@@ -166,6 +173,72 @@ impl GroupDestEncryption {
         let encrypted = &ciphertext[AES_IV_LEN..];
         decrypt_aes256(psk, &iv, encrypted)
     }
+}
+
+pub(crate) struct LinkEncryption;
+
+impl LinkEncryption {
+    pub fn derive_keys(shared_secret: &[u8; 32], link_id: &[u8; 16]) -> LinkKeys {
+        let derived = derive_link_key(shared_secret, link_id);
+        let mut signing_key = [0u8; 32];
+        let mut encryption_key = [0u8; 32];
+        signing_key.copy_from_slice(&derived[..32]);
+        encryption_key.copy_from_slice(&derived[32..]);
+        LinkKeys {
+            signing_key,
+            encryption_key,
+        }
+    }
+
+    pub fn encrypt<R: RngCore>(rng: &mut R, keys: &LinkKeys, plaintext: &[u8]) -> Vec<u8> {
+        let mut iv = [0u8; AES_IV_LEN];
+        rng.fill_bytes(&mut iv);
+
+        let ciphertext = encrypt_aes256(&keys.encryption_key, &iv, plaintext);
+
+        let mut signed_parts = Vec::with_capacity(AES_IV_LEN + ciphertext.len());
+        signed_parts.extend_from_slice(&iv);
+        signed_parts.extend_from_slice(&ciphertext);
+
+        let hmac = hmac_sha256(&keys.signing_key, &signed_parts);
+
+        let mut result = signed_parts;
+        result.extend_from_slice(&hmac);
+        result
+    }
+
+    pub fn decrypt(keys: &LinkKeys, token: &[u8]) -> Option<Vec<u8>> {
+        if token.len() < AES_IV_LEN + 32 {
+            return None;
+        }
+
+        let signed_parts = &token[..token.len() - 32];
+        let received_hmac = &token[token.len() - 32..];
+
+        let expected_hmac = hmac_sha256(&keys.signing_key, signed_parts);
+        if received_hmac != expected_hmac {
+            return None;
+        }
+
+        let iv: [u8; AES_IV_LEN] = signed_parts[..AES_IV_LEN].try_into().ok()?;
+        let ciphertext = &signed_parts[AES_IV_LEN..];
+
+        decrypt_aes256(&keys.encryption_key, &iv, ciphertext)
+    }
+}
+
+pub(crate) struct LinkKeys {
+    signing_key: [u8; 32],
+    encryption_key: [u8; 32],
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    type HmacSha256 = Hmac<Sha256>;
+
+    let mut mac = HmacSha256::new_from_slice(key).expect("valid key length");
+    mac.update(data);
+    mac.finalize().into_bytes().into()
 }
 
 // "Once the packet has been received and decrypted by the addressed destination, that
@@ -320,5 +393,63 @@ mod tests {
     fn plain_destination_no_encryption() {
         let plaintext = b"plain data";
         assert_eq!(plaintext, plaintext);
+    }
+
+    #[test]
+    fn link_encryption_roundtrip() {
+        let mut rng = test_rng();
+        let shared_key = [0xABu8; 32];
+        let link_id = [0xCDu8; 16];
+        let plaintext = b"link message";
+
+        let keys = LinkEncryption::derive_keys(&shared_key, &link_id);
+        let ciphertext = LinkEncryption::encrypt(&mut rng, &keys, plaintext);
+        let decrypted = LinkEncryption::decrypt(&keys, &ciphertext).expect("decrypt");
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn link_encryption_includes_hmac() {
+        let mut rng = test_rng();
+        let shared_key = [0xABu8; 32];
+        let link_id = [0xCDu8; 16];
+        let plaintext = b"test";
+
+        let keys = LinkEncryption::derive_keys(&shared_key, &link_id);
+        let ciphertext = LinkEncryption::encrypt(&mut rng, &keys, plaintext);
+
+        assert!(ciphertext.len() >= 16 + 16 + 32);
+    }
+
+    #[test]
+    fn link_encryption_tampered_hmac_fails() {
+        let mut rng = test_rng();
+        let shared_key = [0xABu8; 32];
+        let link_id = [0xCDu8; 16];
+        let plaintext = b"secret";
+
+        let keys = LinkEncryption::derive_keys(&shared_key, &link_id);
+        let mut ciphertext = LinkEncryption::encrypt(&mut rng, &keys, plaintext);
+
+        let len = ciphertext.len();
+        ciphertext[len - 1] ^= 0xFF;
+
+        assert!(LinkEncryption::decrypt(&keys, &ciphertext).is_none());
+    }
+
+    #[test]
+    fn link_encryption_wrong_key_fails() {
+        let mut rng = test_rng();
+        let shared_key = [0xABu8; 32];
+        let wrong_key = [0xEFu8; 32];
+        let link_id = [0xCDu8; 16];
+        let plaintext = b"secret";
+
+        let keys = LinkEncryption::derive_keys(&shared_key, &link_id);
+        let wrong_keys = LinkEncryption::derive_keys(&wrong_key, &link_id);
+        let ciphertext = LinkEncryption::encrypt(&mut rng, &keys, plaintext);
+
+        assert!(LinkEncryption::decrypt(&wrong_keys, &ciphertext).is_none());
     }
 }

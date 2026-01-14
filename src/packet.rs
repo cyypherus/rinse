@@ -346,6 +346,19 @@ impl Packet {
         };
         2 + ifac_len + addr_len + 1 + self.data.len()
     }
+
+    pub fn hashable_part(&self) -> Vec<u8> {
+        let bytes = self.to_bytes();
+        let mut out = Vec::new();
+        out.push(bytes[0] & 0b0000_1111);
+        let skip = if self.header.header_type == HeaderType::Type2 {
+            2 + ADDR_LEN
+        } else {
+            2
+        };
+        out.extend_from_slice(&bytes[skip..]);
+        out
+    }
 }
 
 #[cfg(test)]
