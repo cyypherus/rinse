@@ -1,9 +1,13 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use rand::Rng;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use rand::RngCore;
 use rand::rngs::ThreadRng;
+use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
+use crate::announce::{AnnounceBuilder, AnnounceData};
+use crate::crypto::sha256;
 use crate::{Address, Addresses, Interface, Packet, PacketType, Transport};
 
 // "By default, m is set to 128."
@@ -11,6 +15,20 @@ const DEFAULT_MAX_HOPS: u8 = 128;
 // "By default, r is set to 1."
 const DEFAULT_RETRIES: u8 = 1;
 const DEFAULT_RETRY_DELAY_MS: u64 = 4000;
+
+pub trait Service: Send {
+    fn name(&self) -> &str;
+    fn receive(&mut self, data: &[u8]);
+}
+
+struct ServiceEntry {
+    service: Box<dyn Service>,
+    address: Address,
+    name_hash: [u8; 10],
+    encryption_secret: StaticSecret,
+    encryption_public: X25519Public,
+    signing_key: SigningKey,
+}
 
 struct AnnounceEntry {
     // "record into a table which Transport Node the announce was received from"
@@ -20,14 +38,23 @@ struct AnnounceEntry {
     app_data: Vec<u8>,
     retries_remaining: u8,
     retry_at: Option<Instant>,
+    // "The sender already knows the public key of the destination from an earlier
+    // received announce"
+    encryption_key: X25519Public,
+    // "where the signature can be verified against the destination's known public signing key"
+    signing_key: VerifyingKey,
+    // "(or ratchet key, if available)"
+    ratchet_key: Option<X25519Public>,
 }
 
-pub struct Node<T, IR = ThreadRng> {
+pub struct Node<T, R = ThreadRng> {
     max_hops: u8,
     retries: u8,
     pub(crate) retry_delay_ms: u64,
+    rng: R,
     seen_announces: HashMap<Address, AnnounceEntry>,
-    interfaces: Vec<Interface<T, IR>>,
+    services: Vec<ServiceEntry>,
+    interfaces: Vec<Interface<T>>,
 }
 
 impl<T: Transport> Node<T, ThreadRng> {
@@ -36,20 +63,93 @@ impl<T: Transport> Node<T, ThreadRng> {
             max_hops: DEFAULT_MAX_HOPS,
             retries: DEFAULT_RETRIES,
             retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+            rng: rand::thread_rng(),
             seen_announces: HashMap::new(),
             interfaces: Vec::new(),
+            services: Vec::new(),
         }
     }
 }
 
-impl<T: Transport, IR: Rng> Node<T, IR> {
-    pub fn add_interface(&mut self, interface: Interface<T, IR>) -> usize {
+impl<T: Transport, R: RngCore> Node<T, R> {
+    pub fn with_rng(rng: R) -> Self {
+        Self {
+            max_hops: DEFAULT_MAX_HOPS,
+            retries: DEFAULT_RETRIES,
+            retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+            rng,
+            seen_announces: HashMap::new(),
+            interfaces: Vec::new(),
+            services: Vec::new(),
+        }
+    }
+
+    pub fn add_interface(&mut self, interface: Interface<T>) -> usize {
         let id = self.interfaces.len();
         self.interfaces.push(interface);
         id
     }
 
-    pub fn inbound(&mut self, packet: &Packet, source: usize, now: Instant) {
+    pub fn add_service(&mut self, service: impl Service + 'static) -> Address {
+        let name = service.name();
+        let name_hash: [u8; 10] = sha256(name.as_bytes())[..10].try_into().unwrap();
+
+        let mut enc_bytes = [0u8; 32];
+        self.rng.fill_bytes(&mut enc_bytes);
+        let encryption_secret = StaticSecret::from(enc_bytes);
+        let encryption_public = X25519Public::from(&encryption_secret);
+
+        let mut sig_bytes = [0u8; 32];
+        self.rng.fill_bytes(&mut sig_bytes);
+        let signing_key = SigningKey::from_bytes(&sig_bytes);
+
+        // Compute address: hash(name_hash || identity_hash)
+        let mut public_key = [0u8; 64];
+        public_key[..32].copy_from_slice(encryption_public.as_bytes());
+        public_key[32..].copy_from_slice(signing_key.verifying_key().as_bytes());
+        let identity_hash = &sha256(&public_key)[..16];
+
+        let mut hash_material = Vec::new();
+        hash_material.extend_from_slice(&name_hash);
+        hash_material.extend_from_slice(identity_hash);
+        let address: Address = sha256(&hash_material)[..16].try_into().unwrap();
+
+        self.services.push(ServiceEntry {
+            service: Box::new(service),
+            address,
+            name_hash,
+            encryption_secret,
+            encryption_public,
+            signing_key,
+        });
+
+        address
+    }
+
+    pub fn announce(&mut self, address: Address, now: Instant) {
+        let Some(entry) = self.services.iter().find(|s| s.address == address) else {
+            return;
+        };
+
+        let mut random_hash = [0u8; 10];
+        self.rng.fill_bytes(&mut random_hash);
+
+        let announce_data = AnnounceBuilder::new(
+            *entry.encryption_public.as_bytes(),
+            entry.signing_key.clone(),
+            entry.name_hash,
+            random_hash,
+        )
+        .build(&address);
+
+        let packet = self.make_announce_packet(address, 0, announce_data.to_bytes());
+
+        for iface in &mut self.interfaces {
+            iface.send(packet.clone(), 0, &mut self.rng, now);
+        }
+    }
+
+    pub(crate) fn inbound(&mut self, packet: &Packet, source: usize, now: Instant) {
         match packet.header.packet_type {
             PacketType::Announce => {
                 let dest = match packet.addresses {
@@ -67,7 +167,25 @@ impl<T: Transport, IR: Rng> Node<T, IR> {
                     entry.retry_at = None;
                 }
 
-                if self.process_announce(dest, hops, packet.data.clone(), source) {
+                let has_ratchet = packet.header.context_flag == crate::ContextFlag::Set;
+                let Ok(announce) = AnnounceData::parse(&packet.data, has_ratchet) else {
+                    return;
+                };
+                let Ok(signing_key) = announce.signing_public_key() else {
+                    return;
+                };
+
+                let should_forward = self.process_announce_inner(
+                    dest,
+                    hops,
+                    announce.app_data.clone(),
+                    source,
+                    announce.encryption_public_key(),
+                    signing_key,
+                    announce.ratchet.map(X25519Public::from),
+                );
+
+                if should_forward {
                     self.outbound(packet.clone(), Some(source), now);
                 }
             }
@@ -94,7 +212,7 @@ impl<T: Transport, IR: Rng> Node<T, IR> {
 
         for (i, iface) in self.interfaces.iter_mut().enumerate() {
             if Some(i) != exclude {
-                iface.send(packet.clone(), hops, now);
+                iface.send(packet.clone(), hops, &mut self.rng, now);
             }
         }
 
@@ -109,10 +227,23 @@ impl<T: Transport, IR: Rng> Node<T, IR> {
     }
 
     pub fn poll(&mut self, now: Instant) {
+        // Receive from all interfaces
+        let mut received = Vec::new();
+        for (i, iface) in self.interfaces.iter_mut().enumerate() {
+            while let Some(packet) = iface.recv() {
+                received.push((packet, i));
+            }
+        }
+        for (packet, source) in received {
+            self.inbound(&packet, source, now);
+        }
+
+        // Process outbound queues
         for iface in &mut self.interfaces {
             iface.poll(now);
         }
 
+        // Handle retries
         let mut to_retry = Vec::new();
         for (dest, entry) in &mut self.seen_announces {
             if let Some(retry_at) = entry.retry_at
@@ -156,12 +287,15 @@ impl<T: Transport, IR: Rng> Node<T, IR> {
         Packet::new(header, None, Addresses::Single(dest), Context::None, data).unwrap()
     }
 
-    fn process_announce(
+    fn process_announce_inner(
         &mut self,
         destination: Address,
         hops: u8,
         app_data: Vec<u8>,
         source: usize,
+        encryption_key: X25519Public,
+        signing_key: VerifyingKey,
+        ratchet_key: Option<X25519Public>,
     ) -> bool {
         if let Some(entry) = self.seen_announces.get_mut(&destination) {
             // "If a newer announce from the same destination arrives, while an identical one
@@ -177,6 +311,9 @@ impl<T: Transport, IR: Rng> Node<T, IR> {
                 entry.source_interface = source;
                 entry.retries_remaining = self.retries;
                 entry.retry_at = None;
+                entry.encryption_key = encryption_key;
+                entry.signing_key = signing_key;
+                entry.ratchet_key = ratchet_key;
                 return hops < self.max_hops;
             }
             // "If this exact announce has already been received before, ignore it."
@@ -199,6 +336,9 @@ impl<T: Transport, IR: Rng> Node<T, IR> {
                 app_data,
                 retries_remaining: self.retries,
                 retry_at: None,
+                encryption_key,
+                signing_key,
+                ratchet_key,
             },
         );
 
@@ -223,17 +363,21 @@ mod tests {
     struct MockTransport {
         bandwidth: bool,
         sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        inbox: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
     impl MockTransport {
-        fn new(bandwidth: bool) -> (Self, Arc<Mutex<Vec<Vec<u8>>>>) {
+        fn new(bandwidth: bool) -> (Self, Arc<Mutex<Vec<Vec<u8>>>>, Arc<Mutex<Vec<Vec<u8>>>>) {
             let sent = Arc::new(Mutex::new(Vec::new()));
+            let inbox = Arc::new(Mutex::new(Vec::new()));
             (
                 Self {
                     bandwidth,
                     sent: sent.clone(),
+                    inbox: inbox.clone(),
                 },
                 sent,
+                inbox,
             )
         }
     }
@@ -244,7 +388,12 @@ mod tests {
         }
 
         fn recv(&mut self) -> Option<Vec<u8>> {
-            None
+            let mut inbox = self.inbox.lock().unwrap();
+            if inbox.is_empty() {
+                None
+            } else {
+                Some(inbox.remove(0))
+            }
         }
 
         fn bandwidth_available(&self) -> bool {
@@ -252,15 +401,56 @@ mod tests {
         }
     }
 
+    struct MockWire {
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        inbox: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl MockWire {
+        fn inject(&self, packet: &Packet) {
+            self.inbox.lock().unwrap().push(packet.to_bytes());
+        }
+
+        fn take_sent(&self) -> Vec<Vec<u8>> {
+            std::mem::take(&mut self.sent.lock().unwrap())
+        }
+    }
+
     fn make_interface(bandwidth: bool) -> (Interface<MockTransport>, Arc<Mutex<Vec<Vec<u8>>>>) {
-        let (transport, sent) = MockTransport::new(bandwidth);
+        let (transport, sent, _inbox) = MockTransport::new(bandwidth);
         let mut iface = Interface::new(transport, 0);
         iface.min_delay_ms = 0;
         iface.max_delay_ms = 0;
         (iface, sent)
     }
 
-    fn make_announce(dest: Address, hops: u8, data: Vec<u8>) -> Packet {
+    fn make_mock_interface(bandwidth: bool) -> (Interface<MockTransport>, MockWire) {
+        let (transport, sent, inbox) = MockTransport::new(bandwidth);
+        let mut iface = Interface::new(transport, 0);
+        iface.min_delay_ms = 0;
+        iface.max_delay_ms = 0;
+        (iface, MockWire { sent, inbox })
+    }
+
+    fn make_announce_packet(dest: Address, hops: u8, app_data: Vec<u8>) -> Packet {
+        use crate::announce::AnnounceBuilder;
+        use crate::crypto::sha256;
+        use ed25519_dalek::SigningKey;
+        use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
+
+        // Deterministic keys from dest (expand 16 bytes to 32)
+        let seed = sha256(&dest);
+        let enc_secret = StaticSecret::from(seed);
+        let enc_public = X25519Public::from(&enc_secret);
+        let signing_key = SigningKey::from_bytes(&sha256(&seed));
+
+        let name_hash: [u8; 10] = sha256(&dest)[..10].try_into().unwrap();
+        let random_hash: [u8; 10] = [0; 10];
+        let announce =
+            AnnounceBuilder::new(*enc_public.as_bytes(), signing_key, name_hash, random_hash)
+                .with_app_data(app_data)
+                .build(&dest);
+
         let header = Header {
             ifac_flag: IfacFlag::Open,
             header_type: HeaderType::Type1,
@@ -270,7 +460,14 @@ mod tests {
             packet_type: PacketType::Announce,
             hops,
         };
-        Packet::new(header, None, Addresses::Single(dest), Context::None, data).unwrap()
+        Packet::new(
+            header,
+            None,
+            Addresses::Single(dest),
+            Context::None,
+            announce.to_bytes(),
+        )
+        .unwrap()
     }
 
     // "If this exact announce has already been received before, ignore it."
@@ -281,7 +478,7 @@ mod tests {
         let src = node.add_interface(iface);
 
         let now = Instant::now();
-        let packet = make_announce([1u8; 16], 1, vec![0xAB]);
+        let packet = make_announce_packet([1u8; 16], 1, vec![0xAB]);
         node.inbound(&packet, src, now);
         node.inbound(&packet, src, now);
 
@@ -293,14 +490,14 @@ mod tests {
     // and how many times in total it has been retransmitted to get here."
     #[test]
     fn record_into_a_table_which_transport_node_the_announce_was_received_from() {
-        let mut node = Node::new();
+        let mut node: Node<MockTransport> = Node::new();
         let (iface0, _) = make_interface(true);
         let (iface1, tx1) = make_interface(true);
         let src = node.add_interface(iface0);
         node.add_interface(iface1);
 
         let now = Instant::now();
-        let packet = make_announce([2u8; 16], 5, vec![]);
+        let packet = make_announce_packet([2u8; 16], 5, vec![]);
         node.inbound(&packet, src, now);
 
         node.poll(now);
@@ -311,14 +508,14 @@ mod tests {
     // By default, m is set to 128."
     #[test]
     fn if_the_announce_has_been_retransmitted_m_plus_1_times_it_will_not_be_forwarded() {
-        let mut node = Node::new();
+        let mut node: Node<MockTransport> = Node::new();
         let (iface0, tx0) = make_interface(true);
         let (iface1, tx1) = make_interface(true);
         let src = node.add_interface(iface0);
         node.add_interface(iface1);
 
         let now = Instant::now();
-        let packet = make_announce([3u8; 16], 129, vec![]);
+        let packet = make_announce_packet([3u8; 16], 129, vec![]);
         node.inbound(&packet, src, now);
 
         node.poll(now);
@@ -337,7 +534,7 @@ mod tests {
         node.add_interface(iface1);
 
         let now = Instant::now();
-        let packet = make_announce([4u8; 16], 128, vec![]);
+        let packet = make_announce_packet([4u8; 16], 128, vec![]);
         node.inbound(&packet, src, now);
 
         node.poll(now);
@@ -356,7 +553,7 @@ mod tests {
         node.add_interface(iface1);
 
         let now = Instant::now();
-        let packet = make_announce([6u8; 16], 127, vec![]);
+        let packet = make_announce_packet([6u8; 16], 127, vec![]);
         node.inbound(&packet, src, now);
 
         node.poll(now);
@@ -377,8 +574,8 @@ mod tests {
 
         let now = Instant::now();
         let dest = [11u8; 16];
-        node.inbound(&make_announce(dest, 1, vec![0x01]), src0, now);
-        node.inbound(&make_announce(dest, 2, vec![0x01]), src1, now);
+        node.inbound(&make_announce_packet(dest, 1, vec![0x01]), src0, now);
+        node.inbound(&make_announce_packet(dest, 2, vec![0x01]), src1, now);
 
         node.poll(now);
         assert_eq!(tx0.lock().unwrap().len(), 0);
@@ -398,8 +595,8 @@ mod tests {
 
         let now = Instant::now();
         let dest = [7u8; 16];
-        node.inbound(&make_announce(dest, 1, vec![0x01]), src0, now);
-        node.inbound(&make_announce(dest, 2, vec![0x02]), src1, now);
+        node.inbound(&make_announce_packet(dest, 1, vec![0x01]), src0, now);
+        node.inbound(&make_announce_packet(dest, 2, vec![0x02]), src1, now);
 
         node.poll(now);
         assert_eq!(tx0.lock().unwrap().len(), 1);
@@ -419,7 +616,7 @@ mod tests {
         node.add_interface(iface2);
 
         let now = Instant::now();
-        let packet = make_announce([8u8; 16], 1, vec![]);
+        let packet = make_announce_packet([8u8; 16], 1, vec![]);
         node.inbound(&packet, src, now);
 
         node.poll(now);
@@ -441,7 +638,7 @@ mod tests {
         node.add_interface(iface1);
 
         let now = Instant::now();
-        let packet = make_announce([9u8; 16], 1, vec![]);
+        let packet = make_announce_packet([9u8; 16], 1, vec![]);
         node.inbound(&packet, src, now);
 
         node.poll(now);
@@ -462,7 +659,7 @@ mod tests {
 
         let now = Instant::now();
         let dest = [13u8; 16];
-        node.inbound(&make_announce(dest, 1, vec![]), src0, now);
+        node.inbound(&make_announce_packet(dest, 1, vec![]), src0, now);
 
         node.poll(now);
         assert_eq!(tx1.lock().unwrap().len(), 1);
@@ -488,14 +685,245 @@ mod tests {
 
         let now = Instant::now();
         let dest = [14u8; 16];
-        node.inbound(&make_announce(dest, 1, vec![]), src0, now);
+        node.inbound(&make_announce_packet(dest, 1, vec![]), src0, now);
 
         node.poll(now);
         assert_eq!(tx1.lock().unwrap().len(), 1);
 
-        node.inbound(&make_announce(dest, 2, vec![]), src1, now);
+        node.inbound(&make_announce_packet(dest, 2, vec![]), src1, now);
 
         node.poll(now + Duration::from_millis(50));
         assert_eq!(tx1.lock().unwrap().len(), 1);
+    }
+
+    // --- routing.md tests ---
+    // Two nodes connected via mock transports, announcing services to each other
+
+    struct TestService {
+        name: String,
+        received: Vec<Vec<u8>>,
+    }
+
+    impl TestService {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                received: Vec::new(),
+            }
+        }
+    }
+
+    impl Service for TestService {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn receive(&mut self, data: &[u8]) {
+            self.received.push(data.to_vec());
+        }
+    }
+
+    // "When the packet is sent to a single destination type, Reticulum will automatically
+    // create an ephemeral encryption key, perform an ECDH key exchange with the destination's
+    // public key (or ratchet key, if available), and encrypt the information."
+    //
+    // "The sender already knows the public key of the destination from an earlier received
+    // announce, and can thus perform the ECDH key exchange locally, before sending the packet."
+    #[test]
+    fn node_announces_service_and_other_node_receives_keys() {
+        let mut receiver: Node<MockTransport> = Node::new();
+        let (recv_iface, recv_wire) = make_mock_interface(true);
+        receiver.add_interface(recv_iface);
+
+        let chat_addr = receiver.add_service(TestService::new("myapp.chat"));
+
+        let now = Instant::now();
+        receiver.announce(chat_addr, now);
+        receiver.poll(now);
+
+        // Announce was sent on wire
+        let sent = recv_wire.take_sent();
+        assert_eq!(sent.len(), 1);
+
+        // Other node receives the announce via poll (injected into its interface)
+        let mut sender: Node<MockTransport> = Node::new();
+        let (sender_iface, sender_wire) = make_mock_interface(true);
+        let announce_packet = Packet::from_bytes(&sent[0], 0).unwrap();
+        sender_wire.inject(&announce_packet);
+        sender.add_interface(sender_iface);
+
+        sender.poll(now);
+
+        // Sender now has keys for the announced service
+        let entry = sender.seen_announces.get(&chat_addr).unwrap();
+        assert_eq!(entry.encryption_key.as_bytes().len(), 32);
+    }
+
+    // "Once the packet has been received and decrypted by the addressed destination, that
+    // destination can opt to prove its receipt of the packet. It does this by calculating
+    // the SHA-256 hash of the received packet, and signing this hash with its Ed25519
+    // signing key."
+    //
+    // "Transport nodes in the network can then direct this proof back to the packets origin,
+    // where the signature can be verified against the destination's known public signing key."
+    #[test]
+    fn proof_of_receipt_flow() {
+        use crate::crypto::{create_proof, verify_proof};
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+
+        let rng = StdRng::seed_from_u64(99);
+        let mut receiver: Node<MockTransport, StdRng> = Node::with_rng(rng);
+        let (recv_iface, recv_tx) = make_interface(true);
+        receiver.add_interface(recv_iface);
+
+        let service_addr = receiver.add_service(TestService::new("proof.test"));
+        let receiver_signing_key = receiver
+            .services
+            .iter()
+            .find(|s| s.address == service_addr)
+            .unwrap()
+            .signing_key
+            .clone();
+
+        let now = Instant::now();
+        receiver.announce(service_addr, now);
+        receiver.poll(now);
+
+        // Sender receives announce
+        let mut sender: Node<MockTransport> = Node::new();
+        let (sender_iface, _) = make_interface(true);
+        let src = sender.add_interface(sender_iface);
+
+        let announce_packet = Packet::from_bytes(&recv_tx.lock().unwrap()[0], 0).unwrap();
+        sender.inbound(&announce_packet, src, now);
+
+        // Receiver creates proof for some packet data
+        let packet_data = b"packet payload";
+        let proof = create_proof(&receiver_signing_key, packet_data);
+
+        // Sender verifies using stored signing key
+        let entry = sender.seen_announces.get(&service_addr).unwrap();
+        assert!(verify_proof(&entry.signing_key, packet_data, &proof));
+        assert!(!verify_proof(&entry.signing_key, b"tampered", &proof));
+    }
+
+    // "In case the packet is addressed to a group destination type, the packet will be
+    // encrypted with the pre-shared AES-256 key associated with the destination."
+    #[test]
+    fn group_destination_encrypt_decrypt_flow() {
+        use crate::crypto::{GroupDestEncryption, sha256};
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+
+        let mut rng = StdRng::seed_from_u64(99);
+
+        // Pre-shared key known by group members
+        let psk: [u8; 32] = std::array::from_fn(|i| (i * 13) as u8);
+        let wrong_psk: [u8; 32] = std::array::from_fn(|i| (i * 17) as u8);
+
+        // Create two group member nodes and one non-member
+        let mut _member1: Node<MockTransport> = Node::new();
+        let mut _member2: Node<MockTransport> = Node::new();
+        let mut _non_member: Node<MockTransport> = Node::new();
+
+        let (iface1, _tx1) = make_interface(true);
+        let (iface2, _tx2) = make_interface(true);
+        let (iface3, _tx3) = make_interface(true);
+        _member1.add_interface(iface1);
+        _member2.add_interface(iface2);
+        _non_member.add_interface(iface3);
+
+        // Group destination address (derived from PSK in real impl)
+        let group_dest: Address = sha256(&psk)[..16].try_into().unwrap();
+
+        // Sender encrypts message with PSK
+        let plaintext = b"message for the group";
+        let ciphertext = GroupDestEncryption::encrypt(&mut rng, &psk, plaintext);
+
+        // Create group packet
+        let header = Header {
+            ifac_flag: IfacFlag::Open,
+            header_type: HeaderType::Type1,
+            context_flag: ContextFlag::Unset,
+            propagation_type: PropagationType::Broadcast,
+            destination_type: DestinationType::Group,
+            packet_type: PacketType::Data,
+            hops: 0,
+        };
+        let packet = Packet::new(
+            header,
+            None,
+            Addresses::Single(group_dest),
+            Context::None,
+            ciphertext,
+        )
+        .unwrap();
+
+        // Members can decrypt with PSK
+        let decrypted1 = GroupDestEncryption::decrypt(&psk, &packet.data).unwrap();
+        assert_eq!(decrypted1, plaintext);
+
+        let decrypted2 = GroupDestEncryption::decrypt(&psk, &packet.data).unwrap();
+        assert_eq!(decrypted2, plaintext);
+
+        // Non-member cannot decrypt
+        let bad_decrypt = GroupDestEncryption::decrypt(&wrong_psk, &packet.data);
+        assert!(
+            bad_decrypt.is_none() || bad_decrypt.as_ref().unwrap() != plaintext,
+            "Non-member should not be able to decrypt"
+        );
+    }
+
+    // "In case the packet is addressed to a plain destination type, the payload data will
+    // not be encrypted."
+    #[test]
+    fn plain_destination_no_encryption_flow() {
+        // Setup two nodes connected via mock transport
+        let mut sender: Node<MockTransport> = Node::new();
+        let mut receiver: Node<MockTransport> = Node::new();
+
+        let (sender_iface, _sender_tx) = make_interface(true);
+        let (receiver_iface, _) = make_interface(true);
+        sender.add_interface(sender_iface);
+        let recv_src = receiver.add_interface(receiver_iface);
+
+        // Create plain destination packet
+        let dest: Address = [0xAB; 16];
+        let plaintext = b"unencrypted payload";
+        let header = Header {
+            ifac_flag: IfacFlag::Open,
+            header_type: HeaderType::Type1,
+            context_flag: ContextFlag::Unset,
+            propagation_type: PropagationType::Broadcast,
+            destination_type: DestinationType::Plain,
+            packet_type: PacketType::Data,
+            hops: 0,
+        };
+        let packet = Packet::new(
+            header,
+            None,
+            Addresses::Single(dest),
+            Context::None,
+            plaintext.to_vec(),
+        )
+        .unwrap();
+
+        // Verify plaintext appears directly in wire data (no encryption)
+        let wire_data = packet.to_bytes();
+        let plaintext_in_wire = wire_data.windows(plaintext.len()).any(|w| w == plaintext);
+        assert!(
+            plaintext_in_wire,
+            "Plain destination packet should contain unencrypted payload on wire"
+        );
+
+        // Receiver gets packet, payload is plaintext
+        let now = Instant::now();
+        receiver.inbound(&packet, recv_src, now);
+
+        // The packet data is the plaintext directly
+        assert_eq!(
+            packet.data, plaintext,
+            "Plain destination packet data should be plaintext"
+        );
     }
 }

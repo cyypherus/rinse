@@ -2,7 +2,6 @@ use std::collections::BinaryHeap;
 use std::time::Instant;
 
 use rand::Rng;
-use rand::rngs::ThreadRng;
 
 use crate::Packet;
 
@@ -44,9 +43,8 @@ struct DelayedPacket {
     send_at: Instant,
 }
 
-pub struct Interface<T, R = ThreadRng> {
+pub struct Interface<T> {
     transport: T,
-    rng: R,
     queue: BinaryHeap<QueuedPacket>,
     delayed: Vec<DelayedPacket>,
     ifac_len: usize,
@@ -54,17 +52,10 @@ pub struct Interface<T, R = ThreadRng> {
     pub(crate) max_delay_ms: u64,
 }
 
-impl<T: Transport> Interface<T, ThreadRng> {
+impl<T: Transport> Interface<T> {
     pub fn new(transport: T, ifac_len: usize) -> Self {
-        Self::with_rng(transport, ifac_len, rand::thread_rng())
-    }
-}
-
-impl<T: Transport, R: Rng> Interface<T, R> {
-    fn with_rng(transport: T, ifac_len: usize, rng: R) -> Self {
         Self {
             transport,
-            rng,
             queue: BinaryHeap::new(),
             delayed: Vec::new(),
             ifac_len,
@@ -79,8 +70,8 @@ impl<T: Transport, R: Rng> Interface<T, R> {
 
     // "After a randomised delay, the announce will be retransmitted on all interfaces
     // that have bandwidth available for processing announces."
-    pub(crate) fn send(&mut self, packet: Packet, priority: u8, now: Instant) {
-        let delay_ms = self.rng.gen_range(self.min_delay_ms..=self.max_delay_ms);
+    pub(crate) fn send(&mut self, packet: Packet, priority: u8, rng: &mut impl Rng, now: Instant) {
+        let delay_ms = rng.gen_range(self.min_delay_ms..=self.max_delay_ms);
         let send_at = now + std::time::Duration::from_millis(delay_ms);
         self.delayed.push(DelayedPacket {
             packet,
@@ -219,14 +210,18 @@ mod tests {
     // that have bandwidth available for processing announces."
     #[test]
     fn send_delays_then_transmits() {
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+
         let (transport, sent) = MockTransport::new(true);
         let mut iface = Interface::new(transport, 0);
+        let mut rng = StdRng::seed_from_u64(1);
         iface.min_delay_ms = 10;
         iface.max_delay_ms = 10;
 
         let packet = make_packet([1u8; 16], 5);
         let now = Instant::now();
-        iface.send(packet, 5, now);
+        iface.send(packet, 5, &mut rng, now);
 
         iface.poll(now);
         assert_eq!(sent.lock().unwrap().len(), 0);
@@ -240,14 +235,18 @@ mod tests {
     // hop count, and be inserted into a queue managed by the interface."
     #[test]
     fn no_bandwidth_queues_packet() {
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+
         let (transport, sent) = MockTransport::new(false);
         let mut iface = Interface::new(transport, 0);
+        let mut rng = StdRng::seed_from_u64(1);
         iface.min_delay_ms = 0;
         iface.max_delay_ms = 0;
 
         let now = Instant::now();
         let packet = make_packet([1u8; 16], 5);
-        iface.send(packet, 5, now);
+        iface.send(packet, 5, &mut rng, now);
 
         iface.poll(now);
 
