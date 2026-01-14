@@ -90,7 +90,25 @@ impl<T: Transport> Interface<T> {
 
     pub fn recv(&mut self) -> Option<Packet> {
         let data = self.transport.recv()?;
-        Packet::from_bytes(&data, self.ifac_len).ok()
+        match Packet::from_bytes(&data, self.ifac_len) {
+            Ok(pkt) => {
+                log::trace!(
+                    "recv packet: {:?} {} bytes",
+                    pkt.header.packet_type,
+                    data.len()
+                );
+                Some(pkt)
+            }
+            Err(e) => {
+                log::warn!(
+                    "packet parse error: {:?} for {} bytes: {:02x?}",
+                    e,
+                    data.len(),
+                    &data[..data.len().min(40)]
+                );
+                None
+            }
+        }
     }
 
     pub(crate) fn poll(&mut self, now: Instant) {

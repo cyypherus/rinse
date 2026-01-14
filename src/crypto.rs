@@ -75,13 +75,28 @@ pub fn decrypt_aes256(
     ciphertext: &[u8],
 ) -> Option<Vec<u8>> {
     if !ciphertext.len().is_multiple_of(16) {
+        log::warn!(
+            "decrypt_aes256: ciphertext length {} not multiple of 16",
+            ciphertext.len()
+        );
         return None;
     }
     let cipher = Aes256CbcDec::new(key.into(), iv.into());
-    let decrypted = cipher
-        .decrypt_padded_vec_mut::<aes::cipher::block_padding::NoPadding>(ciphertext)
-        .ok()?;
-    unpad_pkcs7(&decrypted)
+    let decrypted =
+        match cipher.decrypt_padded_vec_mut::<aes::cipher::block_padding::NoPadding>(ciphertext) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("decrypt_aes256: decryption failed: {:?}", e);
+                return None;
+            }
+        };
+    match unpad_pkcs7(&decrypted) {
+        Some(d) => Some(d),
+        None => {
+            log::warn!("decrypt_aes256: invalid PKCS7 padding");
+            None
+        }
+    }
 }
 
 pub struct EphemeralKeyPair {
@@ -138,6 +153,10 @@ impl SingleDestEncryption {
         ciphertext: &[u8],
     ) -> Option<Vec<u8>> {
         if ciphertext.len() < AES_IV_LEN {
+            log::warn!(
+                "single dest decrypt: ciphertext too short ({} bytes)",
+                ciphertext.len()
+            );
             return None;
         }
         let iv: [u8; AES_IV_LEN] = ciphertext[..AES_IV_LEN].try_into().ok()?;
@@ -209,6 +228,11 @@ impl LinkEncryption {
 
     pub fn decrypt(keys: &LinkKeys, token: &[u8]) -> Option<Vec<u8>> {
         if token.len() < AES_IV_LEN + 32 {
+            log::warn!(
+                "link decrypt: token too short ({} bytes, need at least {})",
+                token.len(),
+                AES_IV_LEN + 32
+            );
             return None;
         }
 
@@ -217,6 +241,7 @@ impl LinkEncryption {
 
         let expected_hmac = hmac_sha256(&keys.signing_key, signed_parts);
         if received_hmac != expected_hmac {
+            log::warn!("link decrypt: HMAC verification failed");
             return None;
         }
 

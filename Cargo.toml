@@ -9,6 +9,7 @@ cbc = { version = "0.1.2", features = ["alloc"] }
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 hkdf = "0.12.4"
 hmac = "0.12.1"
+log = "0.4"
 rand = "0.8"
 serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.10.9"

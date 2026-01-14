@@ -151,7 +151,13 @@ impl AnnounceData {
     }
 
     pub fn verify(&self, destination_hash: &[u8; 16]) -> Result<(), AnnounceError> {
-        let verifying_key = self.signing_public_key()?;
+        let verifying_key = match self.signing_public_key() {
+            Ok(k) => k,
+            Err(e) => {
+                log::warn!("announce verify: invalid signing key");
+                return Err(e);
+            }
+        };
 
         let mut signed_data = Vec::new();
         signed_data.extend_from_slice(destination_hash);
@@ -166,9 +172,14 @@ impl AnnounceData {
 
         let signature = Signature::from_bytes(&self.signature);
 
-        verifying_key
-            .verify(&signed_data, &signature)
-            .map_err(|_| AnnounceError::InvalidSignature)
+        verifying_key.verify(&signed_data, &signature).map_err(|e| {
+            log::warn!(
+                "announce verify: signature verification failed for dest {:02x?}: {:?}",
+                destination_hash,
+                e
+            );
+            AnnounceError::InvalidSignature
+        })
     }
 
     pub fn verify_destination(&self, destination_hash: &[u8; 16]) -> Result<(), AnnounceError> {
@@ -181,6 +192,11 @@ impl AnnounceData {
         if destination_hash == expected_hash {
             Ok(())
         } else {
+            log::warn!(
+                "announce verify_destination: hash mismatch, expected {:02x?}, got {:02x?}",
+                expected_hash,
+                destination_hash
+            );
             Err(AnnounceError::DestinationMismatch)
         }
     }

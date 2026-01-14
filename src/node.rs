@@ -59,6 +59,8 @@ struct AnnounceEntry {
     signing_key: VerifyingKey,
     // "(or ratchet key, if available)"
     ratchet_key: Option<X25519Public>,
+    // Transport node that forwarded the announce (for Type2 packets)
+    next_hop: Option<Address>,
 }
 
 struct LinkTableEntry {
@@ -71,6 +73,7 @@ pub struct Node<T, R = ThreadRng> {
     retries: u8,
     pub(crate) retry_delay_ms: u64,
     rng: R,
+    transport_id: Address,
     seen_announces: HashMap<Address, AnnounceEntry>,
     services: Vec<ServiceEntry>,
     interfaces: Vec<Interface<T>>,
@@ -81,11 +84,15 @@ pub struct Node<T, R = ThreadRng> {
 
 impl<T: Transport> Node<T, ThreadRng> {
     pub fn new() -> Self {
+        let mut rng = rand::thread_rng();
+        let mut transport_id = [0u8; 16];
+        rng.fill_bytes(&mut transport_id);
         Self {
             max_hops: DEFAULT_MAX_HOPS,
             retries: DEFAULT_RETRIES,
             retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
-            rng: rand::thread_rng(),
+            rng,
+            transport_id,
             seen_announces: HashMap::new(),
             interfaces: Vec::new(),
             services: Vec::new(),
@@ -97,12 +104,15 @@ impl<T: Transport> Node<T, ThreadRng> {
 }
 
 impl<T: Transport, R: RngCore> Node<T, R> {
-    pub fn with_rng(rng: R) -> Self {
+    pub fn with_rng(mut rng: R) -> Self {
+        let mut transport_id = [0u8; 16];
+        rng.fill_bytes(&mut transport_id);
         Self {
             max_hops: DEFAULT_MAX_HOPS,
             retries: DEFAULT_RETRIES,
             retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
             rng,
+            transport_id,
             seen_announces: HashMap::new(),
             interfaces: Vec::new(),
             services: Vec::new(),
@@ -116,6 +126,21 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         let id = self.interfaces.len();
         self.interfaces.push(interface);
         id
+    }
+
+    pub fn has_destination(&self, dest: &Address) -> bool {
+        self.seen_announces.contains_key(dest)
+    }
+
+    pub fn known_destinations(&self) -> Vec<Address> {
+        self.seen_announces.keys().copied().collect()
+    }
+
+    pub fn is_link_established(&self, link_id: &LinkId) -> bool {
+        self.established_links
+            .get(link_id)
+            .map(|l| l.state == crate::link::LinkState::Active)
+            .unwrap_or(false)
     }
 
     pub fn add_service(&mut self, service: impl Service + 'static) -> Address {
@@ -218,6 +243,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         // Must have seen an announce for this destination
         let announce_entry = self.seen_announces.get(&destination)?;
         let target_interface = announce_entry.source_interface;
+        let next_hop = announce_entry.next_hop;
 
         // "randomly generate a new X25519 private/public key pair"
         let ephemeral = EphemeralKeyPair::generate(&mut self.rng);
@@ -229,8 +255,8 @@ impl<T: Transport, R: RngCore> Node<T, R> {
 
         let request = LinkRequest::new(ephemeral.public, signing_key.verifying_key().to_bytes());
 
-        // Build link request packet
-        let packet = self.make_link_request_packet(destination, request.to_bytes());
+        // Build link request packet - use Type2 if we have a next_hop transport node
+        let packet = self.make_link_request_packet(destination, next_hop, request.to_bytes());
         let link_id = LinkRequest::link_id(&packet.hashable_part());
 
         // Store pending link
@@ -263,8 +289,9 @@ impl<T: Transport, R: RngCore> Node<T, R> {
     }
 
     fn handle_announce(&mut self, packet: &Packet, source: usize, now: Instant) {
-        let dest = match packet.addresses {
-            Addresses::Single(a) | Addresses::Double(a, _) => a,
+        let (next_hop, dest) = match packet.addresses {
+            Addresses::Single(a) => (None, a),
+            Addresses::Double(transport_id, dest) => (Some(transport_id), dest),
         };
         let hops = packet.header.hops;
 
@@ -300,10 +327,17 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             announce.encryption_public_key(),
             signing_key,
             announce.ratchet.map(X25519Public::from),
+            next_hop,
         );
 
         if should_forward {
-            self.outbound(packet.clone(), Some(source), now);
+            // Convert to Type2 with our transport_id when forwarding
+            let mut forwarded = packet.clone();
+            forwarded.header.header_type = crate::HeaderType::Type2;
+            forwarded.header.propagation_type = crate::PropagationType::Transport;
+            forwarded.header.hops += 1;
+            forwarded.addresses = Addresses::Double(self.transport_id, dest);
+            self.outbound(forwarded, Some(source), now);
         }
     }
 
@@ -311,7 +345,8 @@ impl<T: Transport, R: RngCore> Node<T, R> {
     // accept the request."
     fn handle_link_request(&mut self, packet: &Packet, source: usize, now: Instant) {
         let dest = match packet.addresses {
-            Addresses::Single(a) | Addresses::Double(a, _) => a,
+            Addresses::Single(a) => a,
+            Addresses::Double(_, dest) => dest,
         };
         let hops = packet.header.hops;
 
@@ -376,7 +411,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
     fn handle_link_proof(&mut self, packet: &Packet, now: Instant) {
         let link_id: LinkId = match packet.addresses {
             Addresses::Single(a) => a,
-            Addresses::Double(a, _) => a,
+            Addresses::Double(_, dest) => dest, // transport_id first, link_id second
         };
 
         // Check if this is for a link we initiated
@@ -422,7 +457,8 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         use crate::crypto::SingleDestEncryption;
 
         let dest = match packet.addresses {
-            Addresses::Single(a) | Addresses::Double(a, _) => a,
+            Addresses::Single(a) => a,
+            Addresses::Double(_, dest) => dest,
         };
 
         if dest == PathRequest::destination() {
@@ -497,6 +533,12 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         match packet.context {
             Context::None => {
                 if let Some(plaintext) = link.decrypt(&packet.data) {
+                    log::info!(
+                        "link {:02x?} received {} bytes: {:?}",
+                        &link_id[..4],
+                        plaintext.len(),
+                        String::from_utf8_lossy(&plaintext)
+                    );
                     let service_addr = link.destination;
                     if let Some(service) =
                         self.services.iter_mut().find(|s| s.address == service_addr)
@@ -630,7 +672,8 @@ impl<T: Transport, R: RngCore> Node<T, R> {
     // that connect to wider and faster networks."
     fn outbound(&mut self, packet: Packet, exclude: Option<usize>, now: Instant) {
         let dest = match packet.addresses {
-            Addresses::Single(a) | Addresses::Double(a, _) => a,
+            Addresses::Single(a) => a,
+            Addresses::Double(_, dest) => dest,
         };
         let hops = packet.header.hops;
 
@@ -857,20 +900,37 @@ impl<T: Transport, R: RngCore> Node<T, R> {
     }
 
     // "The link request is addressed to the destination hash of the desired destination"
-    fn make_link_request_packet(&self, dest: Address, data: Vec<u8>) -> Packet {
+    fn make_link_request_packet(
+        &self,
+        dest: Address,
+        transport_id: Option<Address>,
+        data: Vec<u8>,
+    ) -> Packet {
         use crate::{
             Context, ContextFlag, DestinationType, Header, HeaderType, IfacFlag, PropagationType,
         };
+        let (header_type, propagation_type, addresses) = match transport_id {
+            Some(tid) => (
+                HeaderType::Type2,
+                PropagationType::Transport,
+                Addresses::Double(tid, dest),
+            ),
+            None => (
+                HeaderType::Type1,
+                PropagationType::Broadcast,
+                Addresses::Single(dest),
+            ),
+        };
         let header = Header {
             ifac_flag: IfacFlag::Open,
-            header_type: HeaderType::Type1,
+            header_type,
             context_flag: ContextFlag::Unset,
-            propagation_type: PropagationType::Broadcast,
+            propagation_type,
             destination_type: DestinationType::Link,
             packet_type: PacketType::LinkRequest,
             hops: 0,
         };
-        Packet::new(header, None, Addresses::Single(dest), Context::None, data).unwrap()
+        Packet::new(header, None, addresses, Context::None, data).unwrap()
     }
 
     // "This packet is addressed to the link id of the link."
@@ -906,6 +966,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         encryption_key: X25519Public,
         signing_key: VerifyingKey,
         ratchet_key: Option<X25519Public>,
+        next_hop: Option<Address>,
     ) -> bool {
         if let Some(entry) = self.seen_announces.get_mut(&destination) {
             // "If a newer announce from the same destination arrives, while an identical one
@@ -924,6 +985,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 entry.encryption_key = encryption_key;
                 entry.signing_key = signing_key;
                 entry.ratchet_key = ratchet_key;
+                entry.next_hop = next_hop;
                 return hops < self.max_hops;
             }
             // "If this exact announce has already been received before, ignore it."
@@ -949,6 +1011,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 encryption_key,
                 signing_key,
                 ratchet_key,
+                next_hop,
             },
         );
 
@@ -1699,6 +1762,141 @@ mod tests {
         assert!(initiator.pending_outbound_links.contains_key(&link_id));
     }
 
+    // When an announce arrives via a transport node (Type2 packet), the client must send
+    // link requests as Type2 packets addressed to that transport node. Otherwise, the
+    // transport node won't know how to forward the packet.
+    #[test]
+    fn link_request_uses_type2_when_announce_came_via_transport() {
+        // Server behind a transport node
+        let mut server: Node<MockTransport> = Node::new();
+        let (server_iface, server_wire) = make_mock_interface(true);
+        server.add_interface(server_iface);
+        let service_addr = server.add_service(TestService::new("remote.service"));
+
+        // Transport node in the middle
+        let mut transport: Node<MockTransport> = Node::new();
+        let (transport_server_iface, transport_server_wire) = make_mock_interface(true);
+        let (transport_client_iface, transport_client_wire) = make_mock_interface(true);
+        transport.add_interface(transport_server_iface);
+        transport.add_interface(transport_client_iface);
+
+        // Client
+        let mut client: Node<MockTransport> = Node::new();
+        let (client_iface, client_wire) = make_mock_interface(true);
+        client.add_interface(client_iface);
+
+        let now = Instant::now();
+
+        // Server announces (Type1 broadcast)
+        server.announce(service_addr, now);
+        server.poll(now);
+        let announce_bytes = server_wire.take_sent().remove(0);
+        let announce = Packet::from_bytes(&announce_bytes, 0).unwrap();
+        assert_eq!(announce.header.header_type, HeaderType::Type1);
+
+        // Transport receives and forwards (becomes Type2 with transport_id)
+        transport_server_wire.inject(&announce);
+        transport.poll(now);
+        let forwarded = transport_client_wire.take_sent();
+        assert_eq!(forwarded.len(), 1);
+        let forwarded_announce = Packet::from_bytes(&forwarded[0], 0).unwrap();
+        assert_eq!(forwarded_announce.header.header_type, HeaderType::Type2);
+
+        // Extract transport_id from forwarded announce
+        let transport_id = match forwarded_announce.addresses {
+            Addresses::Double(tid, _) => tid,
+            _ => panic!("Expected Type2 addresses"),
+        };
+
+        // Client receives announce via transport
+        client_wire.inject(&forwarded_announce);
+        client.poll(now);
+
+        // Client should have stored the next_hop
+        let entry = client.seen_announces.get(&service_addr).unwrap();
+        assert_eq!(entry.next_hop, Some(transport_id));
+
+        // Client sends link request - should be Type2 with transport_id
+        let _link_id = client.link(service_addr, now).unwrap();
+        client.poll(now);
+
+        let sent = client_wire.take_sent();
+        assert_eq!(sent.len(), 1);
+        let link_request = Packet::from_bytes(&sent[0], 0).unwrap();
+
+        assert_eq!(
+            link_request.header.header_type,
+            HeaderType::Type2,
+            "Link request should be Type2 when destination is behind transport"
+        );
+        assert_eq!(
+            link_request.header.propagation_type,
+            PropagationType::Transport,
+            "Link request should use transport propagation"
+        );
+
+        // Verify addresses: transport_id first, destination second
+        match link_request.addresses {
+            Addresses::Double(tid, dest) => {
+                assert_eq!(tid, transport_id, "First address should be transport_id");
+                assert_eq!(dest, service_addr, "Second address should be destination");
+            }
+            _ => panic!("Expected Type2 addresses in link request"),
+        }
+    }
+
+    // Direct link requests (no transport node) should remain Type1 broadcast
+    #[test]
+    fn link_request_uses_type1_for_direct_connection() {
+        let mut responder: Node<MockTransport> = Node::new();
+        let (resp_iface, resp_wire) = make_mock_interface(true);
+        responder.add_interface(resp_iface);
+
+        let service_addr = responder.add_service(TestService::new("direct.service"));
+        let now = Instant::now();
+        responder.announce(service_addr, now);
+        responder.poll(now);
+
+        let mut initiator: Node<MockTransport> = Node::new();
+        let (init_iface, init_wire) = make_mock_interface(true);
+        let announce_bytes = resp_wire.take_sent().remove(0);
+        let announce_packet = Packet::from_bytes(&announce_bytes, 0).unwrap();
+
+        // Direct announce is Type1 (no transport_id)
+        assert_eq!(announce_packet.header.header_type, HeaderType::Type1);
+
+        init_wire.inject(&announce_packet);
+        initiator.add_interface(init_iface);
+        initiator.poll(now);
+
+        // Verify no next_hop stored
+        let entry = initiator.seen_announces.get(&service_addr).unwrap();
+        assert_eq!(entry.next_hop, None);
+
+        // Send link request
+        let _link_id = initiator.link(service_addr, now).unwrap();
+        initiator.poll(now);
+
+        let sent = init_wire.take_sent();
+        assert_eq!(sent.len(), 1);
+        let link_request = Packet::from_bytes(&sent[0], 0).unwrap();
+
+        assert_eq!(
+            link_request.header.header_type,
+            HeaderType::Type1,
+            "Direct link request should be Type1"
+        );
+        assert_eq!(
+            link_request.header.propagation_type,
+            PropagationType::Broadcast,
+            "Direct link request should use broadcast propagation"
+        );
+        assert!(
+            matches!(link_request.addresses, Addresses::Single(_)),
+            "Direct link request should have single address"
+        );
+    }
+
     // "When the destination receives the link request packet, it will decide whether to
     // accept the request. If it is accepted, the destination will also generate a new
     // X25519 private/public key pair"
@@ -1937,7 +2135,7 @@ mod tests {
         // The announce is for our service
         let announce_dest = match announce_packet.addresses {
             Addresses::Single(a) => a,
-            Addresses::Double(a, _) => a,
+            Addresses::Double(_, dest) => dest,
         };
         assert_eq!(announce_dest, service_addr);
     }
