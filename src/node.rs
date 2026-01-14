@@ -7,7 +7,9 @@ use rand::rngs::ThreadRng;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 use crate::announce::{AnnounceBuilder, AnnounceData};
-use crate::crypto::sha256;
+use crate::crypto::{EphemeralKeyPair, sha256};
+use crate::link::{EstablishedLink, LinkId, LinkProof, LinkRequest, PendingLink};
+use crate::path_request::PathRequest;
 use crate::{Address, Addresses, Interface, Packet, PacketType, Transport};
 
 // "By default, m is set to 128."
@@ -47,6 +49,15 @@ struct AnnounceEntry {
     ratchet_key: Option<X25519Public>,
 }
 
+// "Any node that forwards the link request will store a link id in it's link table,
+// along with the amount of hops the packet had taken when received."
+struct PendingInboundLink {
+    link_id: LinkId,
+    initiator_encryption_public: X25519Public,
+    source_interface: usize,
+    service_index: usize,
+}
+
 pub struct Node<T, R = ThreadRng> {
     max_hops: u8,
     retries: u8,
@@ -55,6 +66,10 @@ pub struct Node<T, R = ThreadRng> {
     seen_announces: HashMap<Address, AnnounceEntry>,
     services: Vec<ServiceEntry>,
     interfaces: Vec<Interface<T>>,
+    // "The link id is a hash of the entire link request packet."
+    pending_outbound_links: HashMap<LinkId, PendingLink>,
+    pending_inbound_links: HashMap<LinkId, PendingInboundLink>,
+    established_links: HashMap<LinkId, EstablishedLink>,
 }
 
 impl<T: Transport> Node<T, ThreadRng> {
@@ -67,6 +82,9 @@ impl<T: Transport> Node<T, ThreadRng> {
             seen_announces: HashMap::new(),
             interfaces: Vec::new(),
             services: Vec::new(),
+            pending_outbound_links: HashMap::new(),
+            pending_inbound_links: HashMap::new(),
+            established_links: HashMap::new(),
         }
     }
 }
@@ -81,6 +99,9 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             seen_announces: HashMap::new(),
             interfaces: Vec::new(),
             services: Vec::new(),
+            pending_outbound_links: HashMap::new(),
+            pending_inbound_links: HashMap::new(),
+            established_links: HashMap::new(),
         }
     }
 
@@ -149,6 +170,84 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         }
     }
 
+    // "Requests a path to the destination from the network. If another reachable peer
+    // on the network knows a path, it will announce it."
+    pub fn request_path(&mut self, destination: Address, now: Instant) {
+        use crate::{
+            Context, ContextFlag, DestinationType, Header, HeaderType, IfacFlag, PropagationType,
+        };
+
+        let mut tag = [0u8; 16];
+        self.rng.fill_bytes(&mut tag);
+
+        let request = PathRequest::new(destination, tag);
+        let header = Header {
+            ifac_flag: IfacFlag::Open,
+            header_type: HeaderType::Type1,
+            context_flag: ContextFlag::Unset,
+            propagation_type: PropagationType::Broadcast,
+            destination_type: DestinationType::Plain,
+            packet_type: PacketType::Data,
+            hops: 0,
+        };
+        let packet = Packet::new(
+            header,
+            None,
+            Addresses::Single(PathRequest::destination()),
+            Context::None,
+            request.to_bytes(),
+        )
+        .unwrap();
+
+        for iface in &mut self.interfaces {
+            iface.send(packet.clone(), 0, &mut self.rng, now);
+        }
+    }
+
+    // "When a node in the network wants to establish verified connectivity with another node,
+    // it will randomly generate a new X25519 private/public key pair. It then creates a
+    // link request packet, and broadcast it."
+    pub fn link(&mut self, destination: Address, now: Instant) -> Option<LinkId> {
+        // Must have seen an announce for this destination
+        let announce_entry = self.seen_announces.get(&destination)?;
+        let target_interface = announce_entry.source_interface;
+
+        // "randomly generate a new X25519 private/public key pair"
+        let ephemeral = EphemeralKeyPair::generate(&mut self.rng);
+
+        // Generate signing keypair for this link
+        let mut sig_bytes = [0u8; 32];
+        self.rng.fill_bytes(&mut sig_bytes);
+        let signing_key = SigningKey::from_bytes(&sig_bytes);
+
+        let request = LinkRequest::new(ephemeral.public, signing_key.verifying_key().to_bytes());
+
+        // Build link request packet
+        let packet = self.make_link_request_packet(destination, request.to_bytes());
+        let packet_bytes = packet.to_bytes();
+
+        // "The link id is a hash of the entire link request packet."
+        let link_id = request.link_id(&packet_bytes);
+
+        // Store pending link
+        self.pending_outbound_links.insert(
+            link_id,
+            PendingLink {
+                link_id,
+                initiator_encryption_secret: ephemeral.secret,
+                initiator_encryption_public: ephemeral.public,
+                destination,
+            },
+        );
+
+        // Send on the interface that received the announce
+        if let Some(iface) = self.interfaces.get_mut(target_interface) {
+            iface.send(packet, 0, &mut self.rng, now);
+        }
+
+        Some(link_id)
+    }
+
     pub(crate) fn inbound(&mut self, packet: &Packet, source: usize, now: Instant) {
         match packet.header.packet_type {
             PacketType::Announce => {
@@ -189,8 +288,144 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                     self.outbound(packet.clone(), Some(source), now);
                 }
             }
-            PacketType::Data | PacketType::LinkRequest | PacketType::Proof => {}
+            PacketType::LinkRequest => {
+                self.handle_link_request(packet, source, now);
+            }
+            PacketType::Proof => {
+                self.handle_link_proof(packet);
+            }
+            PacketType::Data => {
+                self.handle_data_packet(packet, source, now);
+            }
         }
+    }
+
+    // "When the destination receives the link request packet, it will decide whether to
+    // accept the request."
+    fn handle_link_request(&mut self, packet: &Packet, source: usize, now: Instant) {
+        let dest = match packet.addresses {
+            Addresses::Single(a) | Addresses::Double(a, _) => a,
+        };
+
+        // Find the service this link request is for
+        let service_index = match self.services.iter().position(|s| s.address == dest) {
+            Some(idx) => idx,
+            None => return, // Not for us, could forward if we were a transport node
+        };
+
+        let Some(request) = LinkRequest::parse(&packet.data) else {
+            return;
+        };
+
+        // "The link id is a hash of the entire link request packet."
+        let link_id = request.link_id(&packet.to_bytes());
+
+        // "If it is accepted, the destination will also generate a new X25519 private/public
+        // key pair, and perform a Diffie Hellman Key Exchange"
+        let responder_ephemeral = EphemeralKeyPair::generate(&mut self.rng);
+
+        // Create established link on responder side
+        let established = EstablishedLink::from_responder(
+            link_id,
+            &responder_ephemeral.secret,
+            &request.encryption_public,
+            dest,
+        );
+        self.established_links.insert(link_id, established);
+
+        // "A link proof packet is now constructed and transmitted over the network."
+        let service = &self.services[service_index];
+        let proof = LinkProof::create(&link_id, &responder_ephemeral.public, &service.signing_key);
+
+        // "This packet is addressed to the link id of the link."
+        let proof_packet = self.make_link_proof_packet(link_id, proof.to_bytes());
+
+        // Send back on the interface that received the request
+        if let Some(iface) = self.interfaces.get_mut(source) {
+            iface.send(proof_packet, 0, &mut self.rng, now);
+        }
+    }
+
+    // "When the source receives the proof, it will know unequivocally that a verified path
+    // has been established to the destination."
+    fn handle_link_proof(&mut self, packet: &Packet) {
+        // The proof is addressed to the link_id
+        let link_id: LinkId = match packet.addresses {
+            Addresses::Single(a) => a,
+            Addresses::Double(a, _) => a,
+        };
+
+        let Some(pending) = self.pending_outbound_links.remove(&link_id) else {
+            return;
+        };
+
+        let Some(proof) = LinkProof::parse(&packet.data) else {
+            // Put it back if we can't parse
+            self.pending_outbound_links.insert(link_id, pending);
+            return;
+        };
+
+        // Verify the proof against the destination's known signing key
+        let Some(announce_entry) = self.seen_announces.get(&pending.destination) else {
+            self.pending_outbound_links.insert(link_id, pending);
+            return;
+        };
+
+        if !proof.verify(&link_id, &announce_entry.signing_key) {
+            self.pending_outbound_links.insert(link_id, pending);
+            return;
+        }
+
+        // "It can now also use the X25519 public key contained in the link proof to perform
+        // it's own Diffie Hellman Key Exchange and derive the symmetric key"
+        let established = EstablishedLink::from_initiator(pending, &proof.encryption_public);
+        self.established_links.insert(link_id, established);
+    }
+
+    fn handle_data_packet(&mut self, packet: &Packet, _source: usize, now: Instant) {
+        let dest = match packet.addresses {
+            Addresses::Single(a) | Addresses::Double(a, _) => a,
+        };
+
+        // Check if this is a path request (addressed to well-known path request destination)
+        if dest == PathRequest::destination() {
+            self.handle_path_request(packet, now);
+        }
+    }
+
+    // "If another reachable peer on the network knows a path, it will announce it."
+    fn handle_path_request(&mut self, packet: &Packet, now: Instant) {
+        let Some(request) = PathRequest::parse(&packet.data) else {
+            return;
+        };
+
+        // Check if we have a local service for this destination
+        if let Some(entry) = self
+            .services
+            .iter()
+            .find(|s| s.address == request.destination_hash)
+        {
+            // Re-announce our local service
+            let mut random_hash = [0u8; 10];
+            self.rng.fill_bytes(&mut random_hash);
+
+            let announce_data = AnnounceBuilder::new(
+                *entry.encryption_public.as_bytes(),
+                entry.signing_key.clone(),
+                entry.name_hash,
+                random_hash,
+            )
+            .build(&entry.address);
+
+            let announce_packet =
+                self.make_announce_packet(entry.address, 0, announce_data.to_bytes());
+
+            for iface in &mut self.interfaces {
+                iface.send(announce_packet.clone(), 0, &mut self.rng, now);
+            }
+        }
+        // TODO: If we're a transport node and have seen an announce for this destination,
+        // we could re-broadcast the cached announce
     }
 
     // "After a randomised delay, the announce will be retransmitted on all interfaces
@@ -285,6 +520,47 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             hops,
         };
         Packet::new(header, None, Addresses::Single(dest), Context::None, data).unwrap()
+    }
+
+    // "The link request is addressed to the destination hash of the desired destination"
+    fn make_link_request_packet(&self, dest: Address, data: Vec<u8>) -> Packet {
+        use crate::{
+            Context, ContextFlag, DestinationType, Header, HeaderType, IfacFlag, PropagationType,
+        };
+        let header = Header {
+            ifac_flag: IfacFlag::Open,
+            header_type: HeaderType::Type1,
+            context_flag: ContextFlag::Unset,
+            propagation_type: PropagationType::Broadcast,
+            destination_type: DestinationType::Link,
+            packet_type: PacketType::LinkRequest,
+            hops: 0,
+        };
+        Packet::new(header, None, Addresses::Single(dest), Context::None, data).unwrap()
+    }
+
+    // "This packet is addressed to the link id of the link."
+    fn make_link_proof_packet(&self, link_id: LinkId, data: Vec<u8>) -> Packet {
+        use crate::{
+            Context, ContextFlag, DestinationType, Header, HeaderType, IfacFlag, PropagationType,
+        };
+        let header = Header {
+            ifac_flag: IfacFlag::Open,
+            header_type: HeaderType::Type1,
+            context_flag: ContextFlag::Unset,
+            propagation_type: PropagationType::Broadcast,
+            destination_type: DestinationType::Link,
+            packet_type: PacketType::Proof,
+            hops: 0,
+        };
+        Packet::new(
+            header,
+            None,
+            Addresses::Single(link_id),
+            Context::None,
+            data,
+        )
+        .unwrap()
     }
 
     fn process_announce_inner(
@@ -925,5 +1201,369 @@ mod tests {
             packet.data, plaintext,
             "Plain destination packet data should be plaintext"
         );
+    }
+
+    // --- Link Establishment Tests ---
+    // Two nodes establish a link after announce exchange
+
+    // "When a node in the network wants to establish verified connectivity with another node,
+    // it will randomly generate a new X25519 private/public key pair. It then creates a
+    // link request packet, and broadcast it."
+    #[test]
+    fn link_request_requires_prior_announce() {
+        let mut initiator: Node<MockTransport> = Node::new();
+        let (iface, _wire) = make_mock_interface(true);
+        initiator.add_interface(iface);
+
+        let now = Instant::now();
+        // Try to link to unknown destination
+        let unknown_dest: Address = [0xDE; 16];
+        let result = initiator.link(unknown_dest, now);
+
+        assert!(result.is_none(), "Link to unknown destination should fail");
+    }
+
+    // "First, the node that wishes to establish a link will send out a link request packet"
+    #[test]
+    fn link_sends_link_request_packet() {
+        let mut responder: Node<MockTransport> = Node::new();
+        let (resp_iface, resp_wire) = make_mock_interface(true);
+        responder.add_interface(resp_iface);
+
+        let service_addr = responder.add_service(TestService::new("link.test"));
+        let now = Instant::now();
+        responder.announce(service_addr, now);
+        responder.poll(now);
+
+        // Initiator receives the announce
+        let mut initiator: Node<MockTransport> = Node::new();
+        let (init_iface, init_wire) = make_mock_interface(true);
+        let announce_bytes = resp_wire.take_sent().remove(0);
+        let announce_packet = Packet::from_bytes(&announce_bytes, 0).unwrap();
+        init_wire.inject(&announce_packet);
+        initiator.add_interface(init_iface);
+        initiator.poll(now);
+
+        // Initiator sends link request
+        let link_id = initiator.link(service_addr, now).unwrap();
+        initiator.poll(now);
+
+        // Verify link request was sent
+        let sent = init_wire.take_sent();
+        assert_eq!(sent.len(), 1);
+
+        let link_request = Packet::from_bytes(&sent[0], 0).unwrap();
+        assert_eq!(link_request.header.packet_type, PacketType::LinkRequest);
+        assert_eq!(link_request.header.destination_type, DestinationType::Link);
+
+        // Verify pending link was stored
+        assert!(initiator.pending_outbound_links.contains_key(&link_id));
+    }
+
+    // "When the destination receives the link request packet, it will decide whether to
+    // accept the request. If it is accepted, the destination will also generate a new
+    // X25519 private/public key pair"
+    //
+    // "A link proof packet is now constructed and transmitted over the network."
+    #[test]
+    fn responder_sends_link_proof() {
+        let mut responder: Node<MockTransport> = Node::new();
+        let (resp_iface, resp_wire) = make_mock_interface(true);
+        responder.add_interface(resp_iface);
+
+        let service_addr = responder.add_service(TestService::new("link.test"));
+        let now = Instant::now();
+        responder.announce(service_addr, now);
+        responder.poll(now);
+
+        // Initiator receives announce
+        let mut initiator: Node<MockTransport> = Node::new();
+        let (init_iface, init_wire) = make_mock_interface(true);
+        let announce_bytes = resp_wire.take_sent().remove(0);
+        let announce_packet = Packet::from_bytes(&announce_bytes, 0).unwrap();
+        init_wire.inject(&announce_packet);
+        initiator.add_interface(init_iface);
+        initiator.poll(now);
+
+        // Initiator sends link request
+        let link_id = initiator.link(service_addr, now).unwrap();
+        initiator.poll(now);
+
+        // Responder receives link request
+        let link_request_bytes = init_wire.take_sent().remove(0);
+        let link_request = Packet::from_bytes(&link_request_bytes, 0).unwrap();
+        resp_wire.inject(&link_request);
+        responder.poll(now);
+
+        // Verify responder established the link
+        assert!(responder.established_links.contains_key(&link_id));
+
+        // Verify link proof was sent
+        let sent = resp_wire.take_sent();
+        assert_eq!(sent.len(), 1);
+
+        let proof_packet = Packet::from_bytes(&sent[0], 0).unwrap();
+        assert_eq!(proof_packet.header.packet_type, PacketType::Proof);
+        assert_eq!(proof_packet.header.destination_type, DestinationType::Link);
+    }
+
+    // "When the source receives the proof, it will know unequivocally that a verified path
+    // has been established to the destination. It can now also use the X25519 public key
+    // contained in the link proof to perform it's own Diffie Hellman Key Exchange and
+    // derive the symmetric key that is used to encrypt the channel."
+    #[test]
+    fn full_link_establishment_between_two_nodes() {
+        let mut responder: Node<MockTransport> = Node::new();
+        let (resp_iface, resp_wire) = make_mock_interface(true);
+        responder.add_interface(resp_iface);
+
+        let service_addr = responder.add_service(TestService::new("link.test"));
+        let now = Instant::now();
+        responder.announce(service_addr, now);
+        responder.poll(now);
+
+        // Initiator receives announce
+        let mut initiator: Node<MockTransport> = Node::new();
+        let (init_iface, init_wire) = make_mock_interface(true);
+        let announce_bytes = resp_wire.take_sent().remove(0);
+        let announce_packet = Packet::from_bytes(&announce_bytes, 0).unwrap();
+        init_wire.inject(&announce_packet);
+        initiator.add_interface(init_iface);
+        initiator.poll(now);
+
+        // Initiator sends link request
+        let link_id = initiator.link(service_addr, now).unwrap();
+        initiator.poll(now);
+
+        // Responder receives link request and sends proof
+        let link_request_bytes = init_wire.take_sent().remove(0);
+        let link_request = Packet::from_bytes(&link_request_bytes, 0).unwrap();
+        resp_wire.inject(&link_request);
+        responder.poll(now);
+
+        // Initiator receives proof
+        let proof_bytes = resp_wire.take_sent().remove(0);
+        let proof_packet = Packet::from_bytes(&proof_bytes, 0).unwrap();
+        init_wire.inject(&proof_packet);
+        initiator.poll(now);
+
+        // Both nodes should have established links
+        assert!(initiator.established_links.contains_key(&link_id));
+        assert!(responder.established_links.contains_key(&link_id));
+
+        // The shared keys should match (ECDH produces same key on both sides)
+        let initiator_link = initiator.established_links.get(&link_id).unwrap();
+        let responder_link = responder.established_links.get(&link_id).unwrap();
+        assert_eq!(initiator_link.shared_key, responder_link.shared_key);
+
+        // Pending link should be removed from initiator
+        assert!(!initiator.pending_outbound_links.contains_key(&link_id));
+    }
+
+    // "By verifying this link proof packet, all nodes that originally transported the
+    // link request packet to the destination from the originator can now verify that
+    // the intended destination received the request and accepted it"
+    #[test]
+    fn link_proof_verification_rejects_invalid_signature() {
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+
+        let mut responder: Node<MockTransport, StdRng> = Node::with_rng(StdRng::seed_from_u64(42));
+        let (resp_iface, resp_wire) = make_mock_interface(true);
+        responder.add_interface(resp_iface);
+
+        let service_addr = responder.add_service(TestService::new("link.test"));
+        let now = Instant::now();
+        responder.announce(service_addr, now);
+        responder.poll(now);
+
+        // Initiator receives announce
+        let mut initiator: Node<MockTransport, StdRng> = Node::with_rng(StdRng::seed_from_u64(99));
+        let (init_iface, init_wire) = make_mock_interface(true);
+        let announce_bytes = resp_wire.take_sent().remove(0);
+        let announce_packet = Packet::from_bytes(&announce_bytes, 0).unwrap();
+        init_wire.inject(&announce_packet);
+        initiator.add_interface(init_iface);
+        initiator.poll(now);
+
+        // Initiator sends link request
+        let link_id = initiator.link(service_addr, now).unwrap();
+        initiator.poll(now);
+
+        // Responder receives link request
+        let link_request_bytes = init_wire.take_sent().remove(0);
+        let link_request = Packet::from_bytes(&link_request_bytes, 0).unwrap();
+        resp_wire.inject(&link_request);
+        responder.poll(now);
+
+        // Get the proof but tamper with it
+        let proof_bytes = resp_wire.take_sent().remove(0);
+        let mut tampered = proof_bytes.clone();
+        // Flip a byte in the signature area
+        if let Some(b) = tampered.get_mut(50) {
+            *b ^= 0xFF;
+        }
+
+        let tampered_packet = Packet::from_bytes(&tampered, 0).unwrap();
+        init_wire.inject(&tampered_packet);
+        initiator.poll(now);
+
+        // Initiator should NOT have established link (bad signature)
+        assert!(!initiator.established_links.contains_key(&link_id));
+        // Pending link should still be there
+        assert!(initiator.pending_outbound_links.contains_key(&link_id));
+    }
+
+    // "The link initiator remains completely anonymous."
+    #[test]
+    fn link_request_does_not_reveal_initiator_identity() {
+        let mut responder: Node<MockTransport> = Node::new();
+        let (resp_iface, resp_wire) = make_mock_interface(true);
+        responder.add_interface(resp_iface);
+
+        let service_addr = responder.add_service(TestService::new("link.test"));
+        let now = Instant::now();
+        responder.announce(service_addr, now);
+        responder.poll(now);
+
+        // Initiator has a service too (but shouldn't reveal it)
+        let mut initiator: Node<MockTransport> = Node::new();
+        let (init_iface, init_wire) = make_mock_interface(true);
+        initiator.add_interface(init_iface);
+        let initiator_service = initiator.add_service(TestService::new("initiator.service"));
+
+        let announce_bytes = resp_wire.take_sent().remove(0);
+        let announce_packet = Packet::from_bytes(&announce_bytes, 0).unwrap();
+        init_wire.inject(&announce_packet);
+        initiator.poll(now);
+
+        // Initiator sends link request
+        initiator.link(service_addr, now).unwrap();
+        initiator.poll(now);
+
+        // Check the link request doesn't contain initiator's service address
+        let link_request_bytes = init_wire.take_sent().remove(0);
+        let contains_initiator_addr = link_request_bytes
+            .windows(16)
+            .any(|w| w == initiator_service);
+        assert!(
+            !contains_initiator_addr,
+            "Link request should not contain initiator's service address"
+        );
+    }
+
+    // --- Path Request Tests ---
+
+    // "Requests a path to the destination from the network. If another reachable peer
+    // on the network knows a path, it will announce it."
+    #[test]
+    fn path_request_triggers_announce_from_service_owner() {
+        // Server has a service
+        let mut server: Node<MockTransport> = Node::new();
+        let (server_iface, server_wire) = make_mock_interface(true);
+        server.add_interface(server_iface);
+        let service_addr = server.add_service(TestService::new("path.test"));
+
+        // Client doesn't know about the service yet
+        let mut client: Node<MockTransport> = Node::new();
+        let (client_iface, client_wire) = make_mock_interface(true);
+        client.add_interface(client_iface);
+
+        let now = Instant::now();
+
+        // Client sends path request for the service address
+        client.request_path(service_addr, now);
+        client.poll(now);
+
+        // Path request was sent
+        let sent = client_wire.take_sent();
+        assert_eq!(sent.len(), 1);
+        let path_request_packet = Packet::from_bytes(&sent[0], 0).unwrap();
+        assert_eq!(path_request_packet.header.packet_type, PacketType::Data);
+
+        // Server receives the path request
+        server_wire.inject(&path_request_packet);
+        server.poll(now);
+
+        // Server should have sent an announce in response
+        let server_sent = server_wire.take_sent();
+        assert_eq!(server_sent.len(), 1);
+        let announce_packet = Packet::from_bytes(&server_sent[0], 0).unwrap();
+        assert_eq!(announce_packet.header.packet_type, PacketType::Announce);
+
+        // The announce is for our service
+        let announce_dest = match announce_packet.addresses {
+            Addresses::Single(a) => a,
+            Addresses::Double(a, _) => a,
+        };
+        assert_eq!(announce_dest, service_addr);
+    }
+
+    #[test]
+    fn path_request_for_unknown_destination_is_ignored() {
+        let mut server: Node<MockTransport> = Node::new();
+        let (server_iface, server_wire) = make_mock_interface(true);
+        server.add_interface(server_iface);
+        // Server has no services
+
+        let mut client: Node<MockTransport> = Node::new();
+        let (client_iface, client_wire) = make_mock_interface(true);
+        client.add_interface(client_iface);
+
+        let now = Instant::now();
+
+        // Client requests path for unknown destination
+        let unknown_dest: Address = [0xAB; 16];
+        client.request_path(unknown_dest, now);
+        client.poll(now);
+
+        let sent = client_wire.take_sent();
+        assert_eq!(sent.len(), 1);
+        let path_request_packet = Packet::from_bytes(&sent[0], 0).unwrap();
+
+        // Server receives but doesn't know the destination
+        server_wire.inject(&path_request_packet);
+        server.poll(now);
+
+        // Server should not have sent anything
+        let server_sent = server_wire.take_sent();
+        assert!(server_sent.is_empty());
+    }
+
+    #[test]
+    fn full_discovery_flow_request_path_then_link() {
+        // Server has a service
+        let mut server: Node<MockTransport> = Node::new();
+        let (server_iface, server_wire) = make_mock_interface(true);
+        server.add_interface(server_iface);
+        let service_addr = server.add_service(TestService::new("discovery.test"));
+
+        // Client knows the service address (out of band) but hasn't seen an announce
+        let mut client: Node<MockTransport> = Node::new();
+        let (client_iface, client_wire) = make_mock_interface(true);
+        client.add_interface(client_iface);
+
+        let now = Instant::now();
+
+        // Client can't link yet (no announce seen)
+        assert!(client.link(service_addr, now).is_none());
+
+        // Client requests path
+        client.request_path(service_addr, now);
+        client.poll(now);
+
+        // Server receives path request and announces
+        let path_request = Packet::from_bytes(&client_wire.take_sent()[0], 0).unwrap();
+        server_wire.inject(&path_request);
+        server.poll(now);
+
+        // Client receives announce
+        let announce = Packet::from_bytes(&server_wire.take_sent()[0], 0).unwrap();
+        client_wire.inject(&announce);
+        client.poll(now);
+
+        // Now client can link
+        let link_id = client.link(service_addr, now);
+        assert!(link_id.is_some());
     }
 }
