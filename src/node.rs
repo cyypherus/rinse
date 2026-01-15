@@ -85,6 +85,7 @@ struct Receipt {
 }
 
 struct PathEntry {
+    timestamp: Instant,
     next_hop: Address,
     hops: u8,
     receiving_interface: usize,
@@ -103,10 +104,11 @@ struct PendingAnnounce {
 }
 
 struct LinkTableEntry {
-    toward_initiator: usize,
-    toward_destination: usize,
+    timestamp: Instant,
     receiving_interface: usize,
     next_hop_interface: usize,
+    remaining_hops: u8,
+    hops: u8,
 }
 
 struct ReverseTableEntry {
@@ -367,7 +369,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         &mut self,
         raw: &[u8],
         interface_index: usize,
-        _now: Instant,
+        now: Instant,
     ) -> Option<(Packet, bool, bool)> {
         // If interface access codes are enabled,
         // we must authenticate each packet.
@@ -519,66 +521,66 @@ impl<T: Transport, R: RngCore> Node<T, R> {
 
             // If the packet is in transport (has transport_id), check whether we
             // are the designated next hop, and process it accordingly if we are.
-            if let Addresses::Double(transport_id, dest) = packet.addresses {
-                if transport_id == self.transport_id
-                    && packet.header.packet_type != PacketType::Announce
-                {
-                    if let Some(path_entry) = self.path_table.get(&dest) {
-                        let next_hop = path_entry.next_hop;
-                        let remaining_hops = path_entry.hops;
-                        let outbound_interface = path_entry.receiving_interface;
+            if let Addresses::Double(transport_id, dest) = packet.addresses
+                && transport_id == self.transport_id
+                && packet.header.packet_type != PacketType::Announce
+            {
+                if let Some(path_entry) = self.path_table.get_mut(&dest) {
+                    let next_hop = path_entry.next_hop;
+                    let remaining_hops = path_entry.hops;
+                    let outbound_interface = path_entry.receiving_interface;
 
-                        // Build forwarded packet
-                        let new_raw = if remaining_hops > 1 {
-                            // Replace transport_id with next_hop, keep rest
-                            let mut raw = packet.to_bytes();
-                            raw[2..18].copy_from_slice(&next_hop);
-                            raw
-                        } else if remaining_hops == 1 {
-                            // Strip transport headers - convert Type2 to Type1
-                            let mut new_packet = packet.clone();
-                            new_packet.header.header_type = crate::HeaderType::Type1;
-                            new_packet.header.propagation_type = PropagationType::Broadcast;
-                            new_packet.addresses = Addresses::Single(dest);
-                            new_packet.to_bytes()
-                        } else {
-                            // remaining_hops == 0, local delivery
-                            packet.to_bytes()
-                        };
-
-                        // Record in link_table for link requests, reverse_table for others
-                        if packet.header.packet_type == PacketType::LinkRequest {
-                            let link_id = LinkRequest::link_id(&packet.hashable_part());
-                            self.link_table.insert(
-                                link_id,
-                                LinkTableEntry {
-                                    toward_initiator: interface_index,
-                                    toward_destination: outbound_interface,
-                                    receiving_interface: interface_index,
-                                    next_hop_interface: outbound_interface,
-                                },
-                            );
-                        } else {
-                            self.reverse_table.insert(
-                                destination_hash,
-                                ReverseTableEntry {
-                                    receiving_interface: interface_index,
-                                    outbound_interface,
-                                },
-                            );
-                        }
-
-                        // Transmit on outbound interface
-                        if let Some(iface) = self.interfaces.get_mut(outbound_interface) {
-                            iface.transport.send(&new_raw);
-                            // TODO missing insert IDXPTTIMESTAMP tracking time entry in path table
-                        }
+                    // Build forwarded packet
+                    let new_raw = if remaining_hops > 1 {
+                        // Replace transport_id with next_hop, keep rest
+                        let mut raw = packet.to_bytes();
+                        raw[2..18].copy_from_slice(&next_hop);
+                        raw
+                    } else if remaining_hops == 1 {
+                        // Strip transport headers - convert Type2 to Type1
+                        let mut new_packet = packet.clone();
+                        new_packet.header.header_type = crate::HeaderType::Type1;
+                        new_packet.header.propagation_type = PropagationType::Broadcast;
+                        new_packet.addresses = Addresses::Single(dest);
+                        new_packet.to_bytes()
                     } else {
-                        log::debug!(
-                            "Got packet in transport, but no known path to destination <{}>",
-                            hex::encode(dest)
+                        // remaining_hops == 0, local delivery
+                        packet.to_bytes()
+                    };
+
+                    // Record in link_table for link requests, reverse_table for others
+                    if packet.header.packet_type == PacketType::LinkRequest {
+                        let link_id = LinkRequest::link_id(&packet.hashable_part());
+                        self.link_table.insert(
+                            link_id,
+                            LinkTableEntry {
+                                timestamp: now,
+                                receiving_interface: interface_index,
+                                next_hop_interface: outbound_interface,
+                                remaining_hops,
+                                hops: packet.header.hops,
+                            },
+                        );
+                    } else {
+                        self.reverse_table.insert(
+                            destination_hash,
+                            ReverseTableEntry {
+                                receiving_interface: interface_index,
+                                outbound_interface,
+                            },
                         );
                     }
+
+                    // Transmit on outbound interface
+                    if let Some(iface) = self.interfaces.get_mut(outbound_interface) {
+                        iface.transport.send(&new_raw);
+                        path_entry.timestamp = now;
+                    }
+                } else {
+                    log::debug!(
+                        "Got packet in transport, but no known path to destination <{}>",
+                        hex::encode(dest)
+                    );
                 }
             }
 
@@ -586,55 +588,46 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             if packet.header.packet_type != PacketType::Announce
                 && packet.header.packet_type != PacketType::LinkRequest
                 && packet.context != Context::LinkRequestProof
+                && let Some(link_entry) = self.link_table.get_mut(&link_id)
             {
-                if let Some(link_entry) = self.link_table.get(&link_id) {
-                    // TODO this logic does not match
-                    // # If receiving and outbound interface is
-                    // # the same for this link, direction doesn't
-                    // # matter, and we simply repeat the packet.
-                    // outbound_interface = None
-                    // if link_entry[IDX_LT_NH_IF] == link_entry[IDX_LT_RCVD_IF]:
-                    //     # But check that taken hops matches one
-                    //     # of the expectede values.
-                    //     if packet.hops == link_entry[IDX_LT_REM_HOPS] or packet.hops == link_entry[IDX_LT_HOPS]:
-                    //         outbound_interface = link_entry[IDX_LT_NH_IF]
-                    // else:
-                    //     # If interfaces differ, we transmit on
-                    //     # the opposite interface of what the
-                    //     # packet was received on.
-                    //     if packet.receiving_interface == link_entry[IDX_LT_NH_IF]:
-                    //         # Also check that expected hop count matches
-                    //         if packet.hops == link_entry[IDX_LT_REM_HOPS]:
-                    //             outbound_interface = link_entry[IDX_LT_RCVD_IF]
-                    //     elif packet.receiving_interface == link_entry[IDX_LT_RCVD_IF]:
-                    //         # Also check that expected hop count matches
-                    //         if packet.hops == link_entry[IDX_LT_HOPS]:
-                    //             outbound_interface = link_entry[IDX_LT_NH_IF]
-
-                    let outbound_interface =
-                        if link_entry.next_hop_interface == link_entry.receiving_interface {
-                            // Same interface both directions - just repeat
-                            Some(link_entry.next_hop_interface)
-                        } else if interface_index == link_entry.next_hop_interface {
-                            // Received from next_hop side, send to receiving side
-                            Some(link_entry.receiving_interface)
-                        } else if interface_index == link_entry.receiving_interface {
-                            // Received from receiving side, send to next_hop side
+                let hops = packet.header.hops;
+                let outbound_interface =
+                    if link_entry.next_hop_interface == link_entry.receiving_interface {
+                        // Same interface both directions - just repeat
+                        // But check that taken hops matches one of the expected values
+                        if hops == link_entry.remaining_hops || hops == link_entry.hops {
                             Some(link_entry.next_hop_interface)
                         } else {
                             None
-                        };
-
-                    if let Some(out_iface) = outbound_interface {
-                        // Add to packet hash filter now that we know it's our turn
-                        self.seen_packet_hashes.insert(packet_hash);
-
-                        let raw = packet.to_bytes();
-                        if let Some(iface) = self.interfaces.get_mut(out_iface) {
-                            iface.transport.send(&raw);
-                            // TODO missing insert IDXLTTIMESTAMP tracking time entry in path table
-                            // Transport.link_table[packet.destination_hash][IDX_LT_TIMESTAMP] = time.time()
                         }
+                    } else if interface_index == link_entry.next_hop_interface {
+                        // Received from next_hop side, send to receiving side
+                        // Check that expected hop count matches
+                        if hops == link_entry.remaining_hops {
+                            Some(link_entry.receiving_interface)
+                        } else {
+                            None
+                        }
+                    } else if interface_index == link_entry.receiving_interface {
+                        // Received from receiving side, send to next_hop side
+                        // Check that expected hop count matches
+                        if hops == link_entry.hops {
+                            Some(link_entry.next_hop_interface)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                if let Some(out_iface) = outbound_interface {
+                    // Add to packet hash filter now that we know it's our turn
+                    self.seen_packet_hashes.insert(packet_hash);
+
+                    let raw = packet.to_bytes();
+                    if let Some(iface) = self.interfaces.get_mut(out_iface) {
+                        iface.transport.send(&raw);
+                        link_entry.timestamp = now;
                     }
                 }
             }
@@ -704,15 +697,15 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 // If we see an announce with hop count one higher than what we sent,
                 // another node picked it up - cancel our retry
                 let our_hops = self.path_table.get(&destination_hash).map(|e| e.hops);
-                if let Some(h) = our_hops {
-                    if packet.header.hops == h.saturating_add(1) {
-                        log::trace!(
-                            "Announce for <{}> passed on by another node",
-                            hex::encode(destination_hash)
-                        );
-                        self.pending_announces
-                            .retain(|a| a.destination != destination_hash);
-                    }
+                if let Some(h) = our_hops
+                    && packet.header.hops == h.saturating_add(1)
+                {
+                    log::trace!(
+                        "Announce for <{}> passed on by another node",
+                        hex::encode(destination_hash)
+                    );
+                    self.pending_announces
+                        .retain(|a| a.destination != destination_hash);
                 }
 
                 // Determine if we should add/update path table
@@ -742,6 +735,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                     self.path_table.insert(
                         destination_hash,
                         PathEntry {
+                            timestamp: now,
                             next_hop: received_from,
                             hops,
                             receiving_interface: interface_index,
@@ -758,7 +752,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         hops,
                         app_data: announce.app_data.clone(),
                         retries_remaining: self.retries,
-                        retry_at: _now, // Rebroadcast immediately on first receive
+                        retry_at: now, // Rebroadcast immediately on first receive
                     });
 
                     log::debug!(
@@ -801,7 +795,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                     &responder_keypair.secret,
                     &request.encryption_public,
                     destination_hash,
-                    _now,
+                    now,
                 );
 
                 // Create and send proof
@@ -831,7 +825,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 // Data for a link - decrypt with link keys
                 if let Some(link) = self.established_links.get_mut(&link_id) {
                     if let Some(plaintext) = link.decrypt(&packet.data) {
-                        link.touch_inbound(_now);
+                        link.touch_inbound(now);
 
                         // Find the service this link belongs to
                         if let Some(service_idx) = self
@@ -926,7 +920,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
 
                     // Establish the link using the responder's public key from the proof
                     let link =
-                        EstablishedLink::from_initiator(pending, &proof.encryption_public, _now);
+                        EstablishedLink::from_initiator(pending, &proof.encryption_public, now);
 
                     self.established_links.insert(destination_hash, link);
 
