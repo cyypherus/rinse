@@ -1,6 +1,7 @@
 use std::collections::BinaryHeap;
 use std::time::Instant;
 
+use ed25519_dalek::SigningKey;
 use rand::Rng;
 
 use crate::Packet;
@@ -44,10 +45,13 @@ struct DelayedPacket {
 }
 
 pub struct Interface<T> {
-    transport: T,
+    pub(crate) transport: T,
     queue: BinaryHeap<QueuedPacket>,
     delayed: Vec<DelayedPacket>,
-    ifac_len: usize,
+    pub(crate) ifac_len: usize,
+    pub(crate) ifac_size: usize,
+    pub(crate) ifac_identity: Option<SigningKey>,
+    pub(crate) ifac_key: Option<Vec<u8>>,
     pub(crate) min_delay_ms: u64,
     pub(crate) max_delay_ms: u64,
 }
@@ -59,9 +63,19 @@ impl<T: Transport> Interface<T> {
             queue: BinaryHeap::new(),
             delayed: Vec::new(),
             ifac_len,
+            ifac_size: 0,
+            ifac_identity: None,
+            ifac_key: None,
             min_delay_ms: 0,
             max_delay_ms: 500,
         }
+    }
+
+    pub fn with_ifac(mut self, identity: SigningKey, key: Vec<u8>, size: usize) -> Self {
+        self.ifac_identity = Some(identity);
+        self.ifac_key = Some(key);
+        self.ifac_size = size;
+        self
     }
 
     fn bandwidth_available(&self) -> bool {

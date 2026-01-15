@@ -64,9 +64,11 @@ impl LinkProof {
         responder_encryption_public: &X25519Public,
         responder_signing_key: &SigningKey,
     ) -> Self {
-        let mut sign_data = Vec::with_capacity(48);
+        // signed_data = link_id + pub_bytes + sig_pub_bytes
+        let mut sign_data = Vec::with_capacity(80);
         sign_data.extend_from_slice(link_id);
         sign_data.extend_from_slice(responder_encryption_public.as_bytes());
+        sign_data.extend_from_slice(responder_signing_key.verifying_key().as_bytes());
         let signature = sign(responder_signing_key, &sign_data);
         Self {
             encryption_public: *responder_encryption_public,
@@ -75,18 +77,20 @@ impl LinkProof {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
+        // proof_data = signature + pub_bytes
         let mut out = Vec::with_capacity(96);
-        out.extend_from_slice(self.encryption_public.as_bytes());
         out.extend_from_slice(&self.signature.to_bytes());
+        out.extend_from_slice(self.encryption_public.as_bytes());
         out
     }
 
     pub fn parse(data: &[u8]) -> Option<Self> {
+        // proof_data = signature (64) + pub_bytes (32)
         if data.len() < 96 {
             return None;
         }
-        let encryption_public = X25519Public::from(<[u8; 32]>::try_from(&data[..32]).ok()?);
-        let signature = Signature::from_bytes(&data[32..96].try_into().ok()?);
+        let signature = Signature::from_bytes(&data[..64].try_into().ok()?);
+        let encryption_public = X25519Public::from(<[u8; 32]>::try_from(&data[64..96]).ok()?);
         Some(Self {
             encryption_public,
             signature,
@@ -94,9 +98,11 @@ impl LinkProof {
     }
 
     pub fn verify(&self, link_id: &LinkId, responder_signing_key: &VerifyingKey) -> bool {
-        let mut sign_data = Vec::with_capacity(48);
+        // signed_data = link_id + pub_bytes + sig_pub_bytes
+        let mut sign_data = Vec::with_capacity(80);
         sign_data.extend_from_slice(link_id);
         sign_data.extend_from_slice(self.encryption_public.as_bytes());
+        sign_data.extend_from_slice(responder_signing_key.as_bytes());
         verify(responder_signing_key, &sign_data, &self.signature)
     }
 }

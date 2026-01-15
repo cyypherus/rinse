@@ -42,6 +42,13 @@ fn derive_link_key(shared_secret: &[u8], link_id: &[u8; 16]) -> [u8; 64] {
     key
 }
 
+pub fn hkdf_expand(ikm: &[u8], salt: &[u8], length: usize) -> Vec<u8> {
+    let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
+    let mut output = vec![0u8; length];
+    hk.expand(&[], &mut output).expect("valid length");
+    output
+}
+
 fn pad_pkcs7(data: &[u8], block_size: usize) -> Vec<u8> {
     let padding_len = block_size - (data.len() % block_size);
     let mut padded = data.to_vec();

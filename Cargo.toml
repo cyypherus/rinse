@@ -7,6 +7,7 @@ edition = "2024"
 aes = "0.8.4"
 cbc = { version = "0.1.2", features = ["alloc"] }
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+hex = "0.4"
 hkdf = "0.12.4"
 hmac = "0.12.1"
 log = "0.4"
@@ -16,6 +17,3 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_bytes = "0.11"
 sha2 = "0.10.9"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
-
-[dev-dependencies]
-hex = "0.4"
