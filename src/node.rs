@@ -22,6 +22,7 @@ const DEFAULT_MAX_HOPS: u8 = 128;
 // "By default, r is set to 1."
 const DEFAULT_RETRIES: u8 = 1;
 const DEFAULT_RETRY_DELAY_MS: u64 = 4000;
+const LOCAL_REBROADCASTS_MAX: u8 = 2;
 
 pub enum InboundMessage {
     LinkData {
@@ -94,6 +95,7 @@ struct PathEntry {
     ratchet_key: Option<X25519Public>,
 }
 
+#[derive(Debug)]
 struct PendingAnnounce {
     destination: Address,
     source_interface: usize,
@@ -101,6 +103,7 @@ struct PendingAnnounce {
     app_data: Vec<u8>,
     retries_remaining: u8,
     retry_at: Instant,
+    local_rebroadcasts: u8,
 }
 
 struct LinkTableEntry {
@@ -455,7 +458,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         let packet_hash = sha256(&packet.hashable_part());
 
         // Packet filter if !filtered
-        unimplemented!("Packet filter");
+        log::warn!("Missing packet filtering");
 
         // By default, remember packet hashes to avoid routing
         // loops in the network, using the packet filter.
@@ -640,12 +643,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 Err(_) => return None, // TODO dogshit silent failure
             };
 
-            // TODO should only validate signature here
-            // Validate announce signature
             if announce.verify(&destination_hash).is_err() {
-                return None;
-            }
-            if announce.verify_destination(&destination_hash).is_err() {
                 return None;
             }
 
@@ -663,51 +661,56 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             // Check if this is a local destination (one of our services)
             let is_local = self.services.iter().any(|s| s.address == destination_hash);
 
-            // TODO full validate announce here
-            if !is_local {
+            if !is_local && announce.verify_destination(&destination_hash).is_ok() {
                 // Get received_from (transport_id if present, else destination_hash)
                 let received_from = match packet.addresses {
                     Addresses::Double(transport_id, _) => transport_id,
                     Addresses::Single(_) => destination_hash,
                 };
 
-                // TODO This shit doesn't look right
-                // # Check if this is a next retransmission from
-                //  # another node. If it is, we're removing the
-                //  # announce in question from our pending table
-                //  if RNS.Reticulum.transport_enabled() and packet.destination_hash in Transport.announce_table:
-                //      announce_entry = Transport.announce_table[packet.destination_hash]
+                // Check if this is a next retransmission from another node.
+                // If it is, we may remove the announce from our pending table.
+                if self.transport {
+                    if let Some(pending) = self
+                        .pending_announces
+                        .iter_mut()
+                        .find(|a| a.destination == destination_hash)
+                    {
+                        // Case 1: Another node heard the same announce we did and rebroadcast it.
+                        // packet.hops - 1 == pending.hops means they received it at the same hop
+                        // count we did (before their increment).
+                        if packet.header.hops.saturating_sub(1) == pending.hops {
+                            log::trace!(
+                                "Heard a rebroadcast of announce for <{}>",
+                                hex::encode(destination_hash)
+                            );
+                            pending.local_rebroadcasts += 1;
+                        }
 
-                //      if packet.hops-1 == announce_entry[IDX_AT_HOPS]:
-                //          RNS.log(f"Heard a rebroadcast of announce for {RNS.prettyhexrep(packet.destination_hash)} on {packet.receiving_interface}", RNS.LOG_EXTREME)
-                //          announce_entry[IDX_AT_LCL_RBRD] += 1
-                //          if announce_entry[IDX_AT_RETRIES] > 0:
-                //              if announce_entry[IDX_AT_LCL_RBRD] >= Transport.LOCAL_REBROADCASTS_MAX:
-                //                  RNS.log("Completed announce processing for "+RNS.prettyhexrep(packet.destination_hash)+", local rebroadcast limit reached", RNS.LOG_EXTREME)
-                //                  if packet.destination_hash in Transport.announce_table: Transport.announce_table.pop(packet.destination_hash)
+                        // Case 2: Our rebroadcast was picked up and passed on by another node.
+                        // packet.hops - 1 == pending.hops + 1 means they received our rebroadcast
+                        // (which was at pending.hops + 1) and incremented it.
+                        if packet.header.hops.saturating_sub(1) == pending.hops.saturating_add(1)
+                            && pending.retries_remaining > 0
+                            && now < pending.retry_at
+                        {
+                            log::trace!(
+                                "Announce for <{}> passed on by another node, no further tries needed",
+                                hex::encode(destination_hash)
+                            );
+                            pending.retries_remaining = 0;
+                        }
+                    }
 
-                //      if packet.hops-1 == announce_entry[IDX_AT_HOPS]+1 and announce_entry[IDX_AT_RETRIES] > 0:
-                //          now = time.time()
-                //          if now < announce_entry[IDX_AT_RTRNS_TMO]:
-                //              RNS.log("Rebroadcasted announce for "+RNS.prettyhexrep(packet.destination_hash)+" has been passed on to another node, no further tries needed", RNS.LOG_EXTREME)
-                //              if packet.destination_hash in Transport.announce_table:
-                //                  Transport.announce_table.pop(packet.destination_hash)
-
-                // Check if this is a rebroadcast we were waiting for
-                // If we see an announce with hop count one higher than what we sent,
-                // another node picked it up - cancel our retry
-                let our_hops = self.path_table.get(&destination_hash).map(|e| e.hops);
-                if let Some(h) = our_hops
-                    && packet.header.hops == h.saturating_add(1)
-                {
-                    log::trace!(
-                        "Announce for <{}> passed on by another node",
-                        hex::encode(destination_hash)
-                    );
-                    self.pending_announces
-                        .retain(|a| a.destination != destination_hash);
+                    // Remove pending announces that hit local rebroadcast limit
+                    self.pending_announces.retain(|a| {
+                        !(a.destination == destination_hash
+                            && a.retries_remaining > 0
+                            && a.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX)
+                    });
                 }
 
+                // TODO continue review from here
                 // Determine if we should add/update path table
                 let mut should_add = false;
                 let hops = packet.header.hops;
@@ -753,6 +756,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         app_data: announce.app_data.clone(),
                         retries_remaining: self.retries,
                         retry_at: now, // Rebroadcast immediately on first receive
+                        local_rebroadcasts: 0,
                     });
 
                     log::debug!(
