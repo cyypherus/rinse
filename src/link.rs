@@ -152,6 +152,7 @@ pub(crate) struct EstablishedLink {
     pub last_outbound: Instant,
     pub rtt_ms: Option<u64>,
     keys: LinkKeys,
+    pub(crate) pending_requests: std::collections::HashMap<crate::RequestId, crate::Address>,
 }
 
 const KEEPALIVE_MAX_SECS: u64 = 360;
@@ -179,6 +180,7 @@ impl EstablishedLink {
             last_outbound: now,
             rtt_ms: None,
             keys,
+            pending_requests: std::collections::HashMap::new(),
         }
     }
 
@@ -201,6 +203,7 @@ impl EstablishedLink {
             last_outbound: now,
             rtt_ms: None,
             keys,
+            pending_requests: std::collections::HashMap::new(),
         }
     }
 

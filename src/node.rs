@@ -19,19 +19,51 @@ const DEFAULT_MAX_HOPS: u8 = 128;
 const DEFAULT_RETRIES: u8 = 1;
 const DEFAULT_RETRY_DELAY_MS: u64 = 4000;
 
-pub enum MessageContext {
-    Link(LinkId),
-    Single(Address),
+pub enum InboundMessage {
+    LinkData {
+        link_id: LinkId,
+        data: Vec<u8>,
+    },
+    SingleData {
+        source: Address,
+        data: Vec<u8>,
+    },
+    Request {
+        link_id: LinkId,
+        request_id: crate::RequestId,
+        path_hash: crate::PathHash,
+        data: Vec<u8>,
+    },
+    Response {
+        request_id: crate::RequestId,
+        data: Vec<u8>,
+    },
 }
 
-pub struct OutboundMessage {
-    pub context: MessageContext,
-    pub data: Vec<u8>,
+pub enum OutboundMessage {
+    LinkData {
+        link_id: LinkId,
+        data: Vec<u8>,
+    },
+    SingleData {
+        destination: Address,
+        data: Vec<u8>,
+    },
+    Request {
+        link_id: LinkId,
+        path: String,
+        data: Vec<u8>,
+    },
+    Response {
+        link_id: LinkId,
+        request_id: crate::RequestId,
+        data: Vec<u8>,
+    },
 }
 
 pub trait Service: Send {
     fn name(&self) -> &str;
-    fn receive(&mut self, data: &[u8], ctx: MessageContext);
+    fn inbound(&mut self, msg: InboundMessage);
     fn outbound(&mut self) -> Option<OutboundMessage>;
 }
 
@@ -507,9 +539,10 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 &ephemeral_public,
                 ciphertext,
             ) {
-                service
-                    .service
-                    .receive(&plaintext, MessageContext::Single(dest));
+                service.service.inbound(InboundMessage::SingleData {
+                    source: dest,
+                    data: plaintext,
+                });
             }
             return;
         }
@@ -544,9 +577,10 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                     if let Some(service) =
                         self.services.iter_mut().find(|s| s.address == service_addr)
                     {
-                        service
-                            .service
-                            .receive(&plaintext, MessageContext::Link(link_id));
+                        service.service.inbound(InboundMessage::LinkData {
+                            link_id,
+                            data: plaintext,
+                        });
                     }
                 }
             }
@@ -582,6 +616,41 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                     && plaintext == link_id
                 {
                     link.state = LinkState::Closed;
+                }
+            }
+
+            Context::Request => {
+                if let Some(plaintext) = link.decrypt(&packet.data)
+                    && let Some(req) = crate::Request::decode(&plaintext)
+                {
+                    let request_id: crate::RequestId = crate::crypto::sha256(&packet.data)[..16]
+                        .try_into()
+                        .unwrap();
+                    let service_addr = link.destination;
+                    if let Some(service) =
+                        self.services.iter_mut().find(|s| s.address == service_addr)
+                    {
+                        service.service.inbound(InboundMessage::Request {
+                            link_id,
+                            request_id,
+                            path_hash: req.path_hash,
+                            data: req.data,
+                        });
+                    }
+                }
+            }
+
+            Context::Response => {
+                if let Some(plaintext) = link.decrypt(&packet.data)
+                    && let Some(resp) = crate::Response::decode(&plaintext)
+                    && let Some(service_addr) = link.pending_requests.remove(&resp.request_id)
+                    && let Some(service) =
+                        self.services.iter_mut().find(|s| s.address == service_addr)
+                {
+                    service.service.inbound(InboundMessage::Response {
+                        request_id: resp.request_id,
+                        data: resp.data,
+                    });
                 }
             }
 
@@ -824,15 +893,15 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         let mut messages = Vec::new();
         for entry in &mut self.services {
             while let Some(msg) = entry.service.outbound() {
-                messages.push(msg);
+                messages.push((entry.address, msg));
             }
         }
 
-        for msg in messages {
-            match msg.context {
-                MessageContext::Link(link_id) => {
+        for (service_addr, msg) in messages {
+            match msg {
+                OutboundMessage::LinkData { link_id, data } => {
                     if let Some(link) = self.established_links.get(&link_id) {
-                        let ciphertext = link.encrypt(&mut self.rng, &msg.data);
+                        let ciphertext = link.encrypt(&mut self.rng, &data);
                         let header = Header {
                             ifac_flag: IfacFlag::Open,
                             header_type: HeaderType::Type1,
@@ -855,12 +924,12 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         }
                     }
                 }
-                MessageContext::Single(destination) => {
+                OutboundMessage::SingleData { destination, data } => {
                     if let Some(entry) = self.seen_announces.get(&destination) {
                         let (ephemeral_pub, ciphertext) = SingleDestEncryption::encrypt(
                             &mut self.rng,
                             &entry.encryption_key,
-                            &msg.data,
+                            &data,
                         );
                         let mut payload = ephemeral_pub.as_bytes().to_vec();
                         payload.extend(ciphertext);
@@ -884,6 +953,73 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                             let target = entry.source_interface;
                             if let Some(iface) = self.interfaces.get_mut(target) {
                                 iface.send(packet, 0, &mut self.rng, now);
+                            }
+                        }
+                    }
+                }
+                OutboundMessage::Request {
+                    link_id,
+                    path,
+                    data,
+                } => {
+                    if let Some(link) = self.established_links.get_mut(&link_id) {
+                        let req = crate::Request::new(&path, data);
+                        let encoded = req.encode();
+                        let ciphertext = link.encrypt(&mut self.rng, &encoded);
+
+                        let request_id: crate::RequestId =
+                            crate::crypto::sha256(&ciphertext)[..16].try_into().unwrap();
+                        link.pending_requests.insert(request_id, service_addr);
+
+                        let header = Header {
+                            ifac_flag: IfacFlag::Open,
+                            header_type: HeaderType::Type1,
+                            context_flag: ContextFlag::Unset,
+                            propagation_type: PropagationType::Broadcast,
+                            destination_type: DestinationType::Link,
+                            packet_type: PacketType::Data,
+                            hops: 0,
+                        };
+                        if let Ok(packet) = Packet::new(
+                            header,
+                            None,
+                            Addresses::Single(link_id),
+                            Context::Request,
+                            ciphertext,
+                        ) {
+                            for iface in &mut self.interfaces {
+                                iface.send(packet.clone(), 0, &mut self.rng, now);
+                            }
+                        }
+                    }
+                }
+                OutboundMessage::Response {
+                    link_id,
+                    request_id,
+                    data,
+                } => {
+                    if let Some(link) = self.established_links.get(&link_id) {
+                        let resp = crate::Response::new(request_id, data);
+                        let ciphertext = link.encrypt(&mut self.rng, &resp.encode());
+
+                        let header = Header {
+                            ifac_flag: IfacFlag::Open,
+                            header_type: HeaderType::Type1,
+                            context_flag: ContextFlag::Unset,
+                            propagation_type: PropagationType::Broadcast,
+                            destination_type: DestinationType::Link,
+                            packet_type: PacketType::Data,
+                            hops: 0,
+                        };
+                        if let Ok(packet) = Packet::new(
+                            header,
+                            None,
+                            Addresses::Single(link_id),
+                            Context::Response,
+                            ciphertext,
+                        ) {
+                            for iface in &mut self.interfaces {
+                                iface.send(packet.clone(), 0, &mut self.rng, now);
                             }
                         }
                     }
@@ -1422,8 +1558,13 @@ mod tests {
         fn name(&self) -> &str {
             &self.name
         }
-        fn receive(&mut self, data: &[u8], _ctx: MessageContext) {
-            self.received.lock().unwrap().push(data.to_vec());
+        fn inbound(&mut self, msg: InboundMessage) {
+            match msg {
+                InboundMessage::LinkData { data, .. } | InboundMessage::SingleData { data, .. } => {
+                    self.received.lock().unwrap().push(data);
+                }
+                _ => {}
+            }
         }
         fn outbound(&mut self) -> Option<OutboundMessage> {
             None
@@ -2830,8 +2971,14 @@ mod tests {
             fn name(&self) -> &str {
                 &self.name
             }
-            fn receive(&mut self, data: &[u8], _ctx: MessageContext) {
-                self.received.lock().unwrap().push(data.to_vec());
+            fn inbound(&mut self, msg: InboundMessage) {
+                match msg {
+                    InboundMessage::LinkData { data, .. }
+                    | InboundMessage::SingleData { data, .. } => {
+                        self.received.lock().unwrap().push(data);
+                    }
+                    _ => {}
+                }
             }
             fn outbound(&mut self) -> Option<OutboundMessage> {
                 None
