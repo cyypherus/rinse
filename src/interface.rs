@@ -124,9 +124,7 @@ impl<T: Transport> Interface<T> {
             if self.delayed[i].send_at <= now {
                 let delayed = self.delayed.swap_remove(i);
                 if self.bandwidth_available() {
-                    let raw = delayed.packet.to_bytes();
-                    log::trace!("[RAW OUTBOUND] {} bytes: {}", raw.len(), hex::encode(&raw));
-                    self.transport.send(&raw);
+                    self.transport.send(&delayed.packet.to_bytes());
                 } else {
                     self.queue(delayed.packet, delayed.priority);
                 }
@@ -137,9 +135,7 @@ impl<T: Transport> Interface<T> {
 
         while self.bandwidth_available() {
             if let Some(packet) = self.dequeue() {
-                let raw = packet.to_bytes();
-                log::trace!("[RAW OUTBOUND] {} bytes: {}", raw.len(), hex::encode(&raw));
-                self.transport.send(&raw);
+                self.transport.send(&packet.to_bytes());
             } else {
                 break;
             }

@@ -503,9 +503,6 @@ impl<T: Transport, R: RngCore> Node<T, R> {
 
         let packet_hash = sha256(&packet.hashable_part());
 
-        // Packet filter if !filtered
-        log::warn!("Missing packet filtering");
-
         // By default, remember packet hashes to avoid routing
         // loops in the network, using the packet filter.
         let mut remember_packet_hash = true;
@@ -700,7 +697,23 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             // Check if this is a local destination (one of our services)
             let is_local = self.services.iter().any(|s| s.address == destination_hash);
 
-            if !is_local && announce.verify_destination(&destination_hash).is_ok() {
+            if is_local {
+                log::trace!(
+                    "Announce for <{}> is local, not rebroadcasting",
+                    hex::encode(destination_hash)
+                );
+            }
+
+            let verify_result = announce.verify_destination(&destination_hash);
+            if verify_result.is_err() {
+                log::debug!(
+                    "Announce for <{}> failed verification: {:?}",
+                    hex::encode(destination_hash),
+                    verify_result
+                );
+            }
+
+            if !is_local && verify_result.is_ok() {
                 let received_from = packet.received_from();
 
                 // Check if this is a next retransmission from another node.
@@ -748,22 +761,29 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                     }
                 }
 
-                // TODO continue review from here
-                // Determine if we should add/update path table
                 let mut should_add = false;
                 let hops = packet.hops();
 
-                // First, check hops are less than max
-                if hops < self.max_hops + 1 {
-                    if let Some(existing) = self.path_table.get(&destination_hash) {
-                        // Update if new path is shorter or equal
-                        if hops <= existing.hops {
-                            should_add = true;
-                        }
-                    } else {
-                        // Unknown destination, add it
+                if hops >= self.max_hops + 1 {
+                    log::debug!(
+                        "Announce for <{}> exceeded max hops ({} >= {})",
+                        hex::encode(destination_hash),
+                        hops,
+                        self.max_hops + 1
+                    );
+                } else if let Some(existing) = self.path_table.get(&destination_hash) {
+                    if hops <= existing.hops {
                         should_add = true;
+                    } else {
+                        log::trace!(
+                            "Announce for <{}> has more hops ({}) than existing path ({})",
+                            hex::encode(destination_hash),
+                            hops,
+                            existing.hops
+                        );
                     }
+                } else {
+                    should_add = true;
                 }
 
                 if should_add {
@@ -866,18 +886,8 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         }
 
         if let Packet::LinkData { data, context, .. } = &packet {
-            log::trace!(
-                "[DECODE 4: LINKDATA] ciphertext {} bytes: {}",
-                data.len(),
-                hex::encode(data)
-            );
             if let Some(link) = self.established_links.get_mut(&link_id) {
                 if let Some(plaintext) = link.decrypt(data) {
-                    log::trace!(
-                        "[DECODE 5: DECRYPTED] plaintext {} bytes: {}",
-                        plaintext.len(),
-                        hex::encode(&plaintext)
-                    );
                     link.touch_inbound(now);
 
                     if let Some(service_idx) = self
@@ -923,11 +933,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         };
                         self.services[service_idx].service.inbound(msg);
                     }
-                } else {
-                    log::trace!("[DECODE 5: DECRYPT FAILED] context={:?}", context);
                 }
-            } else {
-                log::trace!("[DECODE 4: NO LINK] link_id=<{}>", hex::encode(link_id));
             }
         }
 
@@ -1190,9 +1196,9 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         for (i, iface) in self.interfaces.iter_mut().enumerate() {
             let mut should_transmit = true;
 
-            // If packet has an attached interface, only send on that one
+            // If packet has an attached interface, skip that one (don't echo back)
             if let Some(attached) = attached_interface {
-                if i != attached {
+                if i == attached {
                     should_transmit = false;
                 }
             }
@@ -1263,6 +1269,11 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         self.pending_announces.retain(|a| a.retries_remaining > 0);
 
         for (dest, hops, has_ratchet, data, source) in to_send {
+            log::debug!(
+                "Rebroadcasting announce for <{}> at hops={}",
+                hex::encode(dest),
+                hops + 1
+            );
             let packet = self.make_announce_packet(dest, hops, has_ratchet, data);
             self.outbound(packet, Some(source), now);
         }
