@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::RngCore;
@@ -279,7 +279,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         )
         .build(&address);
 
-        let packet = self.make_announce_packet(address, 0, false, announce_data.to_bytes());
+        let packet = self.make_announce_packet(address, 0, false, announce_data.to_bytes(), None);
 
         for iface in &mut self.interfaces {
             iface.send(packet.clone(), 0, &mut self.rng, now);
@@ -1274,7 +1274,8 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 hex::encode(dest),
                 hops + 1
             );
-            let packet = self.make_announce_packet(dest, hops, has_ratchet, data);
+            let packet =
+                self.make_announce_packet(dest, hops, has_ratchet, data, Some(self.transport_id));
             self.outbound(packet, Some(source), now);
         }
 
@@ -1450,11 +1451,19 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         hops: u8,
         has_ratchet: bool,
         data: Vec<u8>,
+        transport_id: Option<Address>,
     ) -> Packet {
         use crate::packet::AnnounceDestination;
+        let destination = match transport_id {
+            Some(tid) => AnnounceDestination::Transport {
+                transport_id: tid,
+                destination: dest,
+            },
+            None => AnnounceDestination::Single(dest),
+        };
         Packet::Announce {
             hops,
-            destination: AnnounceDestination::Single(dest),
+            destination,
             has_ratchet,
             data,
         }
