@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -11,6 +10,7 @@ use crate::announce::{AnnounceBuilder, AnnounceData};
 use crate::crypto::{EphemeralKeyPair, sha256};
 pub use crate::link::LinkId;
 use crate::link::{EstablishedLink, LinkProof, LinkRequest, LinkState, PendingLink};
+use crate::packet_hashlist::PacketHashlist;
 use crate::path_request::PathRequest;
 use crate::{
     Address, Addresses, Context, DestinationType, Interface, Packet, PacketType, PropagationType,
@@ -129,8 +129,7 @@ pub struct Node<T, R = ThreadRng> {
     transport_id: Address,
     path_table: HashMap<Address, PathEntry>,
     pending_announces: Vec<PendingAnnounce>,
-    packet_hashlist: std::collections::HashSet<[u8; 32]>,
-    packet_hashlist_prev: std::collections::HashSet<[u8; 32]>,
+    seen_packets: PacketHashlist,
     reverse_table: HashMap<Address, ReverseTableEntry>,
     control_hashes: std::collections::HashSet<Address>,
     receipts: Vec<Receipt>,
@@ -159,7 +158,7 @@ impl<T: Transport> Node<T, ThreadRng> {
             transport_id,
             path_table: HashMap::new(),
             pending_announces: Vec::new(),
-            seen_packet_hashes: std::collections::HashSet::new(),
+            seen_packets: crate::packet_hashlist::PacketHashlist::new(1_000_000),
             reverse_table: HashMap::new(),
             control_hashes: std::collections::HashSet::new(),
             receipts: Vec::new(),
@@ -189,7 +188,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             transport_id,
             path_table: HashMap::new(),
             pending_announces: Vec::new(),
-            seen_packet_hashes: std::collections::HashSet::new(),
+            seen_packets: PacketHashlist::new(1_000_000),
             reverse_table: HashMap::new(),
             control_hashes: std::collections::HashSet::new(),
             receipts: Vec::new(),
@@ -311,8 +310,9 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         let packet = Packet::new(
             header,
             None,
-            Addresses::Single {
-                transport_id: PathRequest::destination(),
+            Addresses {
+                destination_hash: PathRequest::destination(),
+                transport_id: None,
             },
             Context::None,
             request.to_bytes(),
@@ -541,7 +541,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         }
 
         if remember_packet_hash {
-            self.seen_packet_hashes.insert(packet_hash);
+            self.seen_packets.insert(packet_hash);
         }
 
         // TODO review
@@ -677,7 +677,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
 
                 if let Some(out_iface) = outbound_interface {
                     // Add to packet hash filter now that we know it's our turn
-                    self.seen_packet_hashes.insert(packet_hash);
+                    self.seen_packets.insert(packet_hash);
 
                     let raw = packet.to_bytes();
                     if let Some(iface) = self.interfaces.get_mut(out_iface) {
@@ -722,7 +722,8 @@ impl<T: Transport, R: RngCore> Node<T, R> {
 
                 // Check if this is a next retransmission from another node.
                 // If it is, we may remove the announce from our pending table.
-                if self.transport {
+                // Only applies when transport_id is present (Type2 header).
+                if self.transport && matches!(packet.addresses, Addresses::Double { .. }) {
                     if let Some(pending) = self
                         .pending_announces
                         .iter_mut()
@@ -737,6 +738,15 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                                 hex::encode(destination_hash)
                             );
                             pending.local_rebroadcasts += 1;
+                            if pending.retries_remaining > 0
+                                && pending.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX
+                            {
+                                log::trace!(
+                                    "Completed announce processing for <{}>, local rebroadcast limit reached",
+                                    hex::encode(destination_hash)
+                                );
+                                pending.retries_remaining = 0;
+                            }
                         }
 
                         // Case 2: Our rebroadcast was picked up and passed on by another node.
@@ -753,13 +763,6 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                             pending.retries_remaining = 0;
                         }
                     }
-
-                    // Remove pending announces that hit local rebroadcast limit
-                    self.pending_announces.retain(|a| {
-                        !(a.destination == destination_hash
-                            && a.retries_remaining > 0
-                            && a.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX)
-                    });
                 }
 
                 // TODO continue review from here

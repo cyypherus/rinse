@@ -7,6 +7,8 @@ mod interface;
 mod link;
 mod node;
 mod packet;
+mod packet2;
+mod packet_hashlist;
 mod path_request;
 mod request;
 pub mod transports;
