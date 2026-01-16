@@ -212,13 +212,13 @@ impl InboundResource {
         let hash = sha256(&data);
         let part_hash: [u8; MAPHASH_LEN] = [hash[0], hash[1], hash[2], hash[3]];
 
-        if let Some(idx) = self.hashmap.iter().position(|h| h == &part_hash) {
-            if self.parts[idx].is_none() {
-                self.parts[idx] = Some(data);
-                self.received_count += 1;
-                self.window = (self.window + 1).min(WINDOW_MAX_FAST);
-                return true;
-            }
+        if let Some(idx) = self.hashmap.iter().position(|h| h == &part_hash)
+            && self.parts[idx].is_none()
+        {
+            self.parts[idx] = Some(data);
+            self.received_count += 1;
+            self.window = (self.window + 1).min(WINDOW_MAX_FAST);
+            return true;
         }
         false
     }

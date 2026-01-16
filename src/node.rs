@@ -106,7 +106,7 @@ pub trait Service: Send {
     fn outbound(&mut self) -> Option<OutboundMessage>;
 }
 
-struct ServiceEntry<S> {
+pub(crate) struct ServiceEntry<S> {
     service: S,
     address: Address,
     name_hash: [u8; 10],
@@ -309,6 +309,15 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
     }
 
     pub fn announce(&mut self, address: Address, now: Instant) {
+        self.announce_with_app_data(address, None, now);
+    }
+
+    pub fn announce_with_app_data(
+        &mut self,
+        address: Address,
+        app_data: Option<Vec<u8>>,
+        now: Instant,
+    ) {
         let Some(entry) = self.services.iter().find(|s| s.address == address) else {
             return;
         };
@@ -316,13 +325,16 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         let mut random_hash = [0u8; 10];
         self.rng.fill_bytes(&mut random_hash);
 
-        let announce_data = AnnounceBuilder::new(
+        let mut builder = AnnounceBuilder::new(
             *entry.encryption_public.as_bytes(),
             entry.signing_key.clone(),
             entry.name_hash,
             random_hash,
-        )
-        .build(&address);
+        );
+        if let Some(data) = app_data {
+            builder = builder.with_app_data(data);
+        }
+        let announce_data = builder.build(&address);
 
         let packet = self.make_announce_packet(address, 0, false, announce_data.to_bytes(), None);
 
@@ -424,22 +436,22 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             return true;
         }
 
-        if let Packet::Data { context, .. } = packet {
-            if matches!(context, DataContext::CacheRequest | DataContext::Channel) {
-                return true;
-            }
+        if let Packet::Data { context, .. } = packet
+            && matches!(context, DataContext::CacheRequest | DataContext::Channel)
+        {
+            return true;
         }
 
-        if let Packet::LinkData { context, .. } = packet {
-            if matches!(
+        if let Packet::LinkData { context, .. } = packet
+            && matches!(
                 context,
                 LinkContext::Resource
                     | LinkContext::ResourceReq
                     | LinkContext::ResourcePrf
                     | LinkContext::Channel
-            ) {
-                return true;
-            }
+            )
+        {
+            return true;
         }
 
         if let Packet::Data {
@@ -447,11 +459,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             hops,
             ..
         } = packet
+            && *hops > 1
         {
-            if *hops > 1 {
-                log::debug!("Dropped PLAIN/GROUP packet with hops {}", hops);
-                return false;
-            }
+            log::debug!("Dropped PLAIN/GROUP packet with hops {}", hops);
+            return false;
         }
 
         true
@@ -463,7 +474,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         interface_index: usize,
         now: Instant,
     ) -> Option<(Packet, bool, bool)> {
-        let mut packet = match Packet::from_bytes(&raw) {
+        let mut packet = match Packet::from_bytes(raw) {
             Ok(p) => p,
             Err(e) => {
                 log::debug!("Failed to parse packet: {:?}", e);
@@ -688,45 +699,45 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 // Check if this is a next retransmission from another node.
                 // If it is, we may remove the announce from our pending table.
                 // Only applies when transport_id is present (Type2 header).
-                if self.transport && packet.transport_id().is_some() {
-                    if let Some(pending) = self
+                if self.transport
+                    && packet.transport_id().is_some()
+                    && let Some(pending) = self
                         .pending_announces
                         .iter_mut()
                         .find(|a| a.destination == destination_hash)
-                    {
-                        // Case 1: Another node heard the same announce we did and rebroadcast it.
-                        // packet.hops - 1 == pending.hops means they received it at the same hop
-                        // count we did (before their increment).
-                        if packet.hops().saturating_sub(1) == pending.hops {
-                            log::trace!(
-                                "Heard a rebroadcast of announce for <{}>",
-                                hex::encode(destination_hash)
-                            );
-                            pending.local_rebroadcasts += 1;
-                            if pending.retries_remaining > 0
-                                && pending.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX
-                            {
-                                log::trace!(
-                                    "Completed announce processing for <{}>, local rebroadcast limit reached",
-                                    hex::encode(destination_hash)
-                                );
-                                pending.retries_remaining = 0;
-                            }
-                        }
-
-                        // Case 2: Our rebroadcast was picked up and passed on by another node.
-                        // packet.hops - 1 == pending.hops + 1 means they received our rebroadcast
-                        // (which was at pending.hops + 1) and incremented it.
-                        if packet.hops().saturating_sub(1) == pending.hops.saturating_add(1)
-                            && pending.retries_remaining > 0
-                            && now < pending.retry_at
+                {
+                    // Case 1: Another node heard the same announce we did and rebroadcast it.
+                    // packet.hops - 1 == pending.hops means they received it at the same hop
+                    // count we did (before their increment).
+                    if packet.hops().saturating_sub(1) == pending.hops {
+                        log::trace!(
+                            "Heard a rebroadcast of announce for <{}>",
+                            hex::encode(destination_hash)
+                        );
+                        pending.local_rebroadcasts += 1;
+                        if pending.retries_remaining > 0
+                            && pending.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX
                         {
                             log::trace!(
-                                "Announce for <{}> passed on by another node, no further tries needed",
+                                "Completed announce processing for <{}>, local rebroadcast limit reached",
                                 hex::encode(destination_hash)
                             );
                             pending.retries_remaining = 0;
                         }
+                    }
+
+                    // Case 2: Our rebroadcast was picked up and passed on by another node.
+                    // packet.hops - 1 == pending.hops + 1 means they received our rebroadcast
+                    // (which was at pending.hops + 1) and incremented it.
+                    if packet.hops().saturating_sub(1) == pending.hops.saturating_add(1)
+                        && pending.retries_remaining > 0
+                        && now < pending.retry_at
+                    {
+                        log::trace!(
+                            "Announce for <{}> passed on by another node, no further tries needed",
+                            hex::encode(destination_hash)
+                        );
+                        pending.retries_remaining = 0;
                     }
                 }
 
@@ -802,7 +813,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         if let Packet::LinkRequest { data, .. } = &packet {
             let is_for_us = packet
                 .transport_id()
-                .map_or(true, |tid| tid == self.transport_id);
+                .is_none_or(|tid| tid == self.transport_id);
             log::debug!(
                 "Received LinkRequest for <{}> is_for_us={} for_local_service={}",
                 hex::encode(destination_hash),
@@ -856,101 +867,96 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             }
         }
 
-        if let Packet::LinkData { data, context, .. } = &packet {
-            if let Some(link) = self.established_links.get_mut(&link_id) {
-                if let Some(plaintext) = link.decrypt(data) {
-                    link.touch_inbound(now);
+        if let Packet::LinkData { data, context, .. } = &packet
+            && let Some(link) = self.established_links.get_mut(&link_id)
+            && let Some(plaintext) = link.decrypt(data)
+        {
+            link.touch_inbound(now);
 
-                    // Handle keepalive
-                    if *context == LinkContext::Keepalive {
-                        self.handle_keepalive(link_id, &plaintext, now);
-                    } else if *context == LinkContext::LinkRtt {
-                        self.handle_link_rtt(link_id, &plaintext);
-                    } else if matches!(
-                        context,
-                        LinkContext::Resource
-                            | LinkContext::ResourceAdv
-                            | LinkContext::ResourceReq
-                            | LinkContext::ResourceHmu
-                            | LinkContext::ResourcePrf
-                            | LinkContext::ResourceIcl
-                            | LinkContext::ResourceRcl
-                    ) {
-                        self.handle_resource_packet(link_id, *context, &plaintext, now);
-                    } else if *context == LinkContext::Response {
-                        if let Some(resp) = Response::decode(&plaintext) {
-                            if let Some(service_addr) =
-                                link.pending_requests.remove(&resp.request_id)
-                            {
-                                if let Some(service_idx) =
-                                    self.services.iter().position(|s| s.address == service_addr)
-                                {
-                                    let msg = InboundMessage::Response {
-                                        request_id: resp.request_id,
-                                        data: resp.data,
-                                    };
-                                    self.services[service_idx].service.inbound(msg);
-                                }
+            // Handle keepalive
+            if *context == LinkContext::Keepalive {
+                self.handle_keepalive(link_id, &plaintext, now);
+            } else if *context == LinkContext::LinkRtt {
+                self.handle_link_rtt(link_id, &plaintext);
+            } else if matches!(
+                context,
+                LinkContext::Resource
+                    | LinkContext::ResourceAdv
+                    | LinkContext::ResourceReq
+                    | LinkContext::ResourceHmu
+                    | LinkContext::ResourcePrf
+                    | LinkContext::ResourceIcl
+                    | LinkContext::ResourceRcl
+            ) {
+                self.handle_resource_packet(link_id, *context, &plaintext, now);
+            } else if *context == LinkContext::Response {
+                if let Some(resp) = Response::decode(&plaintext)
+                    && let Some(service_addr) = link.pending_requests.remove(&resp.request_id)
+                    && let Some(service_idx) =
+                        self.services.iter().position(|s| s.address == service_addr)
+                {
+                    let msg = InboundMessage::Response {
+                        request_id: resp.request_id,
+                        data: resp.data,
+                    };
+                    self.services[service_idx].service.inbound(msg);
+                }
+            } else if let Some(service_idx) = self
+                .services
+                .iter()
+                .position(|s| s.address == link.destination)
+            {
+                let msg = match context {
+                    LinkContext::Request => {
+                        if let Some(req) = Request::decode(&plaintext) {
+                            let request_id: crate::RequestId =
+                                packet.packet_hash()[..16].try_into().unwrap();
+                            InboundMessage::Request {
+                                link_id,
+                                request_id,
+                                path_hash: req.path_hash,
+                                data: req.data,
                             }
-                        }
-                    } else if let Some(service_idx) = self
-                        .services
-                        .iter()
-                        .position(|s| s.address == link.destination)
-                    {
-                        let msg = match context {
-                            LinkContext::Request => {
-                                if let Some(req) = Request::decode(&plaintext) {
-                                    let request_id: crate::RequestId =
-                                        packet.packet_hash()[..16].try_into().unwrap();
-                                    InboundMessage::Request {
-                                        link_id,
-                                        request_id,
-                                        path_hash: req.path_hash,
-                                        data: req.data,
-                                    }
-                                } else {
-                                    InboundMessage::LinkData {
-                                        link_id,
-                                        data: plaintext,
-                                    }
-                                }
-                            }
-                            _ => InboundMessage::LinkData {
+                        } else {
+                            InboundMessage::LinkData {
                                 link_id,
                                 data: plaintext,
-                            },
-                        };
-                        self.services[service_idx].service.inbound(msg);
+                            }
+                        }
                     }
-                }
+                    _ => InboundMessage::LinkData {
+                        link_id,
+                        data: plaintext,
+                    },
+                };
+                self.services[service_idx].service.inbound(msg);
             }
         }
 
-        if let Packet::Data { data, .. } = &packet {
-            if for_local_service {
-                // Data for a single destination - decrypt with service keys
-                // Packet data format: ephemeral_public (32) + ciphertext
-                if data.len() >= 32
-                    && let Some(service_idx) = self
-                        .services
-                        .iter()
-                        .position(|s| s.address == destination_hash)
-                {
-                    let service = &self.services[service_idx];
+        if let Packet::Data { data, .. } = &packet
+            && for_local_service
+        {
+            // Data for a single destination - decrypt with service keys
+            // Packet data format: ephemeral_public (32) + ciphertext
+            if data.len() >= 32
+                && let Some(service_idx) = self
+                    .services
+                    .iter()
+                    .position(|s| s.address == destination_hash)
+            {
+                let service = &self.services[service_idx];
 
-                    let ephemeral_public =
-                        X25519Public::from(<[u8; 32]>::try_from(&data[..32]).unwrap());
-                    let ciphertext = &data[32..];
+                let ephemeral_public =
+                    X25519Public::from(<[u8; 32]>::try_from(&data[..32]).unwrap());
+                let ciphertext = &data[32..];
 
-                    if let Some(plaintext) = crate::crypto::SingleDestEncryption::decrypt(
-                        &service.encryption_secret,
-                        &ephemeral_public,
-                        ciphertext,
-                    ) {
-                        let msg = InboundMessage::SingleData { data: plaintext };
-                        self.services[service_idx].service.inbound(msg);
-                    }
+                if let Some(plaintext) = crate::crypto::SingleDestEncryption::decrypt(
+                    &service.encryption_secret,
+                    &ephemeral_public,
+                    ciphertext,
+                ) {
+                    let msg = InboundMessage::SingleData { data: plaintext };
+                    self.services[service_idx].service.inbound(msg);
                 }
             }
         }
@@ -1030,10 +1036,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
         if let Packet::Proof { data, .. } = &packet {
             // Regular proof - check reverse table for transport
-            if let Some(reverse_entry) = self.reverse_table.remove(&destination_hash) {
-                if let Some(iface) = self.interfaces.get_mut(reverse_entry.receiving_interface) {
-                    iface.send(packet.clone(), 0, now);
-                }
+            if let Some(reverse_entry) = self.reverse_table.remove(&destination_hash)
+                && let Some(iface) = self.interfaces.get_mut(reverse_entry.receiving_interface)
+            {
+                iface.send(packet.clone(), 0, now);
             }
 
             // Check local receipts - validate proof against outstanding receipts
@@ -1182,10 +1188,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             let mut should_transmit = true;
 
             // If packet has an attached interface, skip that one (don't echo back)
-            if let Some(attached) = attached_interface {
-                if i == attached {
-                    should_transmit = false;
-                }
+            if let Some(attached) = attached_interface
+                && i == attached
+            {
+                should_transmit = false;
             }
 
             // For link packets, check if link is on this interface
@@ -1371,15 +1377,14 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         use crate::link::decode_rtt;
 
         // LRRTT packet from initiator telling responder the measured RTT
-        if let Some(rtt_secs) = decode_rtt(plaintext) {
-            if let Some(link) = self.established_links.get_mut(&link_id) {
-                if !link.is_initiator {
-                    let rtt_ms = (rtt_secs * 1000.0) as u64;
-                    link.set_rtt(rtt_ms);
-                    link.state = LinkState::Active;
-                    link.activated_at = Some(std::time::Instant::now());
-                }
-            }
+        if let Some(rtt_secs) = decode_rtt(plaintext)
+            && let Some(link) = self.established_links.get_mut(&link_id)
+            && !link.is_initiator
+        {
+            let rtt_ms = (rtt_secs * 1000.0) as u64;
+            link.set_rtt(rtt_ms);
+            link.state = LinkState::Active;
+            link.activated_at = Some(std::time::Instant::now());
         }
     }
 
@@ -1434,38 +1439,37 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     resource.mark_transferring();
 
                     for part_hash in requested_hashes {
-                        if let Some(part_data) = resource.get_part(&part_hash) {
-                            if let Some(link) = self.established_links.get(&link_id) {
-                                let ciphertext = link.encrypt(&mut self.rng, part_data);
-                                let packet = Packet::LinkData {
-                                    hops: 0,
-                                    destination: LinkDataDestination::Direct(link_id),
-                                    context: LinkContext::Resource,
-                                    data: ciphertext,
-                                };
-                                for iface in &mut self.interfaces {
-                                    iface.send(packet.clone(), 0, now);
-                                }
+                        if let Some(part_data) = resource.get_part(&part_hash)
+                            && let Some(link) = self.established_links.get(&link_id)
+                        {
+                            let ciphertext = link.encrypt(&mut self.rng, part_data);
+                            let packet = Packet::LinkData {
+                                hops: 0,
+                                destination: LinkDataDestination::Direct(link_id),
+                                context: LinkContext::Resource,
+                                data: ciphertext,
+                            };
+                            for iface in &mut self.interfaces {
+                                iface.send(packet.clone(), 0, now);
                             }
                         }
                     }
 
-                    if exhausted {
-                        if let Some(hmu_data) = resource.hashmap_update(100) {
-                            if let Some(link) = self.established_links.get(&link_id) {
-                                let mut payload = hash.to_vec();
-                                payload.extend(&hmu_data);
-                                let ciphertext = link.encrypt(&mut self.rng, &payload);
-                                let packet = Packet::LinkData {
-                                    hops: 0,
-                                    destination: LinkDataDestination::Direct(link_id),
-                                    context: LinkContext::ResourceHmu,
-                                    data: ciphertext,
-                                };
-                                for iface in &mut self.interfaces {
-                                    iface.send(packet.clone(), 0, now);
-                                }
-                            }
+                    if exhausted
+                        && let Some(hmu_data) = resource.hashmap_update(100)
+                        && let Some(link) = self.established_links.get(&link_id)
+                    {
+                        let mut payload = hash.to_vec();
+                        payload.extend(&hmu_data);
+                        let ciphertext = link.encrypt(&mut self.rng, &payload);
+                        let packet = Packet::LinkData {
+                            hops: 0,
+                            destination: LinkDataDestination::Direct(link_id),
+                            context: LinkContext::ResourceHmu,
+                            data: ciphertext,
+                        };
+                        for iface in &mut self.interfaces {
+                            iface.send(packet.clone(), 0, now);
                         }
                     }
                 }
@@ -1477,21 +1481,20 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                         let old_progress = resource.progress();
                         if resource.receive_part(plaintext.to_vec()) {
                             let new_progress = resource.progress();
-                            if (new_progress - old_progress) >= 0.05 || new_progress >= 1.0 {
-                                if let Some(service_idx) =
+                            if ((new_progress - old_progress) >= 0.05 || new_progress >= 1.0)
+                                && let Some(service_idx) =
                                     self.established_links.get(&link_id).and_then(|l| {
                                         self.services
                                             .iter()
                                             .position(|s| s.address == l.destination)
                                     })
-                                {
-                                    let msg = InboundMessage::ResourceProgress {
-                                        link_id,
-                                        hash: *hash,
-                                        progress: new_progress,
-                                    };
-                                    self.services[service_idx].service.inbound(msg);
-                                }
+                            {
+                                let msg = InboundMessage::ResourceProgress {
+                                    link_id,
+                                    hash: *hash,
+                                    progress: new_progress,
+                                };
+                                self.services[service_idx].service.inbound(msg);
                             }
                             if resource.is_complete() {
                                 completed = Some(*hash);
@@ -1523,22 +1526,21 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 let proof: [u8; 32] = plaintext[32..64].try_into().unwrap();
                 if let Some((res_link_id, service_addr, resource)) =
                     self.outbound_resources.get_mut(&hash)
+                    && resource.verify_proof(&proof)
                 {
-                    if resource.verify_proof(&proof) {
-                        resource.mark_complete();
-                        if let Some(service_idx) = self
-                            .services
-                            .iter()
-                            .position(|s| s.address == *service_addr)
-                        {
-                            let msg = InboundMessage::ResourceComplete {
-                                link_id: *res_link_id,
-                                hash,
-                                data: Vec::new(),
-                                metadata: resource.metadata.clone(),
-                            };
-                            self.services[service_idx].service.inbound(msg);
-                        }
+                    resource.mark_complete();
+                    if let Some(service_idx) = self
+                        .services
+                        .iter()
+                        .position(|s| s.address == *service_addr)
+                    {
+                        let msg = InboundMessage::ResourceComplete {
+                            link_id: *res_link_id,
+                            hash,
+                            data: Vec::new(),
+                            metadata: resource.metadata.clone(),
+                        };
+                        self.services[service_idx].service.inbound(msg);
                     }
                 }
             }
@@ -1567,44 +1569,44 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
     fn complete_resource(&mut self, link_id: LinkId, hash: [u8; 32], now: Instant) {
         use crate::packet::LinkDataDestination;
 
-        if let Some((_, resource)) = self.inbound_resources.remove(&hash) {
-            if let Some(link) = self.established_links.get(&link_id) {
-                if let Some(data) = resource.assemble(link) {
-                    let proof = resource.generate_proof();
-                    let mut payload = hash.to_vec();
-                    payload.extend(&proof);
-                    let ciphertext = link.encrypt(&mut self.rng, &payload);
-                    let packet = Packet::LinkData {
-                        hops: 0,
-                        destination: LinkDataDestination::Direct(link_id),
-                        context: LinkContext::ResourcePrf,
-                        data: ciphertext,
-                    };
-                    for iface in &mut self.interfaces {
-                        iface.send(packet.clone(), 0, now);
-                    }
+        if let Some((_, resource)) = self.inbound_resources.remove(&hash)
+            && let Some(link) = self.established_links.get(&link_id)
+        {
+            if let Some(data) = resource.assemble(link) {
+                let proof = resource.generate_proof();
+                let mut payload = hash.to_vec();
+                payload.extend(&proof);
+                let ciphertext = link.encrypt(&mut self.rng, &payload);
+                let packet = Packet::LinkData {
+                    hops: 0,
+                    destination: LinkDataDestination::Direct(link_id),
+                    context: LinkContext::ResourcePrf,
+                    data: ciphertext,
+                };
+                for iface in &mut self.interfaces {
+                    iface.send(packet.clone(), 0, now);
+                }
 
-                    if let Some(service_idx) = self
-                        .services
-                        .iter()
-                        .position(|s| s.address == link.destination)
-                    {
-                        let msg = InboundMessage::ResourceComplete {
-                            link_id,
-                            hash,
-                            data,
-                            metadata: resource.metadata.clone(),
-                        };
-                        self.services[service_idx].service.inbound(msg);
-                    }
-                } else if let Some(service_idx) = self
+                if let Some(service_idx) = self
                     .services
                     .iter()
                     .position(|s| s.address == link.destination)
                 {
-                    let msg = InboundMessage::ResourceFailed { link_id, hash };
+                    let msg = InboundMessage::ResourceComplete {
+                        link_id,
+                        hash,
+                        data,
+                        metadata: resource.metadata.clone(),
+                    };
                     self.services[service_idx].service.inbound(msg);
                 }
+            } else if let Some(service_idx) = self
+                .services
+                .iter()
+                .position(|s| s.address == link.destination)
+            {
+                let msg = InboundMessage::ResourceFailed { link_id, hash };
+                self.services[service_idx].service.inbound(msg);
             }
         }
     }
@@ -1621,10 +1623,8 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             let exhausted = resource.is_hashmap_exhausted();
             let mut payload = Vec::new();
             payload.push(if exhausted { 1u8 } else { 0u8 });
-            if exhausted {
-                if let Some(last_hash) = resource.last_hashmap_hash() {
-                    payload.extend(&last_hash);
-                }
+            if exhausted && let Some(last_hash) = resource.last_hashmap_hash() {
+                payload.extend(&last_hash);
             }
             payload.extend(&hash);
             for h in needed {

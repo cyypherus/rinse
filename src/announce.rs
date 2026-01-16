@@ -228,15 +228,12 @@ impl AnnounceBuilder {
         }
     }
 
-    pub fn with_ratchet(mut self, ratchet: [u8; RATCHET_LEN]) -> Self {
-        self.ratchet = Some(ratchet);
-        self
-    }
-
     pub fn with_app_data(mut self, app_data: Vec<u8>) -> Self {
         self.app_data = app_data;
         self
     }
+
+    // TODO: with_ratchet() - requires ratchet key rotation infrastructure
 
     pub fn build(self, destination_hash: &[u8; 16]) -> AnnounceData {
         let signing_pub_bytes = self.signing_key.verifying_key().to_bytes();
