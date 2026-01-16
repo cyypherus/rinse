@@ -2,7 +2,6 @@ use std::collections::BinaryHeap;
 use std::time::Instant;
 
 use ed25519_dalek::SigningKey;
-use rand::Rng;
 
 use crate::packet::Packet;
 
@@ -48,26 +47,20 @@ pub struct Interface<T> {
     pub(crate) transport: T,
     queue: BinaryHeap<QueuedPacket>,
     delayed: Vec<DelayedPacket>,
-    pub(crate) ifac_len: usize,
     pub(crate) ifac_size: usize,
     pub(crate) ifac_identity: Option<SigningKey>,
     pub(crate) ifac_key: Option<Vec<u8>>,
-    pub(crate) min_delay_ms: u64,
-    pub(crate) max_delay_ms: u64,
 }
 
 impl<T: Transport> Interface<T> {
-    pub fn new(transport: T, ifac_len: usize) -> Self {
+    pub fn new(transport: T) -> Self {
         Self {
             transport,
             queue: BinaryHeap::new(),
             delayed: Vec::new(),
-            ifac_len,
             ifac_size: 0,
             ifac_identity: None,
             ifac_key: None,
-            min_delay_ms: 0,
-            max_delay_ms: 500,
         }
     }
 
@@ -82,15 +75,11 @@ impl<T: Transport> Interface<T> {
         self.transport.bandwidth_available()
     }
 
-    // "After a randomised delay, the announce will be retransmitted on all interfaces
-    // that have bandwidth available for processing announces."
-    pub(crate) fn send(&mut self, packet: Packet, priority: u8, rng: &mut impl Rng, now: Instant) {
-        let delay_ms = rng.gen_range(self.min_delay_ms..=self.max_delay_ms);
-        let send_at = now + std::time::Duration::from_millis(delay_ms);
+    pub(crate) fn send(&mut self, packet: Packet, priority: u8, now: Instant) {
         self.delayed.push(DelayedPacket {
             packet,
             priority,
-            send_at,
+            send_at: now,
         });
     }
 
@@ -102,20 +91,121 @@ impl<T: Transport> Interface<T> {
         self.queue.pop().map(|q| q.packet)
     }
 
-    pub(crate) fn recv(&mut self) -> Option<Vec<u8>> {
-        let data = self.transport.recv();
-        if let Some(ref bytes) = data {
-            if let Ok(pkt) = Packet::from_bytes(bytes) {
-                log::trace!("[RECV] {}", pkt.log_format());
+    fn validate_and_strip_ifac(&self, raw: &[u8]) -> Option<Vec<u8>> {
+        if raw.len() <= 2 {
+            return None;
+        }
+
+        if let (Some(ifac_identity), Some(ifac_key)) = (&self.ifac_identity, &self.ifac_key) {
+            if self.ifac_size == 0 {
+                return Some(raw.to_vec());
+            }
+
+            // Interface has IFAC enabled - packet MUST have valid IFAC
+            if raw[0] & 0x80 != 0x80 {
+                return None; // IFAC flag not set
+            }
+            if raw.len() <= 2 + self.ifac_size {
+                return None; // Too short
+            }
+
+            // Extract IFAC
+            let ifac = &raw[2..2 + self.ifac_size];
+
+            // Generate mask
+            let mask = crate::crypto::hkdf_expand(ifac, ifac_key, raw.len());
+
+            // Unmask header and payload (but not IFAC itself)
+            let mut unmasked_raw = Vec::with_capacity(raw.len());
+            for (i, &byte) in raw.iter().enumerate() {
+                if i <= 1 || i > self.ifac_size + 1 {
+                    unmasked_raw.push(byte ^ mask[i]);
+                } else {
+                    unmasked_raw.push(byte);
+                }
+            }
+
+            // Unset IFAC flag and re-assemble packet without IFAC
+            let new_header = [unmasked_raw[0] & 0x7f, unmasked_raw[1]];
+            let mut new_raw = Vec::with_capacity(raw.len() - self.ifac_size);
+            new_raw.extend_from_slice(&new_header);
+            new_raw.extend_from_slice(&unmasked_raw[2 + self.ifac_size..]);
+
+            // Validate: re-compute IFAC and compare
+            let signature = crate::crypto::sign(ifac_identity, &new_raw);
+            let expected_ifac = &signature.to_bytes()[64 - self.ifac_size..];
+
+            if ifac == expected_ifac {
+                Some(new_raw)
             } else {
-                log::trace!(
-                    "[RECV] raw {} bytes: {}",
-                    bytes.len(),
-                    hex::encode(&bytes[..bytes.len().min(32)])
-                );
+                None
+            }
+        } else {
+            // Interface does NOT have IFAC enabled - packet must NOT have IFAC flag
+            if raw[0] & 0x80 == 0x80 {
+                None
+            } else {
+                Some(raw.to_vec())
             }
         }
-        data
+    }
+
+    pub(crate) fn recv(&mut self) -> Option<Vec<u8>> {
+        let raw = self.transport.recv()?;
+        let data = self.validate_and_strip_ifac(&raw)?;
+        if let Ok(pkt) = Packet::from_bytes(&data) {
+            log::trace!("[RECV] {}", pkt.log_format());
+        } else {
+            log::trace!(
+                "[RECV] raw {} bytes: {}",
+                data.len(),
+                hex::encode(&data[..data.len().min(32)])
+            );
+        }
+        Some(data)
+    }
+
+    fn apply_ifac(&self, raw: &[u8]) -> Vec<u8> {
+        if let (Some(ifac_identity), Some(ifac_key)) = (&self.ifac_identity, &self.ifac_key) {
+            if self.ifac_size == 0 {
+                return raw.to_vec();
+            }
+
+            // Calculate packet access code (sign raw, take last ifac_size bytes)
+            let signature = crate::crypto::sign(ifac_identity, raw);
+            let ifac = &signature.to_bytes()[64 - self.ifac_size..];
+
+            // Generate mask
+            let mask = crate::crypto::hkdf_expand(ifac, ifac_key, raw.len() + self.ifac_size);
+
+            // Set IFAC flag (bit 7 of header byte 0)
+            let new_header = [raw[0] | 0x80, raw[1]];
+
+            // Assemble new payload: header + ifac + payload
+            let mut new_raw = Vec::with_capacity(raw.len() + self.ifac_size);
+            new_raw.extend_from_slice(&new_header);
+            new_raw.extend_from_slice(ifac);
+            new_raw.extend_from_slice(&raw[2..]);
+
+            // Mask payload
+            let mut masked_raw = Vec::with_capacity(new_raw.len());
+            for (i, &byte) in new_raw.iter().enumerate() {
+                if i == 0 {
+                    // Mask first header byte, but keep IFAC flag set
+                    masked_raw.push((byte ^ mask[i]) | 0x80);
+                } else if i == 1 || i > self.ifac_size + 1 {
+                    // Mask second header byte and payload
+                    masked_raw.push(byte ^ mask[i]);
+                } else {
+                    // Don't mask the IFAC itself
+                    masked_raw.push(byte);
+                }
+            }
+
+            masked_raw
+        } else {
+            raw.to_vec()
+        }
     }
 
     pub(crate) fn poll(&mut self, now: Instant) {
@@ -124,7 +214,9 @@ impl<T: Transport> Interface<T> {
             if self.delayed[i].send_at <= now {
                 let delayed = self.delayed.swap_remove(i);
                 if self.bandwidth_available() {
-                    self.transport.send(&delayed.packet.to_bytes());
+                    let raw = delayed.packet.to_bytes();
+                    let out = self.apply_ifac(&raw);
+                    self.transport.send(&out);
                 } else {
                     self.queue(delayed.packet, delayed.priority);
                 }
@@ -135,7 +227,9 @@ impl<T: Transport> Interface<T> {
 
         while self.bandwidth_available() {
             if let Some(packet) = self.dequeue() {
-                self.transport.send(&packet.to_bytes());
+                let raw = packet.to_bytes();
+                let out = self.apply_ifac(&raw);
+                self.transport.send(&out);
             } else {
                 break;
             }
@@ -148,7 +242,6 @@ mod tests {
     use super::*;
     use crate::packet::AnnounceDestination;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
 
     struct MockTransport {
         sent: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -195,8 +288,8 @@ mod tests {
     fn bandwidth_delegates_to_transport() {
         let (t_with, _) = MockTransport::new(true);
         let (t_without, _) = MockTransport::new(false);
-        let iface_with = Interface::new(t_with, 0);
-        let iface_without = Interface::new(t_without, 0);
+        let iface_with = Interface::new(t_with);
+        let iface_without = Interface::new(t_without);
 
         assert!(iface_with.bandwidth_available());
         assert!(!iface_without.bandwidth_available());
@@ -205,7 +298,7 @@ mod tests {
     #[test]
     fn prioritise_announces_for_destinations_that_are_closest_in_terms_of_hops() {
         let (transport, _) = MockTransport::new(true);
-        let mut iface = Interface::new(transport, 0);
+        let mut iface = Interface::new(transport);
 
         iface.queue(make_packet([1u8; 16], 10), 10);
         iface.queue(make_packet([2u8; 16], 2), 2);
@@ -221,45 +314,134 @@ mod tests {
     }
 
     #[test]
-    fn send_delays_then_transmits() {
-        use rand::SeedableRng;
-        use rand::rngs::StdRng;
-
+    fn send_then_poll_transmits() {
         let (transport, sent) = MockTransport::new(true);
-        let mut iface = Interface::new(transport, 0);
-        let mut rng = StdRng::seed_from_u64(1);
-        iface.min_delay_ms = 10;
-        iface.max_delay_ms = 10;
+        let mut iface = Interface::new(transport);
 
         let packet = make_packet([1u8; 16], 5);
         let now = Instant::now();
-        iface.send(packet, 5, &mut rng, now);
+        iface.send(packet, 5, now);
 
-        iface.poll(now);
         assert_eq!(sent.lock().unwrap().len(), 0);
-
-        iface.poll(now + Duration::from_millis(20));
+        iface.poll(now);
         assert_eq!(sent.lock().unwrap().len(), 1);
     }
 
     #[test]
     fn no_bandwidth_queues_packet() {
-        use rand::SeedableRng;
-        use rand::rngs::StdRng;
-
         let (transport, sent) = MockTransport::new(false);
-        let mut iface = Interface::new(transport, 0);
-        let mut rng = StdRng::seed_from_u64(1);
-        iface.min_delay_ms = 0;
-        iface.max_delay_ms = 0;
+        let mut iface = Interface::new(transport);
 
         let now = Instant::now();
         let packet = make_packet([1u8; 16], 5);
-        iface.send(packet, 5, &mut rng, now);
+        iface.send(packet, 5, now);
 
         iface.poll(now);
 
         assert_eq!(sent.lock().unwrap().len(), 0);
         assert_eq!(iface.queue.len(), 1);
+    }
+
+    fn make_ifac_interface() -> (Interface<MockTransport>, Arc<Mutex<Vec<Vec<u8>>>>) {
+        use ed25519_dalek::SigningKey;
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let ifac_identity = SigningKey::generate(&mut rng);
+        let ifac_key = vec![0xAB; 32];
+
+        let (transport, sent) = MockTransport::new(true);
+        let iface = Interface::new(transport).with_ifac(ifac_identity, ifac_key, 8);
+        (iface, sent)
+    }
+
+    #[test]
+    fn ifac_roundtrip() {
+        let (iface, _) = make_ifac_interface();
+
+        let packet = make_packet([1u8; 16], 5);
+        let raw = packet.to_bytes();
+
+        let with_ifac = iface.apply_ifac(&raw);
+        assert_ne!(with_ifac, raw, "IFAC should modify packet");
+        assert_eq!(with_ifac[0] & 0x80, 0x80, "IFAC flag should be set");
+        assert_eq!(with_ifac.len(), raw.len() + 8, "should add ifac_size bytes");
+
+        let stripped = iface.validate_and_strip_ifac(&with_ifac);
+        assert_eq!(stripped, Some(raw), "round-trip should return original");
+    }
+
+    #[test]
+    fn ifac_wrong_key_rejected() {
+        use ed25519_dalek::SigningKey;
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+
+        let (iface_a, _) = make_ifac_interface();
+
+        // Create interface B with different key
+        let mut rng = StdRng::seed_from_u64(99);
+        let ifac_identity_b = SigningKey::generate(&mut rng);
+        let ifac_key_b = vec![0xCD; 32]; // different key
+        let (transport_b, _) = MockTransport::new(true);
+        let iface_b = Interface::new(transport_b).with_ifac(ifac_identity_b, ifac_key_b, 8);
+
+        let packet = make_packet([1u8; 16], 5);
+        let raw = packet.to_bytes();
+
+        // A applies IFAC
+        let with_ifac = iface_a.apply_ifac(&raw);
+
+        // B tries to validate - should fail
+        let result = iface_b.validate_and_strip_ifac(&with_ifac);
+        assert!(result.is_none(), "wrong IFAC key should be rejected");
+    }
+
+    #[test]
+    fn ifac_missing_flag_rejected() {
+        let (iface, _) = make_ifac_interface();
+
+        // Raw packet without IFAC flag
+        let packet = make_packet([1u8; 16], 5);
+        let raw = packet.to_bytes();
+        assert_eq!(raw[0] & 0x80, 0, "raw packet should not have IFAC flag");
+
+        let result = iface.validate_and_strip_ifac(&raw);
+        assert!(
+            result.is_none(),
+            "packet without IFAC flag should be rejected on IFAC interface"
+        );
+    }
+
+    #[test]
+    fn ifac_flag_on_non_ifac_interface_rejected() {
+        let (transport, _) = MockTransport::new(true);
+        let iface = Interface::new(transport); // no IFAC
+
+        // Create a packet with IFAC flag set manually
+        let packet = make_packet([1u8; 16], 5);
+        let mut raw = packet.to_bytes();
+        raw[0] |= 0x80; // set IFAC flag
+
+        let result = iface.validate_and_strip_ifac(&raw);
+        assert!(
+            result.is_none(),
+            "IFAC flag on non-IFAC interface should be rejected"
+        );
+    }
+
+    #[test]
+    fn ifac_correct_key_passes() {
+        let (iface, _) = make_ifac_interface();
+
+        let packet = make_packet([1u8; 16], 5);
+        let raw = packet.to_bytes();
+
+        let with_ifac = iface.apply_ifac(&raw);
+        let result = iface.validate_and_strip_ifac(&with_ifac);
+
+        assert!(result.is_some(), "correct IFAC key should pass");
+        assert_eq!(result.unwrap(), raw);
     }
 }

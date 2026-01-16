@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use rand::RngCore;
 use rand::rngs::ThreadRng;
+use rand::{Rng, RngCore};
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 use crate::announce::{AnnounceBuilder, AnnounceData};
@@ -22,6 +22,7 @@ const DEFAULT_MAX_HOPS: u8 = 128;
 const DEFAULT_RETRIES: u8 = 1;
 const DEFAULT_RETRY_DELAY_MS: u64 = 4000;
 const LOCAL_REBROADCASTS_MAX: u8 = 2;
+const PATHFINDER_RW_MS: u64 = 500;
 
 pub enum InboundMessage {
     LinkData {
@@ -326,7 +327,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         let packet = self.make_announce_packet(address, 0, false, announce_data.to_bytes(), None);
 
         for iface in &mut self.interfaces {
-            iface.send(packet.clone(), 0, &mut self.rng, now);
+            iface.send(packet.clone(), 0, now);
         }
     }
 
@@ -343,7 +344,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         };
 
         for iface in &mut self.interfaces {
-            iface.send(packet.clone(), 0, &mut self.rng, now);
+            iface.send(packet.clone(), 0, now);
         }
     }
 
@@ -394,7 +395,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             hex::encode(link_id)
         );
         if let Some(iface) = self.interfaces.get_mut(target_interface) {
-            iface.send(packet, 0, &mut self.rng, now);
+            iface.send(packet, 0, now);
         }
 
         Some(link_id)
@@ -456,90 +457,12 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         true
     }
 
-    fn validate_ifac(
-        raw: &[u8],
-        ifac_identity: Option<&SigningKey>,
-        ifac_size: usize,
-        ifac_key: Option<&[u8]>,
-    ) -> Option<Vec<u8>> {
-        if raw.len() <= 2 {
-            return None;
-        }
-
-        if let Some(ifac_id) = ifac_identity {
-            // Interface has IFAC enabled
-            if raw[0] & 0x80 == 0x80 {
-                // IFAC flag is set - good
-                if raw.len() > 2 + ifac_size {
-                    // Extract IFAC
-                    let ifac = &raw[2..2 + ifac_size];
-
-                    // Generate mask
-                    let mask = crate::crypto::hkdf_expand(ifac, ifac_key?, raw.len());
-
-                    // Unmask payload
-                    let mut unmasked_raw = Vec::with_capacity(raw.len());
-                    for (i, &byte) in raw.iter().enumerate() {
-                        if i <= 1 || i > ifac_size + 1 {
-                            // Unmask header bytes and payload
-                            unmasked_raw.push(byte ^ mask[i]);
-                        } else {
-                            // Don't unmask IFAC itself
-                            unmasked_raw.push(byte);
-                        }
-                    }
-
-                    // Unset IFAC flag
-                    let new_header = [unmasked_raw[0] & 0x7f, unmasked_raw[1]];
-
-                    // Re-assemble packet
-                    let mut new_raw = Vec::with_capacity(raw.len() - ifac_size);
-                    new_raw.extend_from_slice(&new_header);
-                    new_raw.extend_from_slice(&unmasked_raw[2 + ifac_size..]);
-
-                    // Calculate expected IFAC
-                    let signature = crate::crypto::sign(ifac_id, &new_raw);
-                    let expected_ifac = &signature.to_bytes()[64 - ifac_size..];
-
-                    // Check it
-                    if ifac == expected_ifac {
-                        Some(new_raw)
-                    } else {
-                        None
-                    }
-                } else {
-                    // Too short
-                    None
-                }
-            } else {
-                // IFAC flag not set but should be
-                None
-            }
-        } else {
-            // Interface does NOT have IFAC enabled
-            if raw[0] & 0x80 == 0x80 {
-                // Flag set but shouldn't be
-                None
-            } else {
-                Some(raw.to_vec())
-            }
-        }
-    }
-
     fn inbound(
         &mut self,
         raw: &[u8],
         interface_index: usize,
         now: Instant,
     ) -> Option<(Packet, bool, bool)> {
-        let interface = self.interfaces.get(interface_index)?;
-        let raw = Self::validate_ifac(
-            raw,
-            interface.ifac_identity.as_ref(),
-            interface.ifac_size,
-            interface.ifac_key.as_deref(),
-        )?;
-
         let mut packet = match Packet::from_bytes(&raw) {
             Ok(p) => p,
             Err(e) => {
@@ -599,11 +522,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 }
             )
         {
-            let raw = packet.to_bytes();
             // Send to all interfaces except the originator
             for (i, iface) in self.interfaces.iter_mut().enumerate() {
                 if i != interface_index {
-                    iface.transport.send(&raw);
+                    iface.send(packet.clone(), 0, now);
                 }
             }
         }
@@ -632,7 +554,6 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     } else if remaining_hops == 1 {
                         new_packet.strip_transport();
                     }
-                    let new_raw = new_packet.to_bytes();
 
                     // Record in link_table for link requests, reverse_table for others
                     if matches!(packet, Packet::LinkRequest { .. }) {
@@ -659,7 +580,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
                     // Transmit on outbound interface
                     if let Some(iface) = self.interfaces.get_mut(outbound_interface) {
-                        iface.transport.send(&new_raw);
+                        iface.send(new_packet, 0, now);
                         path_entry.timestamp = now;
                     }
                 } else {
@@ -710,9 +631,8 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     // Add to packet hash filter now that we know it's our turn
                     self.seen_packets.insert(packet_hash);
 
-                    let raw = packet.to_bytes();
                     if let Some(iface) = self.interfaces.get_mut(out_iface) {
-                        iface.transport.send(&raw);
+                        iface.send(packet.clone(), 0, now);
                         link_entry.timestamp = now;
                     }
                 }
@@ -855,7 +775,9 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                         },
                     );
 
-                    // Schedule for rebroadcast
+                    // Schedule for rebroadcast with random delay
+                    let delay_ms = self.rng.gen_range(0..=PATHFINDER_RW_MS);
+                    let retry_at = now + std::time::Duration::from_millis(delay_ms);
                     self.pending_announces.push(PendingAnnounce {
                         destination: destination_hash,
                         source_interface: interface_index,
@@ -863,7 +785,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                         has_ratchet: *has_ratchet,
                         data: data.clone(),
                         retries_remaining: self.retries,
-                        retry_at: now, // Rebroadcast immediately on first receive
+                        retry_at,
                         local_rebroadcasts: 0,
                     });
 
@@ -923,7 +845,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
                 log::debug!("Sending LinkProof for link <{}>", hex::encode(new_link_id));
                 if let Some(iface) = self.interfaces.get_mut(interface_index) {
-                    iface.transport.send(&proof_packet.to_bytes());
+                    iface.send(proof_packet, 0, now);
                 }
 
                 log::debug!(
@@ -1046,9 +968,8 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             if let Some(link_entry) = self.link_table.get(&link_id) {
                 if interface_index == link_entry.next_hop_interface {
                     // Transport the proof
-                    let raw = packet.to_bytes();
                     if let Some(iface) = self.interfaces.get_mut(link_entry.receiving_interface) {
-                        iface.transport.send(&raw);
+                        iface.send(packet.clone(), 0, now);
                     }
                 }
             } else if let Some(pending) = self.pending_outbound_links.remove(&destination_hash) {
@@ -1110,9 +1031,8 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         if let Packet::Proof { data, .. } = &packet {
             // Regular proof - check reverse table for transport
             if let Some(reverse_entry) = self.reverse_table.remove(&destination_hash) {
-                let raw = packet.to_bytes();
                 if let Some(iface) = self.interfaces.get_mut(reverse_entry.receiving_interface) {
-                    iface.transport.send(&raw);
+                    iface.send(packet.clone(), 0, now);
                 }
             }
 
@@ -1186,7 +1106,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         };
 
         for iface in &mut self.interfaces {
-            iface.send(packet.clone(), 0, &mut self.rng, now);
+            iface.send(packet.clone(), 0, now);
         }
     }
 
@@ -1242,9 +1162,8 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             }
 
             // Transmit on the specific interface
-            let raw = packet.to_bytes();
             if let Some(iface) = self.interfaces.get_mut(outbound_interface) {
-                iface.transport.send(&raw);
+                iface.send(packet, 0, now);
             }
 
             // Update path timestamp
@@ -1292,7 +1211,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     });
                 }
 
-                iface.send(packet.clone(), hops, &mut self.rng, now);
+                iface.send(packet.clone(), hops, now);
                 sent = true;
             }
         }
@@ -1409,7 +1328,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     data: close_data,
                 };
                 for iface in &mut self.interfaces {
-                    iface.send(packet.clone(), 0, &mut self.rng, now);
+                    iface.send(packet.clone(), 0, now);
                 }
             }
             self.established_links.remove(&link_id);
@@ -1435,7 +1354,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     data: response,
                 };
                 for iface in &mut self.interfaces {
-                    iface.send(packet.clone(), 0, &mut self.rng, now);
+                    iface.send(packet.clone(), 0, now);
                 }
             } else if plaintext[0] == KEEPALIVE_RESPONSE && link.is_initiator {
                 // Initiator: received keepalive response, update RTT
@@ -1525,7 +1444,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                                     data: ciphertext,
                                 };
                                 for iface in &mut self.interfaces {
-                                    iface.send(packet.clone(), 0, &mut self.rng, now);
+                                    iface.send(packet.clone(), 0, now);
                                 }
                             }
                         }
@@ -1544,7 +1463,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                                     data: ciphertext,
                                 };
                                 for iface in &mut self.interfaces {
-                                    iface.send(packet.clone(), 0, &mut self.rng, now);
+                                    iface.send(packet.clone(), 0, now);
                                 }
                             }
                         }
@@ -1662,7 +1581,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                         data: ciphertext,
                     };
                     for iface in &mut self.interfaces {
-                        iface.send(packet.clone(), 0, &mut self.rng, now);
+                        iface.send(packet.clone(), 0, now);
                     }
 
                     if let Some(service_idx) = self
@@ -1721,7 +1640,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     data: ciphertext,
                 };
                 for iface in &mut self.interfaces {
-                    iface.send(packet.clone(), 0, &mut self.rng, now);
+                    iface.send(packet.clone(), 0, now);
                 }
             }
         }
@@ -1750,7 +1669,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                             data: ciphertext,
                         };
                         for iface in &mut self.interfaces {
-                            iface.send(packet.clone(), 0, &mut self.rng, now);
+                            iface.send(packet.clone(), 0, now);
                         }
                     }
                 }
@@ -1780,7 +1699,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                         };
                         let target = entry.receiving_interface;
                         if let Some(iface) = self.interfaces.get_mut(target) {
-                            iface.send(packet, 0, &mut self.rng, now);
+                            iface.send(packet, 0, now);
                         }
                     }
                 }
@@ -1805,7 +1724,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                         link.pending_requests.insert(request_id, service_addr);
 
                         for iface in &mut self.interfaces {
-                            iface.send(packet.clone(), 0, &mut self.rng, now);
+                            iface.send(packet.clone(), 0, now);
                         }
                     }
                 }
@@ -1825,7 +1744,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                             data: ciphertext,
                         };
                         for iface in &mut self.interfaces {
-                            iface.send(packet.clone(), 0, &mut self.rng, now);
+                            iface.send(packet.clone(), 0, now);
                         }
                     }
                 }
@@ -1859,7 +1778,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                             .insert(hash, (link_id, service_addr, resource));
 
                         for iface in &mut self.interfaces {
-                            iface.send(packet.clone(), 0, &mut self.rng, now);
+                            iface.send(packet.clone(), 0, now);
                         }
                     }
                 }
@@ -1885,7 +1804,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                             data: ciphertext,
                         };
                         for iface in &mut self.interfaces {
-                            iface.send(packet.clone(), 0, &mut self.rng, now);
+                            iface.send(packet.clone(), 0, now);
                         }
                     }
                 }
@@ -1988,10 +1907,7 @@ mod tests {
     }
 
     fn test_interface() -> Interface<MockTransport> {
-        let mut iface = Interface::new(MockTransport::new(), 0);
-        iface.min_delay_ms = 0;
-        iface.max_delay_ms = 0;
-        iface
+        Interface::new(MockTransport::new())
     }
 
     #[derive(Default)]
@@ -2051,14 +1967,15 @@ mod tests {
 
         let addr = a.add_service(svc("test"));
         let now = Instant::now();
+        let later = now + std::time::Duration::from_secs(1);
 
         a.announce(addr, now);
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
-        b.poll(now);
+        b.poll(later); // rebroadcast after delay
         transfer(&mut b, 1, &mut c, 0);
-        c.poll(now);
+        c.poll(later);
 
         assert!(b.has_destination(&addr));
         assert!(c.has_destination(&addr));
@@ -2122,25 +2039,26 @@ mod tests {
 
         let addr_c = c.add_service(svc("server"));
         let now = Instant::now();
+        let later = now + std::time::Duration::from_secs(1);
 
         c.announce(addr_c, now);
         c.poll(now);
         transfer(&mut c, 0, &mut b, 1);
         b.poll(now);
-        b.poll(now);
+        b.poll(later); // rebroadcast after delay
         transfer(&mut b, 0, &mut a, 0);
-        a.poll(now);
+        a.poll(later);
 
-        let link_id = a.link(addr_c, now).expect("link should be created");
-        a.poll(now);
+        let link_id = a.link(addr_c, later).expect("link should be created");
+        a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
-        b.poll(now);
+        b.poll(later);
         transfer(&mut b, 1, &mut c, 0);
-        c.poll(now);
+        c.poll(later);
         transfer(&mut c, 0, &mut b, 1);
-        b.poll(now);
+        b.poll(later);
         transfer(&mut b, 0, &mut a, 0);
-        a.poll(now);
+        a.poll(later);
 
         assert!(a.established_links.contains_key(&link_id));
         assert!(c.established_links.values().any(|l| l.link_id == link_id));
@@ -2188,32 +2106,33 @@ mod tests {
 
         let addr_c = c.add_service(svc("server"));
         let now = Instant::now();
+        let later = now + std::time::Duration::from_secs(1);
 
         c.announce(addr_c, now);
         c.poll(now);
         transfer(&mut c, 0, &mut b, 1);
         b.poll(now);
-        b.poll(now);
+        b.poll(later); // rebroadcast after delay
         transfer(&mut b, 0, &mut a, 0);
-        a.poll(now);
+        a.poll(later);
 
-        let link_id = a.link(addr_c, now).unwrap();
-        a.poll(now);
+        let link_id = a.link(addr_c, later).unwrap();
+        a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
-        b.poll(now);
+        b.poll(later);
         transfer(&mut b, 1, &mut c, 0);
-        c.poll(now);
+        c.poll(later);
         transfer(&mut c, 0, &mut b, 1);
-        b.poll(now);
+        b.poll(later);
         transfer(&mut b, 0, &mut a, 0);
-        a.poll(now);
+        a.poll(later);
 
-        a.send_link_packet(link_id, LinkContext::None, b"payload", now);
-        a.poll(now);
+        a.send_link_packet(link_id, LinkContext::None, b"payload", later);
+        a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
-        b.poll(now);
+        b.poll(later);
         transfer(&mut b, 1, &mut c, 0);
-        c.poll(now);
+        c.poll(later);
 
         assert_eq!(c.services[0].service.inbox.len(), 1);
     }
@@ -2265,14 +2184,15 @@ mod tests {
         a.add_service(svc("sender"));
         let addr_c = c.add_service(svc("receiver"));
         let now = Instant::now();
+        let later = now + std::time::Duration::from_secs(1);
 
         c.announce(addr_c, now);
         c.poll(now);
         transfer(&mut c, 0, &mut b, 1);
         b.poll(now);
-        b.poll(now);
+        b.poll(later); // rebroadcast after delay
         transfer(&mut b, 0, &mut a, 0);
-        a.poll(now);
+        a.poll(later);
 
         a.services[0]
             .service
@@ -2281,11 +2201,11 @@ mod tests {
                 destination: addr_c,
                 data: b"hello".to_vec(),
             });
-        a.poll(now);
+        a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
-        b.poll(now);
+        b.poll(later);
         transfer(&mut b, 1, &mut c, 0);
-        c.poll(now);
+        c.poll(later);
 
         assert_eq!(c.services[0].service.inbox.len(), 1);
         assert!(matches!(
@@ -2375,25 +2295,26 @@ mod tests {
         a.add_service(svc("client"));
         let addr_c = c.add_service(svc("server"));
         let now = Instant::now();
+        let later = now + std::time::Duration::from_secs(1);
 
         c.announce(addr_c, now);
         c.poll(now);
         transfer(&mut c, 0, &mut b, 1);
         b.poll(now);
-        b.poll(now);
+        b.poll(later); // rebroadcast after delay
         transfer(&mut b, 0, &mut a, 0);
-        a.poll(now);
+        a.poll(later);
 
-        let link_id = a.link(addr_c, now).unwrap();
-        a.poll(now);
+        let link_id = a.link(addr_c, later).unwrap();
+        a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
-        b.poll(now);
+        b.poll(later);
         transfer(&mut b, 1, &mut c, 0);
-        c.poll(now);
+        c.poll(later);
         transfer(&mut c, 0, &mut b, 1);
-        b.poll(now);
+        b.poll(later);
         transfer(&mut b, 0, &mut a, 0);
-        a.poll(now);
+        a.poll(later);
 
         a.services[0]
             .service
@@ -2403,11 +2324,11 @@ mod tests {
                 path: "test.path".into(),
                 data: b"request data".to_vec(),
             });
-        a.poll(now);
+        a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
-        b.poll(now);
+        b.poll(later);
         transfer(&mut b, 1, &mut c, 0);
-        c.poll(now);
+        c.poll(later);
 
         assert_eq!(c.services[0].service.inbox.len(), 1);
         let (req_link_id, req_id) = match &c.services[0].service.inbox[0] {
@@ -2431,11 +2352,11 @@ mod tests {
                 request_id: req_id,
                 data: b"response data".to_vec(),
             });
-        c.poll(now);
+        c.poll(later);
         transfer(&mut c, 0, &mut b, 1);
-        b.poll(now);
+        b.poll(later);
         transfer(&mut b, 0, &mut a, 0);
-        a.poll(now);
+        a.poll(later);
 
         assert_eq!(a.services[0].service.inbox.len(), 1);
         assert!(matches!(
@@ -2786,10 +2707,164 @@ mod tests {
             rtt_after, 50,
             "RTT should be exactly 50ms from keepalive roundtrip"
         );
+    }
+
+    fn make_ifac_interface(
+        ifac_identity: SigningKey,
+        ifac_key: Vec<u8>,
+    ) -> Interface<MockTransport> {
+        Interface::new(MockTransport::new()).with_ifac(ifac_identity, ifac_key, 8)
+    }
+
+    #[test]
+    fn ifac_two_nodes_communicate() {
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+
+        // Both nodes share the SAME IFAC identity and key (derived from network name/key)
+        let mut rng = StdRng::seed_from_u64(42);
+        let shared_ifac_identity = SigningKey::generate(&mut rng);
+        let shared_ifac_key = vec![0xAB; 32];
+
+        let mut a: TestNode = Node::new(false);
+        let mut b: TestNode = Node::new(false);
+        a.add_interface(make_ifac_interface(
+            shared_ifac_identity.clone(),
+            shared_ifac_key.clone(),
+        ));
+        b.add_interface(make_ifac_interface(shared_ifac_identity, shared_ifac_key));
+
+        let _addr_a = a.add_service(svc("client"));
+        let addr_b = b.add_service(svc("server"));
+        let now = Instant::now();
+
+        // B announces
+        b.announce(addr_b, now);
+        b.poll(now);
+
+        // Transfer announce (with IFAC) from B to A
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        // A should have learned about B
         assert!(
-            rtt_after >= 50 && rtt_after <= 100,
-            "RTT should be ~50ms from keepalive roundtrip, got {}ms",
-            rtt_after
+            a.has_destination(&addr_b),
+            "A should know about B after IFAC-protected announce"
+        );
+
+        // A establishes link to B
+        let link_id = a.link(addr_b, now).expect("should create link");
+        a.poll(now);
+        println!(
+            "A outbox after link request: {}",
+            a.interfaces[0].transport.outbox.len()
+        );
+        transfer(&mut a, 0, &mut b, 0);
+        println!(
+            "B inbox after transfer: {}",
+            b.interfaces[0].transport.inbox.len()
+        );
+        b.poll(now);
+        println!(
+            "B outbox after poll: {}",
+            b.interfaces[0].transport.outbox.len()
+        );
+        println!("B established_links: {}", b.established_links.len());
+        println!("B ifac_size: {}", b.interfaces[0].ifac_size);
+        println!(
+            "B ifac_identity: {}",
+            b.interfaces[0].ifac_identity.is_some()
+        );
+        println!("B ifac_key: {}", b.interfaces[0].ifac_key.is_some());
+        if let Some(raw) = b.interfaces[0].transport.outbox.front() {
+            println!(
+                "B outbox packet len: {}, first byte: 0x{:02x}",
+                raw.len(),
+                raw[0]
+            );
+        }
+        transfer(&mut b, 0, &mut a, 0);
+        println!(
+            "A inbox after transfer: {}",
+            a.interfaces[0].transport.inbox.len()
+        );
+        if let Some(raw) = a.interfaces[0].transport.inbox.front() {
+            println!(
+                "Raw packet len: {}, first byte: 0x{:02x}",
+                raw.len(),
+                raw[0]
+            );
+        }
+        a.poll(now);
+        println!("A established_links: {}", a.established_links.len());
+        println!(
+            "A pending_outbound_links: {}",
+            a.pending_outbound_links.len()
+        );
+
+        assert!(
+            a.is_link_established(&link_id),
+            "link should be established over IFAC"
+        );
+
+        // Send data over the link
+        a.services[0]
+            .service
+            .outbox
+            .push_back(OutboundMessage::LinkData {
+                link_id,
+                data: b"hello over ifac".to_vec(),
+            });
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        let received = b.services[0].service.inbox.iter().any(
+            |m| matches!(m, InboundMessage::LinkData { data, .. } if data == b"hello over ifac"),
+        );
+        assert!(received, "B should receive data over IFAC-protected link");
+    }
+
+    #[test]
+    fn ifac_mismatch_blocks_communication() {
+        use ed25519_dalek::SigningKey;
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+
+        let mut a: TestNode = Node::new(false);
+        let mut b: TestNode = Node::new(false);
+
+        // A uses one IFAC key
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let ifac_identity_a = SigningKey::generate(&mut rng_a);
+        let ifac_key_a = vec![0xAA; 32];
+        let iface_a =
+            Interface::new(MockTransport::new()).with_ifac(ifac_identity_a, ifac_key_a, 8);
+        a.add_interface(iface_a);
+
+        // B uses different IFAC key
+        let mut rng_b = StdRng::seed_from_u64(99);
+        let ifac_identity_b = SigningKey::generate(&mut rng_b);
+        let ifac_key_b = vec![0xBB; 32];
+        let iface_b =
+            Interface::new(MockTransport::new()).with_ifac(ifac_identity_b, ifac_key_b, 8);
+        b.add_interface(iface_b);
+
+        let addr_b = b.add_service(svc("server"));
+        let now = Instant::now();
+
+        // B announces
+        b.announce(addr_b, now);
+        b.poll(now);
+
+        // Transfer announce from B to A
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        // A should NOT know about B (IFAC mismatch)
+        assert!(
+            !a.has_destination(&addr_b),
+            "A should not learn about B with mismatched IFAC"
         );
     }
 }
