@@ -25,6 +25,12 @@ const LOCAL_REBROADCASTS_MAX: u8 = 2;
 const PATHFINDER_RW_MS: u64 = 500;
 
 pub enum InboundMessage {
+    LinkEstablished {
+        link_id: LinkId,
+    },
+    LinkClosed {
+        link_id: LinkId,
+    },
     LinkData {
         link_id: LinkId,
         data: Vec<u8>,
@@ -263,6 +269,36 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             .get(link_id)
             .map(|l| l.state == crate::link::LinkState::Active)
             .unwrap_or(false)
+    }
+
+    pub fn close_link(&mut self, link_id: LinkId, now: Instant) {
+        let ciphertext = if let Some(link) = self.established_links.get(&link_id) {
+            if link.state == LinkState::Closed {
+                return;
+            }
+            link.encrypt(&mut self.rng, &link_id)
+        } else {
+            return;
+        };
+
+        self.send_link_packet(link_id, LinkContext::LinkClose, &ciphertext, now);
+
+        let destination = if let Some(link) = self.established_links.get_mut(&link_id) {
+            link.state = LinkState::Closed;
+            Some(link.destination)
+        } else {
+            None
+        };
+
+        if let Some(dest) = destination
+            && let Some(service_idx) = self.services.iter().position(|s| s.address == dest)
+        {
+            self.services[service_idx]
+                .service
+                .inbound(InboundMessage::LinkClosed { link_id });
+        }
+
+        log::debug!("Closed link <{}>", hex::encode(link_id));
     }
 
     pub fn add_service(&mut self, service: S) -> Address {
@@ -858,6 +894,13 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     iface.send(proof_packet, 0, now);
                 }
 
+                // Notify service of link establishment
+                self.services[service_idx]
+                    .service
+                    .inbound(InboundMessage::LinkEstablished {
+                        link_id: new_link_id,
+                    });
+
                 log::debug!(
                     "Established link <{}> as responder for service <{}>",
                     hex::encode(new_link_id),
@@ -877,6 +920,22 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 self.handle_keepalive(link_id, &plaintext, now);
             } else if *context == LinkContext::LinkRtt {
                 self.handle_link_rtt(link_id, &plaintext);
+            } else if *context == LinkContext::LinkClose {
+                // Verify the close packet contains the link_id
+                if plaintext.as_slice() == link_id {
+                    link.state = LinkState::Closed;
+                    log::debug!("Link <{}> closed by remote", hex::encode(link_id));
+                    // Notify service
+                    if let Some(service_idx) = self
+                        .services
+                        .iter()
+                        .position(|s| s.address == link.destination)
+                    {
+                        self.services[service_idx]
+                            .service
+                            .inbound(InboundMessage::LinkClosed { link_id });
+                    }
+                }
             } else if matches!(
                 context,
                 LinkContext::Resource
@@ -2143,7 +2202,7 @@ mod tests {
         a.add_interface(test_interface());
         b.add_interface(test_interface());
 
-        let addr_a = a.add_service(svc("sender"));
+        a.add_service(svc("sender"));
         let addr_b = b.add_service(svc("receiver"));
         let now = Instant::now();
 
@@ -2567,7 +2626,7 @@ mod tests {
         }
         let low_rtt_count = count_keepalives(&mut a, link_id, now, 60, 1);
         assert!(
-            low_rtt_count >= 10 && low_rtt_count <= 14,
+            (10..=14).contains(&low_rtt_count),
             "low RTT (5s interval): expected ~12 keepalives in 60s, got {}",
             low_rtt_count
         );
