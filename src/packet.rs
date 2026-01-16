@@ -1,3 +1,7 @@
+use sha2::Sha256;
+
+use crate::crypto::sha256;
+
 pub const ADDR_LEN: usize = 16;
 pub const MAX_DATA_LEN: usize = 465;
 pub const MAX_IFAC_LEN: usize = 64;
@@ -182,14 +186,24 @@ impl Header {
 /// Addresses are SHA-256 hashes truncated to 16 bytes.
 pub type Address = [u8; ADDR_LEN];
 
-/// The ADDRESSES field contains either 1 or 2 addresses.
-/// Each address is 16 bytes long.
-/// The Header Type flag in the HEADER field determines
-/// whether the ADDRESSES field contains 1 or 2 addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Addresses {
-    Single(Address),
-    Double(Address, Address),
+    Single {
+        transport_id: Address,
+    },
+    Double {
+        transport_id: Address,
+        final_destination: Address,
+    },
+}
+
+impl Addresses {
+    pub(crate) fn transport_id(&self) -> Address {
+        match self {
+            Addresses::Single { transport_id } => *transport_id,
+            Addresses::Double { transport_id, .. } => *transport_id,
+        }
+    }
 }
 
 /// [HEADER 2 bytes] [ADDRESSES 16/32 bytes] [CONTEXT 1 byte] [DATA 0-465 bytes]
@@ -237,8 +251,8 @@ impl Packet {
             return Err(ParseError::IfacTooLong);
         }
         let expected_type = match addresses {
-            Addresses::Single(_) => HeaderType::Type1,
-            Addresses::Double(_, _) => HeaderType::Type2,
+            Addresses::Single { .. } => HeaderType::Type1,
+            Addresses::Double { .. } => HeaderType::Type2,
         };
         if header.header_type != expected_type {
             return Err(ParseError::HeaderAddressMismatch);
@@ -258,6 +272,10 @@ impl Packet {
         })
     }
 
+    pub(crate) fn packet_hash(&self) -> [u8; 32] {
+        sha256(&self.hashable_part())
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.wire_len());
         out.extend_from_slice(&self.header.to_bytes());
@@ -265,8 +283,11 @@ impl Packet {
             out.extend_from_slice(ifac);
         }
         match self.addresses {
-            Addresses::Single(a) => out.extend_from_slice(&a),
-            Addresses::Double(a, b) => {
+            Addresses::Single { transport_id: a } => out.extend_from_slice(&a),
+            Addresses::Double {
+                transport_id: a,
+                final_destination: b,
+            } => {
                 out.extend_from_slice(&a);
                 out.extend_from_slice(&b);
             }
@@ -299,27 +320,32 @@ impl Packet {
             None
         };
 
-        let addr_count = match header.header_type {
-            HeaderType::Type1 => 1,
-            HeaderType::Type2 => 2,
+        let addresses = match header.header_type {
+            HeaderType::Type1 => {
+                let mut addr = [0u8; ADDR_LEN];
+                addr.copy_from_slice(&bytes[pos..pos + ADDR_LEN]);
+                Addresses::Single { transport_id: addr }
+            }
+            HeaderType::Type2 => {
+                let mut transport = [0u8; ADDR_LEN];
+                let mut destination = [0u8; ADDR_LEN];
+                transport.copy_from_slice(&bytes[pos..pos + ADDR_LEN]);
+                destination.copy_from_slice(&bytes[pos + ADDR_LEN..pos + 2 * ADDR_LEN]);
+                Addresses::Double {
+                    transport_id: transport,
+                    final_destination: destination,
+                }
+            }
         };
-        let addr_bytes = addr_count * ADDR_LEN;
-        if bytes.len() < pos + addr_bytes + 1 {
+
+        pos += match header.header_type {
+            HeaderType::Type1 => 1 * ADDR_LEN,
+            HeaderType::Type2 => 2 * ADDR_LEN,
+        } + 1;
+
+        if bytes.len() < pos {
             return Err(ParseError::TooShort);
         }
-
-        let addresses = if addr_count == 1 {
-            let mut addr = [0u8; ADDR_LEN];
-            addr.copy_from_slice(&bytes[pos..pos + ADDR_LEN]);
-            Addresses::Single(addr)
-        } else {
-            let mut addr1 = [0u8; ADDR_LEN];
-            let mut addr2 = [0u8; ADDR_LEN];
-            addr1.copy_from_slice(&bytes[pos..pos + ADDR_LEN]);
-            addr2.copy_from_slice(&bytes[pos + ADDR_LEN..pos + 2 * ADDR_LEN]);
-            Addresses::Double(addr1, addr2)
-        };
-        pos += addr_bytes;
 
         let context = Context::from_byte(bytes[pos]).ok_or(ParseError::InvalidContext)?;
         pos += 1;
@@ -341,8 +367,8 @@ impl Packet {
     pub fn wire_len(&self) -> usize {
         let ifac_len = self.ifac.as_ref().map_or(0, |v| v.len());
         let addr_len = match self.addresses {
-            Addresses::Single(_) => ADDR_LEN,
-            Addresses::Double(_, _) => 2 * ADDR_LEN,
+            Addresses::Single { .. } => ADDR_LEN,
+            Addresses::Double { .. } => 2 * ADDR_LEN,
         };
         2 + ifac_len + addr_len + 1 + self.data.len()
     }
@@ -387,7 +413,10 @@ mod tests {
         let packet = Packet::new(
             header,
             None,
-            Addresses::Double(hash1, hash2),
+            Addresses::Double {
+                transport_id: hash1,
+                final_destination: hash2,
+            },
             Context::None,
             data.clone(),
         )
@@ -426,7 +455,9 @@ mod tests {
         let packet = Packet::new(
             header,
             None,
-            Addresses::Single(hash1),
+            Addresses::Single {
+                transport_id: hash1,
+            },
             Context::None,
             data.clone(),
         )
@@ -465,7 +496,9 @@ mod tests {
         let packet = Packet::new(
             header,
             Some(ifac.clone()),
-            Addresses::Single(hash1),
+            Addresses::Single {
+                transport_id: hash1,
+            },
             Context::None,
             data.clone(),
         )
@@ -497,7 +530,9 @@ mod tests {
         let packet = Packet::new(
             header,
             None,
-            Addresses::Single([0u8; 16]),
+            Addresses::Single {
+                transport_id: [0u8; 16],
+            },
             Context::Keepalive,
             vec![0u8; 1],
         )
@@ -523,7 +558,9 @@ mod tests {
         let packet = Packet::new(
             header,
             None,
-            Addresses::Single([0u8; 16]),
+            Addresses::Single {
+                transport_id: [0u8; 16],
+            },
             Context::PathResponse,
             vec![0u8; 32],
         )
@@ -549,7 +586,10 @@ mod tests {
         let packet = Packet::new(
             header,
             None,
-            Addresses::Double([0u8; 16], [0u8; 16]),
+            Addresses::Double {
+                transport_id: [0u8; 16],
+                final_destination: [0u8; 16],
+            },
             Context::None,
             vec![0u8; 48],
         )
@@ -575,7 +615,10 @@ mod tests {
         let packet = Packet::new(
             header,
             None,
-            Addresses::Double([0u8; 16], [0u8; 16]),
+            Addresses::Double {
+                transport_id: [0u8; 16],
+                final_destination: [0u8; 16],
+            },
             Context::LinkRtt,
             vec![0u8; 64],
         )
@@ -601,7 +644,10 @@ mod tests {
         let packet = Packet::new(
             header,
             None,
-            Addresses::Double([0u8; 16], [0u8; 16]),
+            Addresses::Double {
+                transport_id: [0u8; 16],
+                final_destination: [0u8; 16],
+            },
             Context::LinkProof,
             vec![0u8; 80],
         )
@@ -627,7 +673,9 @@ mod tests {
         let packet = Packet::new(
             header,
             None,
-            Addresses::Single([0u8; 16]),
+            Addresses::Single {
+                transport_id: [0u8; 16],
+            },
             Context::None,
             vec![0u8; 148],
         )

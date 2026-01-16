@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -128,7 +129,8 @@ pub struct Node<T, R = ThreadRng> {
     transport_id: Address,
     path_table: HashMap<Address, PathEntry>,
     pending_announces: Vec<PendingAnnounce>,
-    seen_packet_hashes: std::collections::HashSet<[u8; 32]>,
+    packet_hashlist: std::collections::HashSet<[u8; 32]>,
+    packet_hashlist_prev: std::collections::HashSet<[u8; 32]>,
     reverse_table: HashMap<Address, ReverseTableEntry>,
     control_hashes: std::collections::HashSet<Address>,
     receipts: Vec<Receipt>,
@@ -309,7 +311,9 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         let packet = Packet::new(
             header,
             None,
-            Addresses::Single(PathRequest::destination()),
+            Addresses::Single {
+                transport_id: PathRequest::destination(),
+            },
             Context::None,
             request.to_bytes(),
         )
@@ -366,6 +370,49 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         }
 
         Some(link_id)
+    }
+
+    fn accept_packet(&self, packet: &Packet) -> bool {
+        if packet.header.packet_type != PacketType::Announce
+            && packet.addresses.transport_id() != self.transport_id
+        {
+            log::warn!(
+                "Ignored packet <{}>in transport elsewhere",
+                hex::encode(packet.packet_hash())
+            );
+
+            return false;
+        }
+
+        if let Context::Keepalive
+        | Context::ResourceReq
+        | Context::ResourcePrf
+        | Context::Resource
+        | Context::CacheRequest
+        | Context::Channel = packet.context
+        {
+            return true;
+        }
+
+        if let DestinationType::Plain | DestinationType::Group = packet.header.destination_type
+            && packet.header.packet_type != PacketType::Announce
+            && packet.header.hops > 1
+        {
+            log::debug!(
+                "Dropped invalid GROUP / PLAIN non-announce packet with hops {}",
+                packet.header.hops
+            );
+            return false;
+        }
+
+        if let DestinationType::Plain | DestinationType::Group = packet.header.destination_type
+            && packet.header.packet_type == PacketType::Announce
+        {
+            log::debug!("Dropped invalid GROUP / PLAIN announce packet");
+            return false;
+        }
+
+        true
     }
 
     fn inbound(
@@ -466,8 +513,10 @@ impl<T: Transport, R: RngCore> Node<T, R> {
 
         // Get destination hash for lookups
         let destination_hash = match packet.addresses {
-            Addresses::Single(addr) => addr,
-            Addresses::Double(_, addr) => addr,
+            Addresses::Single { transport_id } => transport_id,
+            Addresses::Double {
+                final_destination, ..
+            } => final_destination,
         };
 
         // If this packet belongs to a link in our link table,
@@ -524,7 +573,10 @@ impl<T: Transport, R: RngCore> Node<T, R> {
 
             // If the packet is in transport (has transport_id), check whether we
             // are the designated next hop, and process it accordingly if we are.
-            if let Addresses::Double(transport_id, dest) = packet.addresses
+            if let Addresses::Double {
+                transport_id,
+                final_destination: dest,
+            } = packet.addresses
                 && transport_id == self.transport_id
                 && packet.header.packet_type != PacketType::Announce
             {
@@ -544,7 +596,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         let mut new_packet = packet.clone();
                         new_packet.header.header_type = crate::HeaderType::Type1;
                         new_packet.header.propagation_type = PropagationType::Broadcast;
-                        new_packet.addresses = Addresses::Single(dest);
+                        new_packet.addresses = Addresses::Single { transport_id: dest };
                         new_packet.to_bytes()
                     } else {
                         // remaining_hops == 0, local delivery
@@ -664,8 +716,8 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             if !is_local && announce.verify_destination(&destination_hash).is_ok() {
                 // Get received_from (transport_id if present, else destination_hash)
                 let received_from = match packet.addresses {
-                    Addresses::Double(transport_id, _) => transport_id,
-                    Addresses::Single(_) => destination_hash,
+                    Addresses::Double { transport_id, .. } => transport_id,
+                    Addresses::Single { .. } => destination_hash,
                 };
 
                 // Check if this is a next retransmission from another node.
@@ -771,16 +823,12 @@ impl<T: Transport, R: RngCore> Node<T, R> {
 
         if packet.header.packet_type == PacketType::LinkRequest {
             let is_for_us = match packet.addresses {
-                Addresses::Single(_) => true,
-                Addresses::Double(transport_id, _) => transport_id == self.transport_id,
+                Addresses::Single { .. } => true,
+                Addresses::Double { transport_id, .. } => transport_id == self.transport_id,
             };
 
             if is_for_us && for_local_service {
-                let request = match LinkRequest::parse(&packet.data) {
-                    Some(r) => r,
-                    None => return None,
-                };
-
+                let request = LinkRequest::parse(&packet.data)?;
                 // Find the service
                 let service_idx = self
                     .services
@@ -827,47 +875,46 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         if packet.header.packet_type == PacketType::Data {
             if packet.header.destination_type == DestinationType::Link {
                 // Data for a link - decrypt with link keys
-                if let Some(link) = self.established_links.get_mut(&link_id) {
-                    if let Some(plaintext) = link.decrypt(&packet.data) {
-                        link.touch_inbound(now);
+                if let Some(link) = self.established_links.get_mut(&link_id)
+                    && let Some(plaintext) = link.decrypt(&packet.data)
+                {
+                    link.touch_inbound(now);
 
-                        // Find the service this link belongs to
-                        if let Some(service_idx) = self
-                            .services
-                            .iter()
-                            .position(|s| s.address == link.destination)
-                        {
-                            let msg = InboundMessage::LinkData {
-                                link_id,
-                                data: plaintext,
-                            };
-                            self.services[service_idx].service.inbound(msg);
-                        }
+                    // Find the service this link belongs to
+                    if let Some(service_idx) = self
+                        .services
+                        .iter()
+                        .position(|s| s.address == link.destination)
+                    {
+                        let msg = InboundMessage::LinkData {
+                            link_id,
+                            data: plaintext,
+                        };
+                        self.services[service_idx].service.inbound(msg);
                     }
                 }
             } else if for_local_service {
                 // Data for a single destination - decrypt with service keys
                 // Packet data format: ephemeral_public (32) + ciphertext
-                if packet.data.len() >= 32 {
-                    if let Some(service_idx) = self
+                if packet.data.len() >= 32
+                    && let Some(service_idx) = self
                         .services
                         .iter()
                         .position(|s| s.address == destination_hash)
-                    {
-                        let service = &self.services[service_idx];
+                {
+                    let service = &self.services[service_idx];
 
-                        let ephemeral_public =
-                            X25519Public::from(<[u8; 32]>::try_from(&packet.data[..32]).unwrap());
-                        let ciphertext = &packet.data[32..];
+                    let ephemeral_public =
+                        X25519Public::from(<[u8; 32]>::try_from(&packet.data[..32]).unwrap());
+                    let ciphertext = &packet.data[32..];
 
-                        if let Some(plaintext) = crate::crypto::SingleDestEncryption::decrypt(
-                            &service.encryption_secret,
-                            &ephemeral_public,
-                            ciphertext,
-                        ) {
-                            let msg = InboundMessage::SingleData { data: plaintext };
-                            self.services[service_idx].service.inbound(msg);
-                        }
+                    if let Some(plaintext) = crate::crypto::SingleDestEncryption::decrypt(
+                        &service.encryption_secret,
+                        &ephemeral_public,
+                        ciphertext,
+                    ) {
+                        let msg = InboundMessage::SingleData { data: plaintext };
+                        self.services[service_idx].service.inbound(msg);
                     }
                 }
             }
@@ -959,35 +1006,34 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                     (None, &[] as &[u8])
                 };
 
-                if !signature_bytes.is_empty() {
-                    if let Ok(signature) = Signature::from_slice(signature_bytes) {
-                        self.receipts.retain(|receipt| {
-                            // For explicit proofs, check hash matches
-                            if let Some(Some(ph)) = proof_hash {
-                                if ph != receipt.packet_hash {
-                                    return true; // Keep - not for this receipt
-                                }
-                            }
+                if !signature_bytes.is_empty()
+                    && let Ok(signature) = Signature::from_slice(signature_bytes)
+                {
+                    self.receipts.retain(|receipt| {
+                        // For explicit proofs, check hash matches
+                        if let Some(Some(ph)) = proof_hash
+                            && ph != receipt.packet_hash
+                        {
+                            return true; // Keep - not for this receipt
+                        }
 
-                            // Get destination's signing key to verify
-                            let signing_key = match self.path_table.get(&receipt.destination) {
-                                Some(entry) => &entry.signing_key,
-                                None => return true, // Keep - can't verify without key
-                            };
+                        // Get destination's signing key to verify
+                        let signing_key = match self.path_table.get(&receipt.destination) {
+                            Some(entry) => &entry.signing_key,
+                            None => return true, // Keep - can't verify without key
+                        };
 
-                            // Validate signature over packet hash
-                            if crate::crypto::verify(signing_key, &receipt.packet_hash, &signature)
-                            {
-                                log::debug!(
-                                    "Proof validated for packet <{}>",
-                                    hex::encode(receipt.packet_hash)
-                                );
-                                false // Remove - proved
-                            } else {
-                                true // Keep - signature invalid
-                            }
-                        });
-                    }
+                        // Validate signature over packet hash
+                        if crate::crypto::verify(signing_key, &receipt.packet_hash, &signature) {
+                            log::debug!(
+                                "Proof validated for packet <{}>",
+                                hex::encode(receipt.packet_hash)
+                            );
+                            false // Remove - proved
+                        } else {
+                            true // Keep - signature invalid
+                        }
+                    });
                 }
             }
         }
@@ -1023,7 +1069,9 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         let packet = Packet::new(
             header,
             None,
-            Addresses::Single(link_id),
+            Addresses::Single {
+                transport_id: link_id,
+            },
             context,
             ciphertext,
         )
@@ -1032,41 +1080,6 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         for iface in &mut self.interfaces {
             iface.send(packet.clone(), 0, &mut self.rng, now);
         }
-    }
-
-    // "If another reachable peer on the network knows a path, it will announce it."
-    fn handle_path_request(&mut self, packet: &Packet, now: Instant) {
-        let Some(request) = PathRequest::parse(&packet.data) else {
-            return;
-        };
-
-        // Check if we have a local service for this destination
-        if let Some(entry) = self
-            .services
-            .iter()
-            .find(|s| s.address == request.destination_hash)
-        {
-            // Re-announce our local service
-            let mut random_hash = [0u8; 10];
-            self.rng.fill_bytes(&mut random_hash);
-
-            let announce_data = AnnounceBuilder::new(
-                *entry.encryption_public.as_bytes(),
-                entry.signing_key.clone(),
-                entry.name_hash,
-                random_hash,
-            )
-            .build(&entry.address);
-
-            let announce_packet =
-                self.make_announce_packet(entry.address, 0, announce_data.to_bytes());
-
-            for iface in &mut self.interfaces {
-                iface.send(announce_packet.clone(), 0, &mut self.rng, now);
-            }
-        }
-        // TODO: If we're a transport node and have seen an announce for this destination,
-        // we could re-broadcast the cached announce
     }
 
     // "After a randomised delay, the announce will be retransmitted on all interfaces
@@ -1082,8 +1095,10 @@ impl<T: Transport, R: RngCore> Node<T, R> {
     // that connect to wider and faster networks."
     fn outbound(&mut self, packet: Packet, exclude: Option<usize>, now: Instant) {
         let dest = match packet.addresses {
-            Addresses::Single(a) => a,
-            Addresses::Double(_, dest) => dest,
+            Addresses::Single { transport_id } => transport_id,
+            Addresses::Double {
+                final_destination, ..
+            } => final_destination,
         };
         let hops = packet.header.hops;
 
@@ -1100,10 +1115,9 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             .pending_announces
             .iter_mut()
             .find(|a| a.destination == dest)
+            && pending.retries_remaining > 0
         {
-            if pending.retries_remaining > 0 {
-                pending.retry_at = now + Duration::from_millis(self.retry_delay_ms);
-            }
+            pending.retry_at = now + Duration::from_millis(self.retry_delay_ms);
         }
     }
 
@@ -1210,7 +1224,9 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 let packet = Packet::new(
                     header,
                     None,
-                    Addresses::Single(link_id),
+                    Addresses::Single {
+                        transport_id: link_id,
+                    },
                     Context::LinkClose,
                     close_data,
                 )
@@ -1253,7 +1269,9 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         if let Ok(packet) = Packet::new(
                             header,
                             None,
-                            Addresses::Single(link_id),
+                            Addresses::Single {
+                                transport_id: link_id,
+                            },
                             Context::None,
                             ciphertext,
                         ) {
@@ -1285,7 +1303,9 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         if let Ok(packet) = Packet::new(
                             header,
                             None,
-                            Addresses::Single(destination),
+                            Addresses::Single {
+                                transport_id: destination,
+                            },
                             Context::None,
                             payload,
                         ) {
@@ -1322,7 +1342,9 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         if let Ok(packet) = Packet::new(
                             header,
                             None,
-                            Addresses::Single(link_id),
+                            Addresses::Single {
+                                transport_id: link_id,
+                            },
                             Context::Request,
                             ciphertext,
                         ) {
@@ -1353,7 +1375,9 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         if let Ok(packet) = Packet::new(
                             header,
                             None,
-                            Addresses::Single(link_id),
+                            Addresses::Single {
+                                transport_id: link_id,
+                            },
                             Context::Response,
                             ciphertext,
                         ) {
@@ -1380,7 +1404,14 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             packet_type: PacketType::Announce,
             hops,
         };
-        Packet::new(header, None, Addresses::Single(dest), Context::None, data).unwrap()
+        Packet::new(
+            header,
+            None,
+            Addresses::Single { transport_id: dest },
+            Context::None,
+            data,
+        )
+        .unwrap()
     }
 
     // "The link request is addressed to the destination hash of the desired destination"
@@ -1397,12 +1428,15 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             Some(tid) => (
                 HeaderType::Type2,
                 PropagationType::Transport,
-                Addresses::Double(tid, dest),
+                Addresses::Double {
+                    transport_id: tid,
+                    final_destination: dest,
+                },
             ),
             None => (
                 HeaderType::Type1,
                 PropagationType::Broadcast,
-                Addresses::Single(dest),
+                Addresses::Single { transport_id: dest },
             ),
         };
         let header = Header {
@@ -1434,7 +1468,9 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         Packet::new(
             header,
             None,
-            Addresses::Single(link_id),
+            Addresses::Single {
+                transport_id: link_id,
+            },
             Context::None,
             data,
         )

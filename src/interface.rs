@@ -183,7 +183,14 @@ mod tests {
             packet_type: PacketType::Announce,
             hops,
         };
-        Packet::new(header, None, Addresses::Single(dest), Context::None, vec![]).unwrap()
+        Packet::new(
+            header,
+            None,
+            Addresses::Single { transport_id: dest },
+            Context::None,
+            vec![],
+        )
+        .unwrap()
     }
 
     #[test]
