@@ -41,6 +41,27 @@ pub enum InboundMessage {
         request_id: crate::RequestId,
         data: Vec<u8>,
     },
+    ResourceAdvertised {
+        link_id: LinkId,
+        hash: [u8; 32],
+        size: usize,
+        metadata: Option<Vec<u8>>,
+    },
+    ResourceProgress {
+        link_id: LinkId,
+        hash: [u8; 32],
+        progress: f32,
+    },
+    ResourceComplete {
+        link_id: LinkId,
+        hash: [u8; 32],
+        data: Vec<u8>,
+        metadata: Option<Vec<u8>>,
+    },
+    ResourceFailed {
+        link_id: LinkId,
+        hash: [u8; 32],
+    },
 }
 
 pub enum OutboundMessage {
@@ -61,6 +82,20 @@ pub enum OutboundMessage {
         link_id: LinkId,
         request_id: crate::RequestId,
         data: Vec<u8>,
+    },
+    ResourceSend {
+        link_id: LinkId,
+        data: Vec<u8>,
+        metadata: Option<Vec<u8>>,
+        compress: bool,
+    },
+    ResourceAccept {
+        link_id: LinkId,
+        hash: [u8; 32],
+    },
+    ResourceReject {
+        link_id: LinkId,
+        hash: [u8; 32],
     },
 }
 
@@ -137,6 +172,9 @@ pub struct Node<T, S, R = ThreadRng> {
     pending_outbound_links: HashMap<LinkId, PendingLink>,
     pub(crate) established_links: HashMap<LinkId, EstablishedLink>,
     link_table: HashMap<LinkId, LinkTableEntry>,
+    outbound_resources: HashMap<[u8; 32], (LinkId, crate::resource::OutboundResource)>,
+    inbound_resources: HashMap<[u8; 32], (LinkId, crate::resource::InboundResource)>,
+    pending_resource_adverts: HashMap<[u8; 32], (LinkId, crate::resource::ResourceAdvertisement)>,
 }
 
 impl<T: Transport, S: Service> Node<T, S, ThreadRng> {
@@ -166,6 +204,9 @@ impl<T: Transport, S: Service> Node<T, S, ThreadRng> {
             pending_outbound_links: HashMap::new(),
             established_links: HashMap::new(),
             link_table: HashMap::new(),
+            outbound_resources: HashMap::new(),
+            inbound_resources: HashMap::new(),
+            pending_resource_adverts: HashMap::new(),
         }
     }
 }
@@ -196,6 +237,9 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             pending_outbound_links: HashMap::new(),
             established_links: HashMap::new(),
             link_table: HashMap::new(),
+            outbound_resources: HashMap::new(),
+            inbound_resources: HashMap::new(),
+            pending_resource_adverts: HashMap::new(),
         }
     }
 
@@ -940,6 +984,21 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             }
         }
 
+        // Handle resource-context Data packets addressed to a link
+        if let Packet::Data {
+            data,
+            context,
+            destination: DataDestination::Link(pkt_link_id),
+            ..
+        } = &packet
+        {
+            if let Some(link) = self.established_links.get(pkt_link_id) {
+                if let Some(plaintext) = link.decrypt(data) {
+                    self.handle_resource_packet(*pkt_link_id, *context, &plaintext, now);
+                }
+            }
+        }
+
         if let Packet::Data { data, .. } = &packet {
             if for_local_service {
                 // Data for a single destination - decrypt with service keys
@@ -1350,6 +1409,267 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         }
     }
 
+    fn handle_resource_packet(
+        &mut self,
+        link_id: LinkId,
+        context: DataContext,
+        plaintext: &[u8],
+        now: Instant,
+    ) {
+        use crate::resource::{InboundResource, MAPHASH_LEN, ResourceAdvertisement};
+
+        match context {
+            DataContext::ResourceAdv => {
+                if let Some(adv) = ResourceAdvertisement::decode(plaintext) {
+                    let hash = adv.hash;
+                    if let Some(service_idx) = self.established_links.get(&link_id).and_then(|l| {
+                        self.services
+                            .iter()
+                            .position(|s| s.address == l.destination)
+                    }) {
+                        self.pending_resource_adverts
+                            .insert(hash, (link_id, adv.clone()));
+                        let msg = InboundMessage::ResourceAdvertised {
+                            link_id,
+                            hash,
+                            size: adv.transfer_size,
+                            metadata: adv.metadata,
+                        };
+                        self.services[service_idx].service.inbound(msg);
+                    }
+                }
+            }
+            DataContext::ResourceReq => {
+                if plaintext.len() < 33 {
+                    return;
+                }
+                let exhausted = plaintext[0] != 0;
+                let offset = if exhausted { 5 } else { 1 };
+                if plaintext.len() < offset + 32 {
+                    return;
+                }
+                let hash: [u8; 32] = plaintext[offset..offset + 32].try_into().unwrap();
+                let requested_hashes: Vec<[u8; MAPHASH_LEN]> = plaintext[offset + 32..]
+                    .chunks_exact(MAPHASH_LEN)
+                    .map(|c| [c[0], c[1], c[2], c[3]])
+                    .collect();
+
+                if let Some((_, resource)) = self.outbound_resources.get_mut(&hash) {
+                    resource.mark_transferring();
+
+                    for part_hash in requested_hashes {
+                        if let Some(part_data) = resource.get_part(&part_hash) {
+                            if let Some(link) = self.established_links.get(&link_id) {
+                                let ciphertext = link.encrypt(&mut self.rng, part_data);
+                                let packet = Packet::Data {
+                                    hops: 0,
+                                    destination: DataDestination::Link(link_id),
+                                    context: DataContext::Resource,
+                                    data: ciphertext,
+                                };
+                                for iface in &mut self.interfaces {
+                                    iface.send(packet.clone(), 0, &mut self.rng, now);
+                                }
+                            }
+                        }
+                    }
+
+                    if exhausted {
+                        if let Some(hmu_data) = resource.hashmap_update(100) {
+                            if let Some(link) = self.established_links.get(&link_id) {
+                                let mut payload = hash.to_vec();
+                                payload.extend(&hmu_data);
+                                let ciphertext = link.encrypt(&mut self.rng, &payload);
+                                let packet = Packet::Data {
+                                    hops: 0,
+                                    destination: DataDestination::Link(link_id),
+                                    context: DataContext::ResourceHmu,
+                                    data: ciphertext,
+                                };
+                                for iface in &mut self.interfaces {
+                                    iface.send(packet.clone(), 0, &mut self.rng, now);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            DataContext::Resource => {
+                let mut completed = None;
+                for (hash, (res_link_id, resource)) in &mut self.inbound_resources {
+                    if *res_link_id == link_id {
+                        let old_progress = resource.progress();
+                        if resource.receive_part(plaintext.to_vec()) {
+                            let new_progress = resource.progress();
+                            if (new_progress - old_progress) >= 0.05 || new_progress >= 1.0 {
+                                if let Some(service_idx) =
+                                    self.established_links.get(&link_id).and_then(|l| {
+                                        self.services
+                                            .iter()
+                                            .position(|s| s.address == l.destination)
+                                    })
+                                {
+                                    let msg = InboundMessage::ResourceProgress {
+                                        link_id,
+                                        hash: *hash,
+                                        progress: new_progress,
+                                    };
+                                    self.services[service_idx].service.inbound(msg);
+                                }
+                            }
+                            if resource.is_complete() {
+                                completed = Some(*hash);
+                            }
+                        }
+                        break;
+                    }
+                }
+                if let Some(hash) = completed {
+                    self.complete_resource(link_id, hash, now);
+                }
+            }
+            DataContext::ResourceHmu => {
+                if plaintext.len() < 32 {
+                    return;
+                }
+                let hash: [u8; 32] = plaintext[..32].try_into().unwrap();
+                let hmu_data = &plaintext[32..];
+                if let Some((_, resource)) = self.inbound_resources.get_mut(&hash) {
+                    resource.receive_hashmap_update(hmu_data);
+                    self.send_resource_request(link_id, hash, now);
+                }
+            }
+            DataContext::ResourcePrf => {
+                if plaintext.len() < 64 {
+                    return;
+                }
+                let hash: [u8; 32] = plaintext[..32].try_into().unwrap();
+                let proof: [u8; 32] = plaintext[32..64].try_into().unwrap();
+                if let Some((res_link_id, resource)) = self.outbound_resources.get_mut(&hash) {
+                    if resource.verify_proof(&proof) {
+                        resource.mark_complete();
+                        if let Some(service_idx) =
+                            self.established_links.get(res_link_id).and_then(|l| {
+                                self.services
+                                    .iter()
+                                    .position(|s| s.address == l.destination)
+                            })
+                        {
+                            let msg = InboundMessage::ResourceComplete {
+                                link_id: *res_link_id,
+                                hash,
+                                data: Vec::new(),
+                                metadata: resource.metadata.clone(),
+                            };
+                            self.services[service_idx].service.inbound(msg);
+                        }
+                    }
+                }
+            }
+            DataContext::ResourceIcl | DataContext::ResourceRcl => {
+                if plaintext.len() < 32 {
+                    return;
+                }
+                let hash: [u8; 32] = plaintext[..32].try_into().unwrap();
+                self.inbound_resources.remove(&hash);
+                self.outbound_resources.remove(&hash);
+                self.pending_resource_adverts.remove(&hash);
+
+                if let Some(service_idx) = self.established_links.get(&link_id).and_then(|l| {
+                    self.services
+                        .iter()
+                        .position(|s| s.address == l.destination)
+                }) {
+                    let msg = InboundMessage::ResourceFailed { link_id, hash };
+                    self.services[service_idx].service.inbound(msg);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn complete_resource(&mut self, link_id: LinkId, hash: [u8; 32], now: Instant) {
+        if let Some((_, resource)) = self.inbound_resources.remove(&hash) {
+            if let Some(link) = self.established_links.get(&link_id) {
+                if let Some(data) = resource.assemble(link) {
+                    let proof = resource.generate_proof();
+                    let mut payload = hash.to_vec();
+                    payload.extend(&proof);
+                    let ciphertext = link.encrypt(&mut self.rng, &payload);
+                    let packet = Packet::Data {
+                        hops: 0,
+                        destination: DataDestination::Link(link_id),
+                        context: DataContext::ResourcePrf,
+                        data: ciphertext,
+                    };
+                    for iface in &mut self.interfaces {
+                        iface.send(packet.clone(), 0, &mut self.rng, now);
+                    }
+
+                    if let Some(service_idx) = self
+                        .services
+                        .iter()
+                        .position(|s| s.address == link.destination)
+                    {
+                        let msg = InboundMessage::ResourceComplete {
+                            link_id,
+                            hash,
+                            data,
+                            metadata: resource.metadata.clone(),
+                        };
+                        self.services[service_idx].service.inbound(msg);
+                    }
+                } else if let Some(service_idx) = self
+                    .services
+                    .iter()
+                    .position(|s| s.address == link.destination)
+                {
+                    let msg = InboundMessage::ResourceFailed { link_id, hash };
+                    self.services[service_idx].service.inbound(msg);
+                }
+            }
+        }
+    }
+
+    fn send_resource_request(&mut self, link_id: LinkId, hash: [u8; 32], now: Instant) {
+        use crate::packet::LinkDataDestination;
+        use crate::resource::MAPHASH_LEN;
+
+        if let Some((_, resource)) = self.inbound_resources.get_mut(&hash) {
+            let needed = resource.needed_hashes();
+            if needed.is_empty() && resource.is_complete() {
+                return;
+            }
+
+            let mut payload = Vec::new();
+            payload.push(if resource.is_hashmap_exhausted() {
+                1u8
+            } else {
+                0u8
+            });
+            if let Some(last_hash) = resource.last_hashmap_hash() {
+                payload.extend(&last_hash);
+            }
+            payload.extend(&hash);
+            for h in needed {
+                payload.extend(&h);
+            }
+
+            if let Some(link) = self.established_links.get(&link_id) {
+                let ciphertext = link.encrypt(&mut self.rng, &payload);
+                let packet = Packet::Data {
+                    hops: 0,
+                    destination: DataDestination::Link(link_id),
+                    context: DataContext::ResourceReq,
+                    data: ciphertext,
+                };
+                for iface in &mut self.interfaces {
+                    iface.send(packet.clone(), 0, &mut self.rng, now);
+                }
+            }
+        }
+    }
+
     fn drain_service_outbound(&mut self, now: Instant) {
         use crate::crypto::SingleDestEncryption;
         use crate::packet::LinkDataDestination;
@@ -1445,6 +1765,65 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                             hops: 0,
                             destination: LinkDataDestination::Direct(link_id),
                             context: LinkContext::Response,
+                            data: ciphertext,
+                        };
+                        for iface in &mut self.interfaces {
+                            iface.send(packet.clone(), 0, &mut self.rng, now);
+                        }
+                    }
+                }
+                OutboundMessage::ResourceSend {
+                    link_id,
+                    data,
+                    metadata,
+                    compress,
+                } => {
+                    if let Some(link) = self.established_links.get(&link_id) {
+                        let mut resource = crate::resource::OutboundResource::new(
+                            &mut self.rng,
+                            link,
+                            data,
+                            metadata,
+                            compress,
+                        );
+                        let adv = resource.advertisement(100);
+                        let adv_data = adv.encode();
+                        let hash = resource.hash;
+
+                        let ciphertext = link.encrypt(&mut self.rng, &adv_data);
+                        let packet = Packet::Data {
+                            hops: 0,
+                            destination: DataDestination::Link(link_id),
+                            context: DataContext::ResourceAdv,
+                            data: ciphertext,
+                        };
+
+                        self.outbound_resources.insert(hash, (link_id, resource));
+
+                        for iface in &mut self.interfaces {
+                            iface.send(packet.clone(), 0, &mut self.rng, now);
+                        }
+                    }
+                }
+                OutboundMessage::ResourceAccept { link_id, hash } => {
+                    if let Some((_, adv)) = self.pending_resource_adverts.remove(&hash) {
+                        let mut resource =
+                            crate::resource::InboundResource::from_advertisement(&adv);
+                        resource.mark_transferring();
+                        self.inbound_resources.insert(hash, (link_id, resource));
+                        self.send_resource_request(link_id, hash, now);
+                    }
+                }
+                OutboundMessage::ResourceReject { link_id, hash } => {
+                    self.pending_resource_adverts.remove(&hash);
+                    if let Some(link) = self.established_links.get(&link_id) {
+                        let mut payload = vec![0u8]; // flags
+                        payload.extend(&hash);
+                        let ciphertext = link.encrypt(&mut self.rng, &payload);
+                        let packet = Packet::Data {
+                            hops: 0,
+                            destination: DataDestination::Link(link_id),
+                            context: DataContext::ResourceRcl,
                             data: ciphertext,
                         };
                         for iface in &mut self.interfaces {

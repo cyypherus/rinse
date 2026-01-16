@@ -17,3 +17,4 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_bytes = "0.11"
 sha2 = "0.10.9"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+bzip2 = "0.5"

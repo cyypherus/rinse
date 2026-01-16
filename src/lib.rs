@@ -10,6 +10,7 @@ mod packet;
 mod packet_hashlist;
 mod path_request;
 mod request;
+mod resource;
 pub mod transports;
 
 pub use interface::*;
