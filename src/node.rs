@@ -70,8 +70,8 @@ pub trait Service: Send {
     fn outbound(&mut self) -> Option<OutboundMessage>;
 }
 
-struct ServiceEntry {
-    service: Box<dyn Service>,
+struct ServiceEntry<S> {
+    service: S,
     address: Address,
     name_hash: [u8; 10],
     encryption_secret: StaticSecret,
@@ -119,7 +119,7 @@ struct ReverseTableEntry {
     outbound_interface: usize,
 }
 
-pub struct Node<T, R = ThreadRng> {
+pub struct Node<T, S, R = ThreadRng> {
     transport: bool,
     max_hops: u8,
     retries: u8,
@@ -132,14 +132,14 @@ pub struct Node<T, R = ThreadRng> {
     reverse_table: HashMap<Address, ReverseTableEntry>,
     control_hashes: std::collections::HashSet<Address>,
     receipts: Vec<Receipt>,
-    services: Vec<ServiceEntry>,
-    interfaces: Vec<Interface<T>>,
+    services: Vec<ServiceEntry<S>>,
+    pub(crate) interfaces: Vec<Interface<T>>,
     pending_outbound_links: HashMap<LinkId, PendingLink>,
-    established_links: HashMap<LinkId, EstablishedLink>,
+    pub(crate) established_links: HashMap<LinkId, EstablishedLink>,
     link_table: HashMap<LinkId, LinkTableEntry>,
 }
 
-impl<T: Transport> Node<T, ThreadRng> {
+impl<T: Transport, S: Service> Node<T, S, ThreadRng> {
     pub fn new(transport: bool) -> Self {
         let mut rng = rand::thread_rng();
         let mut transport_id = [0u8; 16];
@@ -170,7 +170,7 @@ impl<T: Transport> Node<T, ThreadRng> {
     }
 }
 
-impl<T: Transport, R: RngCore> Node<T, R> {
+impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
     pub fn with_rng(mut rng: R, transport: bool) -> Self {
         let mut transport_id = [0u8; 16];
         rng.fill_bytes(&mut transport_id);
@@ -220,7 +220,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             .unwrap_or(false)
     }
 
-    pub fn add_service(&mut self, service: impl Service + 'static) -> Address {
+    pub fn add_service(&mut self, service: S) -> Address {
         let name = service.name();
         let name_hash: [u8; 10] = sha256(name.as_bytes())[..10].try_into().unwrap();
 
@@ -252,7 +252,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         );
 
         self.services.push(ServiceEntry {
-            service: Box::new(service),
+            service,
             address,
             name_hash,
             encryption_secret,
@@ -1488,5 +1488,274 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             destination: LinkProofDestination::Direct(link_id),
             data,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    struct MockTransport {
+        outbox: VecDeque<Vec<u8>>,
+        inbox: VecDeque<Vec<u8>>,
+    }
+
+    impl MockTransport {
+        fn new() -> Self {
+            Self {
+                outbox: VecDeque::new(),
+                inbox: VecDeque::new(),
+            }
+        }
+    }
+
+    impl Transport for MockTransport {
+        fn send(&mut self, data: &[u8]) {
+            self.outbox.push_back(data.to_vec());
+        }
+        fn recv(&mut self) -> Option<Vec<u8>> {
+            self.inbox.pop_front()
+        }
+        fn bandwidth_available(&self) -> bool {
+            true
+        }
+    }
+
+    type TestNode = Node<MockTransport, TestService>;
+
+    fn transfer(from: &mut TestNode, from_iface: usize, to: &mut TestNode, to_iface: usize) {
+        while let Some(pkt) = from.interfaces[from_iface].transport.outbox.pop_front() {
+            to.interfaces[to_iface].transport.inbox.push_back(pkt);
+        }
+    }
+
+    fn test_interface() -> Interface<MockTransport> {
+        let mut iface = Interface::new(MockTransport::new(), 0);
+        iface.min_delay_ms = 0;
+        iface.max_delay_ms = 0;
+        iface
+    }
+
+    #[derive(Default)]
+    struct TestService {
+        name: String,
+        inbox: Vec<InboundMessage>,
+    }
+
+    impl Service for TestService {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn inbound(&mut self, msg: InboundMessage) {
+            self.inbox.push(msg);
+        }
+        fn outbound(&mut self) -> Option<OutboundMessage> {
+            None
+        }
+    }
+
+    fn svc(name: &str) -> TestService {
+        TestService {
+            name: name.into(),
+            inbox: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn announce_two_nodes() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let addr = a.add_service(svc("test"));
+        let now = Instant::now();
+
+        a.announce(addr, now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        assert!(b.has_destination(&addr));
+    }
+
+    #[test]
+    fn announce_three_nodes() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        let mut c: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+        b.add_interface(test_interface());
+        c.add_interface(test_interface());
+
+        let addr = a.add_service(svc("test"));
+        let now = Instant::now();
+
+        a.announce(addr, now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        b.poll(now);
+        transfer(&mut b, 1, &mut c, 0);
+        c.poll(now);
+
+        assert!(b.has_destination(&addr));
+        assert!(c.has_destination(&addr));
+    }
+
+    #[test]
+    fn announce_not_echoed_back() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let addr = a.add_service(svc("test"));
+        let now = Instant::now();
+
+        a.announce(addr, now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        b.poll(now);
+
+        assert!(b.interfaces[0].transport.outbox.is_empty());
+    }
+
+    #[test]
+    fn link_two_nodes() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let addr_b = b.add_service(svc("server"));
+        let now = Instant::now();
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(addr_b, now).expect("link should be created");
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        assert!(a.established_links.contains_key(&link_id));
+        assert!(b.established_links.values().any(|l| l.link_id == link_id));
+    }
+
+    #[test]
+    fn link_three_nodes() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        let mut c: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+        b.add_interface(test_interface());
+        c.add_interface(test_interface());
+
+        let addr_c = c.add_service(svc("server"));
+        let now = Instant::now();
+
+        c.announce(addr_c, now);
+        c.poll(now);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(addr_c, now).expect("link should be created");
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 1, &mut c, 0);
+        c.poll(now);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        assert!(a.established_links.contains_key(&link_id));
+        assert!(c.established_links.values().any(|l| l.link_id == link_id));
+    }
+
+    #[test]
+    fn link_data_two_nodes() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let addr_b = b.add_service(svc("server"));
+        let now = Instant::now();
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(addr_b, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        a.send_link_packet(link_id, LinkContext::None, b"payload", now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        assert_eq!(b.services[0].service.inbox.len(), 1);
+    }
+
+    #[test]
+    fn link_data_three_nodes() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        let mut c: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+        b.add_interface(test_interface());
+        c.add_interface(test_interface());
+
+        let addr_c = c.add_service(svc("server"));
+        let now = Instant::now();
+
+        c.announce(addr_c, now);
+        c.poll(now);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(addr_c, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 1, &mut c, 0);
+        c.poll(now);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        a.send_link_packet(link_id, LinkContext::None, b"payload", now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 1, &mut c, 0);
+        c.poll(now);
+
+        assert_eq!(c.services[0].service.inbox.len(), 1);
     }
 }
