@@ -4,8 +4,8 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use rand::RngCore;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
-use crate::Address;
 use crate::crypto::{LinkEncryption, LinkKeys, sha256, sign, verify};
+use crate::packet::Address;
 
 pub type LinkId = [u8; 16];
 
@@ -158,7 +158,7 @@ pub(crate) struct EstablishedLink {
     pub last_outbound: Instant,
     pub rtt_ms: Option<u64>,
     keys: LinkKeys,
-    pub(crate) pending_requests: std::collections::HashMap<crate::RequestId, crate::Address>,
+    pub(crate) pending_requests: std::collections::HashMap<crate::RequestId, Address>,
 }
 
 const KEEPALIVE_MAX_SECS: u64 = 360;

@@ -4,7 +4,7 @@ use std::time::Instant;
 use ed25519_dalek::SigningKey;
 use rand::Rng;
 
-use crate::Packet;
+use crate::packet::Packet;
 
 pub trait Transport: Send {
     fn send(&mut self, data: &[u8]);
@@ -103,7 +103,19 @@ impl<T: Transport> Interface<T> {
     }
 
     pub(crate) fn recv(&mut self) -> Option<Vec<u8>> {
-        self.transport.recv()
+        let data = self.transport.recv();
+        if let Some(ref bytes) = data {
+            if let Ok(pkt) = Packet::from_bytes(bytes) {
+                log::trace!("[RECV] {}", pkt.log_format());
+            } else {
+                log::trace!(
+                    "[RECV] raw {} bytes: {}",
+                    bytes.len(),
+                    hex::encode(&bytes[..bytes.len().min(32)])
+                );
+            }
+        }
+        data
     }
 
     pub(crate) fn poll(&mut self, now: Instant) {
@@ -112,6 +124,7 @@ impl<T: Transport> Interface<T> {
             if self.delayed[i].send_at <= now {
                 let delayed = self.delayed.swap_remove(i);
                 if self.bandwidth_available() {
+                    log::trace!("[SEND] {}", delayed.packet.log_format());
                     self.transport.send(&delayed.packet.to_bytes());
                 } else {
                     self.queue(delayed.packet, delayed.priority);
@@ -123,6 +136,7 @@ impl<T: Transport> Interface<T> {
 
         while self.bandwidth_available() {
             if let Some(packet) = self.dequeue() {
+                log::trace!("[SEND] {}", packet.log_format());
                 self.transport.send(&packet.to_bytes());
             } else {
                 break;
@@ -134,10 +148,7 @@ impl<T: Transport> Interface<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        Addresses, Context, ContextFlag, DestinationType, Header, HeaderType, IfacFlag, PacketType,
-        PropagationType,
-    };
+    use crate::packet::AnnounceDestination;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -174,23 +185,12 @@ mod tests {
     }
 
     fn make_packet(dest: [u8; 16], hops: u8) -> Packet {
-        let header = Header {
-            ifac_flag: IfacFlag::Open,
-            header_type: HeaderType::Type1,
-            context_flag: ContextFlag::Unset,
-            propagation_type: PropagationType::Broadcast,
-            destination_type: DestinationType::Single,
-            packet_type: PacketType::Announce,
+        Packet::Announce {
             hops,
-        };
-        Packet::new(
-            header,
-            None,
-            Addresses::Single { transport_id: dest },
-            Context::None,
-            vec![],
-        )
-        .unwrap()
+            destination: AnnounceDestination::Single(dest),
+            has_ratchet: false,
+            data: vec![],
+        }
     }
 
     #[test]
@@ -204,10 +204,6 @@ mod tests {
         assert!(!iface_without.bandwidth_available());
     }
 
-    // "When the interface has bandwidth available for processing an announce, it will
-    // prioritise announces for destinations that are closest in terms of hops, thus
-    // prioritising reachability and connectivity of local nodes, even on slow networks
-    // that connect to wider and faster networks."
     #[test]
     fn prioritise_announces_for_destinations_that_are_closest_in_terms_of_hops() {
         let (transport, _) = MockTransport::new(true);
@@ -221,13 +217,11 @@ mod tests {
         let p2 = iface.dequeue().unwrap();
         let p3 = iface.dequeue().unwrap();
 
-        assert_eq!(p1.header.hops, 2);
-        assert_eq!(p2.header.hops, 5);
-        assert_eq!(p3.header.hops, 10);
+        assert_eq!(p1.hops(), 2);
+        assert_eq!(p2.hops(), 5);
+        assert_eq!(p3.hops(), 10);
     }
 
-    // "After a randomised delay, the announce will be retransmitted on all interfaces
-    // that have bandwidth available for processing announces."
     #[test]
     fn send_delays_then_transmits() {
         use rand::SeedableRng;
@@ -250,9 +244,6 @@ mod tests {
         assert_eq!(sent.lock().unwrap().len(), 1);
     }
 
-    // "If any given interface does not have enough bandwidth available for retransmitting
-    // the announce, the announce will be assigned a priority inversely proportional to its
-    // hop count, and be inserted into a queue managed by the interface."
     #[test]
     fn no_bandwidth_queues_packet() {
         use rand::SeedableRng;

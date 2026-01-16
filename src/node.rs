@@ -10,12 +10,10 @@ use crate::announce::{AnnounceBuilder, AnnounceData};
 use crate::crypto::{EphemeralKeyPair, sha256};
 pub use crate::link::LinkId;
 use crate::link::{EstablishedLink, LinkProof, LinkRequest, LinkState, PendingLink};
+use crate::packet::{Address, DataContext, DataDestination, LinkContext, Packet};
 use crate::packet_hashlist::PacketHashlist;
 use crate::path_request::PathRequest;
-use crate::{
-    Address, Addresses, Context, DestinationType, Interface, Packet, PacketType, PropagationType,
-    Transport,
-};
+use crate::{Interface, Transport};
 use ed25519_dalek::Signature;
 
 // "By default, m is set to 128."
@@ -101,7 +99,8 @@ struct PendingAnnounce {
     destination: Address,
     source_interface: usize,
     hops: u8,
-    app_data: Vec<u8>,
+    has_ratchet: bool,
+    data: Vec<u8>,
     retries_remaining: u8,
     retry_at: Instant,
     local_rebroadcasts: u8,
@@ -280,44 +279,24 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         )
         .build(&address);
 
-        let packet = self.make_announce_packet(address, 0, announce_data.to_bytes());
+        let packet = self.make_announce_packet(address, 0, false, announce_data.to_bytes());
 
         for iface in &mut self.interfaces {
             iface.send(packet.clone(), 0, &mut self.rng, now);
         }
     }
 
-    // "Requests a path to the destination from the network. If another reachable peer
-    // on the network knows a path, it will announce it."
     pub fn request_path(&mut self, destination: Address, now: Instant) {
-        use crate::{
-            Context, ContextFlag, DestinationType, Header, HeaderType, IfacFlag, PropagationType,
-        };
-
         let mut tag = [0u8; 16];
         self.rng.fill_bytes(&mut tag);
 
         let request = PathRequest::new(destination, tag);
-        let header = Header {
-            ifac_flag: IfacFlag::Open,
-            header_type: HeaderType::Type1,
-            context_flag: ContextFlag::Unset,
-            propagation_type: PropagationType::Broadcast,
-            destination_type: DestinationType::Plain,
-            packet_type: PacketType::Data,
+        let packet = Packet::Data {
             hops: 0,
+            destination: DataDestination::Plain(PathRequest::destination()),
+            context: DataContext::None,
+            data: request.to_bytes(),
         };
-        let packet = Packet::new(
-            header,
-            None,
-            Addresses {
-                destination_hash: PathRequest::destination(),
-                transport_id: None,
-            },
-            Context::None,
-            request.to_bytes(),
-        )
-        .unwrap();
 
         for iface in &mut self.interfaces {
             iface.send(packet.clone(), 0, &mut self.rng, now);
@@ -365,6 +344,11 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         );
 
         // Send on the interface that received the announce
+        log::debug!(
+            "Sending link request to <{}> link_id=<{}>",
+            hex::encode(destination),
+            hex::encode(link_id)
+        );
         if let Some(iface) = self.interfaces.get_mut(target_interface) {
             iface.send(packet, 0, &mut self.rng, now);
         }
@@ -373,46 +357,124 @@ impl<T: Transport, R: RngCore> Node<T, R> {
     }
 
     fn accept_packet(&self, packet: &Packet) -> bool {
-        if packet.header.packet_type != PacketType::Announce
-            && packet.addresses.transport_id() != self.transport_id
+        use crate::packet::LinkContext;
+
+        if !matches!(packet, Packet::Announce { .. })
+            && packet
+                .transport_id()
+                .is_some_and(|tid| tid != self.transport_id)
         {
             log::warn!(
-                "Ignored packet <{}>in transport elsewhere",
+                "Ignored packet <{}> - not for us",
                 hex::encode(packet.packet_hash())
             );
-
             return false;
         }
 
-        if let Context::Keepalive
-        | Context::ResourceReq
-        | Context::ResourcePrf
-        | Context::Resource
-        | Context::CacheRequest
-        | Context::Channel = packet.context
+        if let Packet::LinkData {
+            context: LinkContext::Keepalive,
+            ..
+        } = packet
         {
             return true;
         }
 
-        if let DestinationType::Plain | DestinationType::Group = packet.header.destination_type
-            && packet.header.packet_type != PacketType::Announce
-            && packet.header.hops > 1
-        {
-            log::debug!(
-                "Dropped invalid GROUP / PLAIN non-announce packet with hops {}",
-                packet.header.hops
-            );
-            return false;
+        if let Packet::Data { context, .. } = packet {
+            if matches!(
+                context,
+                DataContext::Resource
+                    | DataContext::ResourceReq
+                    | DataContext::ResourcePrf
+                    | DataContext::CacheRequest
+                    | DataContext::Channel
+            ) {
+                return true;
+            }
         }
 
-        if let DestinationType::Plain | DestinationType::Group = packet.header.destination_type
-            && packet.header.packet_type == PacketType::Announce
+        if let Packet::Data {
+            destination: DataDestination::Plain(_) | DataDestination::Group(_),
+            hops,
+            ..
+        } = packet
         {
-            log::debug!("Dropped invalid GROUP / PLAIN announce packet");
-            return false;
+            if *hops > 1 {
+                log::debug!("Dropped PLAIN/GROUP packet with hops {}", hops);
+                return false;
+            }
         }
 
         true
+    }
+
+    fn validate_ifac(
+        raw: &[u8],
+        ifac_identity: Option<&SigningKey>,
+        ifac_size: usize,
+        ifac_key: Option<&[u8]>,
+    ) -> Option<Vec<u8>> {
+        if raw.len() <= 2 {
+            return None;
+        }
+
+        if let Some(ifac_id) = ifac_identity {
+            // Interface has IFAC enabled
+            if raw[0] & 0x80 == 0x80 {
+                // IFAC flag is set - good
+                if raw.len() > 2 + ifac_size {
+                    // Extract IFAC
+                    let ifac = &raw[2..2 + ifac_size];
+
+                    // Generate mask
+                    let mask = crate::crypto::hkdf_expand(ifac, ifac_key?, raw.len());
+
+                    // Unmask payload
+                    let mut unmasked_raw = Vec::with_capacity(raw.len());
+                    for (i, &byte) in raw.iter().enumerate() {
+                        if i <= 1 || i > ifac_size + 1 {
+                            // Unmask header bytes and payload
+                            unmasked_raw.push(byte ^ mask[i]);
+                        } else {
+                            // Don't unmask IFAC itself
+                            unmasked_raw.push(byte);
+                        }
+                    }
+
+                    // Unset IFAC flag
+                    let new_header = [unmasked_raw[0] & 0x7f, unmasked_raw[1]];
+
+                    // Re-assemble packet
+                    let mut new_raw = Vec::with_capacity(raw.len() - ifac_size);
+                    new_raw.extend_from_slice(&new_header);
+                    new_raw.extend_from_slice(&unmasked_raw[2 + ifac_size..]);
+
+                    // Calculate expected IFAC
+                    let signature = crate::crypto::sign(ifac_id, &new_raw);
+                    let expected_ifac = &signature.to_bytes()[64 - ifac_size..];
+
+                    // Check it
+                    if ifac == expected_ifac {
+                        Some(new_raw)
+                    } else {
+                        None
+                    }
+                } else {
+                    // Too short
+                    None
+                }
+            } else {
+                // IFAC flag not set but should be
+                None
+            }
+        } else {
+            // Interface does NOT have IFAC enabled
+            if raw[0] & 0x80 == 0x80 {
+                // Flag set but shouldn't be
+                None
+            } else {
+                Some(raw.to_vec())
+            }
+        }
     }
 
     fn inbound(
@@ -421,86 +483,23 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         interface_index: usize,
         now: Instant,
     ) -> Option<(Packet, bool, bool)> {
-        // If interface access codes are enabled,
-        // we must authenticate each packet.
-        if raw.len() <= 2 {
-            return None;
-        }
-
         let interface = self.interfaces.get(interface_index)?;
-        let ifac_identity = interface.ifac_identity.as_ref();
-        let raw = if let Some(ifac_id) = ifac_identity {
-            // Check that IFAC flag is set
-            if raw[0] & 0x80 != 0x80 {
-                // If the IFAC flag is not set, but should be,
-                // drop the packet.
-                return None;
-            }
+        let raw = Self::validate_ifac(
+            raw,
+            interface.ifac_identity.as_ref(),
+            interface.ifac_size,
+            interface.ifac_key.as_deref(),
+        )?;
 
-            let ifac_size = interface.ifac_size;
-            if raw.len() <= 2 + ifac_size {
-                return None;
-            }
-
-            // Extract IFAC
-            let ifac = &raw[2..2 + ifac_size];
-
-            // Generate mask
-            let mask = crate::crypto::hkdf_expand(ifac, interface.ifac_key.as_ref()?, raw.len());
-
-            // Unmask payload
-            let mut unmasked_raw = Vec::with_capacity(raw.len());
-            for (i, &byte) in raw.iter().enumerate() {
-                if i <= 1 || i > ifac_size + 1 {
-                    // Unmask header bytes and payload
-                    unmasked_raw.push(byte ^ mask[i]);
-                } else {
-                    // Don't unmask IFAC itself
-                    unmasked_raw.push(byte);
-                }
-            }
-
-            // Unset IFAC flag
-            let new_header = [unmasked_raw[0] & 0x7f, unmasked_raw[1]];
-
-            // Re-assemble packet
-            let mut new_raw = Vec::with_capacity(raw.len() - ifac_size);
-            new_raw.extend_from_slice(&new_header);
-            new_raw.extend_from_slice(&unmasked_raw[2 + ifac_size..]);
-
-            // Calculate expected IFAC
-            let signature = crate::crypto::sign(ifac_id, &new_raw);
-            let expected_ifac = &signature.to_bytes()[64 - ifac_size..];
-
-            // Check it
-            if ifac != expected_ifac {
-                return None;
-            }
-
-            new_raw
-        } else {
-            // If the interface does not have IFAC enabled,
-            // check the received packet IFAC flag.
-            if raw[0] & 0x80 == 0x80 {
-                // If the flag is set, drop the packet
-                return None;
-            }
-            raw.to_vec()
-        };
-
-        // Parse packet
-        let ifac_len = if ifac_identity.is_some() {
-            0 // IFAC already stripped
-        } else {
-            interface.ifac_len
-        };
-        let mut packet = match Packet::from_bytes(&raw, ifac_len) {
+        let mut packet = match Packet::from_bytes(&raw) {
             Ok(p) => p,
-            Err(_) => return None,
+            Err(e) => {
+                log::debug!("Failed to parse packet: {:?}", e);
+                return None;
+            }
         };
 
-        // Increment hop count
-        packet.header.hops = packet.header.hops.saturating_add(1);
+        packet.increment_hops();
 
         let packet_hash = sha256(&packet.hashable_part());
 
@@ -511,13 +510,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         // loops in the network, using the packet filter.
         let mut remember_packet_hash = true;
 
-        // Get destination hash for lookups
-        let destination_hash = match packet.addresses {
-            Addresses::Single { transport_id } => transport_id,
-            Addresses::Double {
-                final_destination, ..
-            } => final_destination,
-        };
+        let destination_hash = packet.destination_hash();
 
         // If this packet belongs to a link in our link table,
         // we'll have to defer adding it to the filter list.
@@ -534,9 +527,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         // If this is a link request proof, don't add it until
         // we are sure it's not actually somewhere else in the
         // routing chain.
-        if packet.header.packet_type == PacketType::Proof
-            && packet.context == Context::LinkRequestProof
-        {
+        if matches!(packet, Packet::LinkProof { .. }) {
             remember_packet_hash = false;
         }
 
@@ -545,17 +536,22 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         }
 
         // TODO review
-        let for_local_service = packet.header.packet_type != PacketType::Announce
+        let for_local_service = !matches!(packet, Packet::Announce { .. })
             && self.services.iter().any(|s| s.address == destination_hash);
 
-        let for_local_link = packet.header.packet_type != PacketType::Announce
+        let for_local_link = !matches!(packet, Packet::Announce { .. })
             && self.established_links.contains_key(&link_id);
 
         // Plain broadcast packets are sent directly on all attached interfaces
         // (no transport routing needed)
         if !self.control_hashes.contains(&destination_hash)
-            && packet.header.destination_type == DestinationType::Plain
-            && packet.header.propagation_type == PropagationType::Broadcast
+            && matches!(
+                packet,
+                Packet::Data {
+                    destination: DataDestination::Plain(_),
+                    ..
+                }
+            )
         {
             let raw = packet.to_bytes();
             // Send to all interfaces except the originator
@@ -573,38 +569,27 @@ impl<T: Transport, R: RngCore> Node<T, R> {
 
             // If the packet is in transport (has transport_id), check whether we
             // are the designated next hop, and process it accordingly if we are.
-            if let Addresses::Double {
-                transport_id,
-                final_destination: dest,
-            } = packet.addresses
+            if let Some(transport_id) = packet.transport_id()
                 && transport_id == self.transport_id
-                && packet.header.packet_type != PacketType::Announce
+                && !matches!(packet, Packet::Announce { .. })
             {
+                let dest = packet.destination_hash();
                 if let Some(path_entry) = self.path_table.get_mut(&dest) {
                     let next_hop = path_entry.next_hop;
                     let remaining_hops = path_entry.hops;
                     let outbound_interface = path_entry.receiving_interface;
 
                     // Build forwarded packet
-                    let new_raw = if remaining_hops > 1 {
-                        // Replace transport_id with next_hop, keep rest
-                        let mut raw = packet.to_bytes();
-                        raw[2..18].copy_from_slice(&next_hop);
-                        raw
+                    let mut new_packet = packet.clone();
+                    if remaining_hops > 1 {
+                        new_packet.set_transport_id(next_hop);
                     } else if remaining_hops == 1 {
-                        // Strip transport headers - convert Type2 to Type1
-                        let mut new_packet = packet.clone();
-                        new_packet.header.header_type = crate::HeaderType::Type1;
-                        new_packet.header.propagation_type = PropagationType::Broadcast;
-                        new_packet.addresses = Addresses::Single { transport_id: dest };
-                        new_packet.to_bytes()
-                    } else {
-                        // remaining_hops == 0, local delivery
-                        packet.to_bytes()
-                    };
+                        new_packet.strip_transport();
+                    }
+                    let new_raw = new_packet.to_bytes();
 
                     // Record in link_table for link requests, reverse_table for others
-                    if packet.header.packet_type == PacketType::LinkRequest {
+                    if matches!(packet, Packet::LinkRequest { .. }) {
                         let link_id = LinkRequest::link_id(&packet.hashable_part());
                         self.link_table.insert(
                             link_id,
@@ -613,7 +598,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                                 receiving_interface: interface_index,
                                 next_hop_interface: outbound_interface,
                                 remaining_hops,
-                                hops: packet.header.hops,
+                                hops: packet.hops(),
                             },
                         );
                     } else {
@@ -640,12 +625,12 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             }
 
             // Link transport handling. Directs packets according to entries in the link tables
-            if packet.header.packet_type != PacketType::Announce
-                && packet.header.packet_type != PacketType::LinkRequest
-                && packet.context != Context::LinkRequestProof
+            if !matches!(packet, Packet::Announce { .. })
+                && !matches!(packet, Packet::LinkRequest { .. })
+                && !matches!(packet, Packet::LinkProof { .. })
                 && let Some(link_entry) = self.link_table.get_mut(&link_id)
             {
-                let hops = packet.header.hops;
+                let hops = packet.hops();
                 let outbound_interface =
                     if link_entry.next_hop_interface == link_entry.receiving_interface {
                         // Same interface both directions - just repeat
@@ -688,9 +673,11 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             }
         }
 
-        if packet.header.packet_type == PacketType::Announce {
-            let has_ratchet = packet.header.context_flag == crate::ContextFlag::Set;
-            let announce = match AnnounceData::parse(&packet.data, has_ratchet) {
+        if let Packet::Announce {
+            has_ratchet, data, ..
+        } = &packet
+        {
+            let announce = match AnnounceData::parse(data, *has_ratchet) {
                 Ok(a) => a,
                 Err(_) => return None, // TODO dogshit silent failure
             };
@@ -714,16 +701,12 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             let is_local = self.services.iter().any(|s| s.address == destination_hash);
 
             if !is_local && announce.verify_destination(&destination_hash).is_ok() {
-                // Get received_from (transport_id if present, else destination_hash)
-                let received_from = match packet.addresses {
-                    Addresses::Double { transport_id, .. } => transport_id,
-                    Addresses::Single { .. } => destination_hash,
-                };
+                let received_from = packet.received_from();
 
                 // Check if this is a next retransmission from another node.
                 // If it is, we may remove the announce from our pending table.
                 // Only applies when transport_id is present (Type2 header).
-                if self.transport && matches!(packet.addresses, Addresses::Double { .. }) {
+                if self.transport && packet.transport_id().is_some() {
                     if let Some(pending) = self
                         .pending_announces
                         .iter_mut()
@@ -732,7 +715,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         // Case 1: Another node heard the same announce we did and rebroadcast it.
                         // packet.hops - 1 == pending.hops means they received it at the same hop
                         // count we did (before their increment).
-                        if packet.header.hops.saturating_sub(1) == pending.hops {
+                        if packet.hops().saturating_sub(1) == pending.hops {
                             log::trace!(
                                 "Heard a rebroadcast of announce for <{}>",
                                 hex::encode(destination_hash)
@@ -752,7 +735,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         // Case 2: Our rebroadcast was picked up and passed on by another node.
                         // packet.hops - 1 == pending.hops + 1 means they received our rebroadcast
                         // (which was at pending.hops + 1) and incremented it.
-                        if packet.header.hops.saturating_sub(1) == pending.hops.saturating_add(1)
+                        if packet.hops().saturating_sub(1) == pending.hops.saturating_add(1)
                             && pending.retries_remaining > 0
                             && now < pending.retry_at
                         {
@@ -768,7 +751,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 // TODO continue review from here
                 // Determine if we should add/update path table
                 let mut should_add = false;
-                let hops = packet.header.hops;
+                let hops = packet.hops();
 
                 // First, check hops are less than max
                 if hops < self.max_hops + 1 {
@@ -808,7 +791,8 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         destination: destination_hash,
                         source_interface: interface_index,
                         hops,
-                        app_data: announce.app_data.clone(),
+                        has_ratchet: *has_ratchet,
+                        data: data.clone(),
                         retries_remaining: self.retries,
                         retry_at: now, // Rebroadcast immediately on first receive
                         local_rebroadcasts: 0,
@@ -824,14 +808,19 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             }
         }
 
-        if packet.header.packet_type == PacketType::LinkRequest {
-            let is_for_us = match packet.addresses {
-                Addresses::Single { .. } => true,
-                Addresses::Double { transport_id, .. } => transport_id == self.transport_id,
-            };
+        if let Packet::LinkRequest { data, .. } = &packet {
+            let is_for_us = packet
+                .transport_id()
+                .map_or(true, |tid| tid == self.transport_id);
+            log::debug!(
+                "Received LinkRequest for <{}> is_for_us={} for_local_service={}",
+                hex::encode(destination_hash),
+                is_for_us,
+                for_local_service
+            );
 
             if is_for_us && for_local_service {
-                let request = LinkRequest::parse(&packet.data)?;
+                let request = LinkRequest::parse(data)?;
                 // Find the service
                 let service_idx = self
                     .services
@@ -863,6 +852,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
 
                 self.established_links.insert(new_link_id, link);
 
+                log::debug!("Sending LinkProof for link <{}>", hex::encode(new_link_id));
                 if let Some(iface) = self.interfaces.get_mut(interface_index) {
                     iface.transport.send(&proof_packet.to_bytes());
                 }
@@ -875,31 +865,33 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             }
         }
 
-        if packet.header.packet_type == PacketType::Data {
-            if packet.header.destination_type == DestinationType::Link {
-                // Data for a link - decrypt with link keys
-                if let Some(link) = self.established_links.get_mut(&link_id)
-                    && let Some(plaintext) = link.decrypt(&packet.data)
-                {
-                    link.touch_inbound(now);
+        if let Packet::LinkData { data, .. } = &packet {
+            // Data for a link - decrypt with link keys
+            if let Some(link) = self.established_links.get_mut(&link_id)
+                && let Some(plaintext) = link.decrypt(data)
+            {
+                link.touch_inbound(now);
 
-                    // Find the service this link belongs to
-                    if let Some(service_idx) = self
-                        .services
-                        .iter()
-                        .position(|s| s.address == link.destination)
-                    {
-                        let msg = InboundMessage::LinkData {
-                            link_id,
-                            data: plaintext,
-                        };
-                        self.services[service_idx].service.inbound(msg);
-                    }
+                // Find the service this link belongs to
+                if let Some(service_idx) = self
+                    .services
+                    .iter()
+                    .position(|s| s.address == link.destination)
+                {
+                    let msg = InboundMessage::LinkData {
+                        link_id,
+                        data: plaintext,
+                    };
+                    self.services[service_idx].service.inbound(msg);
                 }
-            } else if for_local_service {
+            }
+        }
+
+        if let Packet::Data { data, .. } = &packet {
+            if for_local_service {
                 // Data for a single destination - decrypt with service keys
                 // Packet data format: ephemeral_public (32) + ciphertext
-                if packet.data.len() >= 32
+                if data.len() >= 32
                     && let Some(service_idx) = self
                         .services
                         .iter()
@@ -908,8 +900,8 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                     let service = &self.services[service_idx];
 
                     let ephemeral_public =
-                        X25519Public::from(<[u8; 32]>::try_from(&packet.data[..32]).unwrap());
-                    let ciphertext = &packet.data[32..];
+                        X25519Public::from(<[u8; 32]>::try_from(&data[..32]).unwrap());
+                    let ciphertext = &data[32..];
 
                     if let Some(plaintext) = crate::crypto::SingleDestEncryption::decrypt(
                         &service.encryption_secret,
@@ -923,121 +915,121 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             }
         }
 
-        if packet.header.packet_type == PacketType::Proof {
-            if packet.context == Context::LinkRequestProof {
-                // Link request proof - check if it needs to be transported
-                if let Some(link_entry) = self.link_table.get(&link_id) {
-                    if interface_index == link_entry.next_hop_interface {
-                        // Transport the proof
-                        let raw = packet.to_bytes();
-                        if let Some(iface) = self.interfaces.get_mut(link_entry.receiving_interface)
-                        {
-                            iface.transport.send(&raw);
-                        }
+        if let Packet::LinkProof { data, .. } = &packet {
+            log::debug!(
+                "Received LinkProof for link_id=<{}> pending_links={:?}",
+                hex::encode(destination_hash),
+                self.pending_outbound_links
+                    .keys()
+                    .map(hex::encode)
+                    .collect::<Vec<_>>()
+            );
+            // Link request proof - check if it needs to be transported
+            if let Some(link_entry) = self.link_table.get(&link_id) {
+                if interface_index == link_entry.next_hop_interface {
+                    // Transport the proof
+                    let raw = packet.to_bytes();
+                    if let Some(iface) = self.interfaces.get_mut(link_entry.receiving_interface) {
+                        iface.transport.send(&raw);
                     }
-                } else if let Some(pending) = self.pending_outbound_links.remove(&destination_hash)
-                {
-                    // This is a proof for a link we initiated - validate and establish
-                    let proof = match LinkProof::parse(&packet.data) {
-                        Some(p) => p,
-                        None => {
-                            self.pending_outbound_links
-                                .insert(destination_hash, pending);
-                            return None;
-                        }
-                    };
+                }
+            } else if let Some(pending) = self.pending_outbound_links.remove(&destination_hash) {
+                // This is a proof for a link we initiated - validate and establish
+                let proof = match LinkProof::parse(data) {
+                    Some(p) => p,
+                    None => {
+                        self.pending_outbound_links
+                            .insert(destination_hash, pending);
+                        return None;
+                    }
+                };
 
-                    // Get the destination's signing key from path_table
-                    let signing_key = match self.path_table.get(&pending.destination) {
-                        Some(entry) => entry.signing_key,
-                        None => {
-                            log::debug!(
-                                "No path found for destination <{}>",
-                                hex::encode(pending.destination)
-                            );
-                            self.pending_outbound_links
-                                .insert(destination_hash, pending);
-                            return None;
-                        }
-                    };
-
-                    // Validate the proof signature
-                    if !proof.verify(&pending.link_id, &signing_key) {
+                // Get the destination's signing key from path_table
+                let signing_key = match self.path_table.get(&pending.destination) {
+                    Some(entry) => entry.signing_key,
+                    None => {
                         log::debug!(
-                            "Invalid link proof signature for link <{}>",
-                            hex::encode(pending.link_id)
+                            "No path found for destination <{}>",
+                            hex::encode(pending.destination)
                         );
                         self.pending_outbound_links
                             .insert(destination_hash, pending);
                         return None;
                     }
-
-                    // Establish the link using the responder's public key from the proof
-                    let link =
-                        EstablishedLink::from_initiator(pending, &proof.encryption_public, now);
-
-                    self.established_links.insert(destination_hash, link);
-
-                    log::debug!(
-                        "Link <{}> established as initiator",
-                        hex::encode(destination_hash)
-                    );
-                }
-            } else {
-                // Regular proof - check reverse table for transport
-                if let Some(reverse_entry) = self.reverse_table.remove(&destination_hash) {
-                    let raw = packet.to_bytes();
-                    if let Some(iface) = self.interfaces.get_mut(reverse_entry.receiving_interface)
-                    {
-                        iface.transport.send(&raw);
-                    }
-                }
-
-                // Check local receipts - validate proof against outstanding receipts
-                // Proof format: explicit = hash (32) + signature (64), implicit = signature (64)
-                let proof_data = &packet.data;
-                let (proof_hash, signature_bytes) = if proof_data.len() == 96 {
-                    // Explicit proof
-                    (
-                        Some(<[u8; 32]>::try_from(&proof_data[..32]).ok()),
-                        &proof_data[32..96],
-                    )
-                } else if proof_data.len() == 64 {
-                    // Implicit proof
-                    (None, &proof_data[..64])
-                } else {
-                    (None, &[] as &[u8])
                 };
 
-                if !signature_bytes.is_empty()
-                    && let Ok(signature) = Signature::from_slice(signature_bytes)
-                {
-                    self.receipts.retain(|receipt| {
-                        // For explicit proofs, check hash matches
-                        if let Some(Some(ph)) = proof_hash
-                            && ph != receipt.packet_hash
-                        {
-                            return true; // Keep - not for this receipt
-                        }
-
-                        // Get destination's signing key to verify
-                        let signing_key = match self.path_table.get(&receipt.destination) {
-                            Some(entry) => &entry.signing_key,
-                            None => return true, // Keep - can't verify without key
-                        };
-
-                        // Validate signature over packet hash
-                        if crate::crypto::verify(signing_key, &receipt.packet_hash, &signature) {
-                            log::debug!(
-                                "Proof validated for packet <{}>",
-                                hex::encode(receipt.packet_hash)
-                            );
-                            false // Remove - proved
-                        } else {
-                            true // Keep - signature invalid
-                        }
-                    });
+                // Validate the proof signature
+                if !proof.verify(&pending.link_id, &signing_key) {
+                    log::debug!(
+                        "Invalid link proof signature for link <{}>",
+                        hex::encode(pending.link_id)
+                    );
+                    self.pending_outbound_links
+                        .insert(destination_hash, pending);
+                    return None;
                 }
+
+                // Establish the link using the responder's public key from the proof
+                let link = EstablishedLink::from_initiator(pending, &proof.encryption_public, now);
+
+                self.established_links.insert(destination_hash, link);
+
+                log::debug!(
+                    "Link <{}> established as initiator",
+                    hex::encode(destination_hash)
+                );
+            }
+        }
+
+        if let Packet::Proof { data, .. } = &packet {
+            // Regular proof - check reverse table for transport
+            if let Some(reverse_entry) = self.reverse_table.remove(&destination_hash) {
+                let raw = packet.to_bytes();
+                if let Some(iface) = self.interfaces.get_mut(reverse_entry.receiving_interface) {
+                    iface.transport.send(&raw);
+                }
+            }
+
+            // Check local receipts - validate proof against outstanding receipts
+            // Proof format: explicit = hash (32) + signature (64), implicit = signature (64)
+            let (proof_hash, signature_bytes) = if data.len() == 96 {
+                // Explicit proof
+                (Some(<[u8; 32]>::try_from(&data[..32]).ok()), &data[32..96])
+            } else if data.len() == 64 {
+                // Implicit proof
+                (None, &data[..64])
+            } else {
+                (None, &[] as &[u8])
+            };
+
+            if !signature_bytes.is_empty()
+                && let Ok(signature) = Signature::from_slice(signature_bytes)
+            {
+                self.receipts.retain(|receipt| {
+                    // For explicit proofs, check hash matches
+                    if let Some(Some(ph)) = proof_hash
+                        && ph != receipt.packet_hash
+                    {
+                        return true; // Keep - not for this receipt
+                    }
+
+                    // Get destination's signing key to verify
+                    let signing_key = match self.path_table.get(&receipt.destination) {
+                        Some(entry) => &entry.signing_key,
+                        None => return true, // Keep - can't verify without key
+                    };
+
+                    // Validate signature over packet hash
+                    if crate::crypto::verify(signing_key, &receipt.packet_hash, &signature) {
+                        log::debug!(
+                            "Proof validated for packet <{}>",
+                            hex::encode(receipt.packet_hash)
+                        );
+                        false // Remove - proved
+                    } else {
+                        true // Keep - signature invalid
+                    }
+                });
             }
         }
 
@@ -1047,11 +1039,11 @@ impl<T: Transport, R: RngCore> Node<T, R> {
     fn send_link_packet(
         &mut self,
         link_id: LinkId,
-        context: Context,
+        context: LinkContext,
         plaintext: &[u8],
         now: Instant,
     ) {
-        use crate::{ContextFlag, DestinationType, Header, HeaderType, IfacFlag, PropagationType};
+        use crate::packet::LinkDataDestination;
 
         let Some(link) = self.established_links.get_mut(&link_id) else {
             return;
@@ -1060,68 +1052,136 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         let ciphertext = link.encrypt(&mut self.rng, plaintext);
         link.touch_outbound(now);
 
-        let header = Header {
-            ifac_flag: IfacFlag::Open,
-            header_type: HeaderType::Type1,
-            context_flag: ContextFlag::Unset,
-            propagation_type: PropagationType::Broadcast,
-            destination_type: DestinationType::Link,
-            packet_type: PacketType::Data,
+        let packet = Packet::LinkData {
             hops: 0,
-        };
-        let packet = Packet::new(
-            header,
-            None,
-            Addresses::Single {
-                transport_id: link_id,
-            },
+            destination: LinkDataDestination::Direct(link_id),
             context,
-            ciphertext,
-        )
-        .unwrap();
+            data: ciphertext,
+        };
 
         for iface in &mut self.interfaces {
             iface.send(packet.clone(), 0, &mut self.rng, now);
         }
     }
 
-    // "After a randomised delay, the announce will be retransmitted on all interfaces
-    // that have bandwidth available for processing announces."
-    //
-    // "If any given interface does not have enough bandwidth available for retransmitting
-    // the announce, the announce will be assigned a priority inversely proportional to its
-    // hop count, and be inserted into a queue managed by the interface."
-    //
-    // "When the interface has bandwidth available for processing an announce, it will
-    // prioritise announces for destinations that are closest in terms of hops, thus
-    // prioritising reachability and connectivity of local nodes, even on slow networks
-    // that connect to wider and faster networks."
-    fn outbound(&mut self, packet: Packet, exclude: Option<usize>, now: Instant) {
-        let dest = match packet.addresses {
-            Addresses::Single { transport_id } => transport_id,
-            Addresses::Double {
-                final_destination, ..
-            } => final_destination,
-        };
-        let hops = packet.header.hops;
+    fn outbound(
+        &mut self,
+        mut packet: Packet,
+        attached_interface: Option<usize>,
+        now: Instant,
+    ) -> bool {
+        let destination_hash = packet.destination_hash();
+        let hops = packet.hops();
+
+        // Check if we should generate a receipt for this packet
+        // Only for DATA packets to Single/Group destinations (not Plain)
+        // and not for resource-related contexts
+        let generate_receipt = matches!(
+            &packet,
+            Packet::Data {
+                destination: DataDestination::Single(_) | DataDestination::Group(_),
+                context,
+                ..
+            } if !matches!(context,
+                DataContext::Resource |
+                DataContext::ResourceAdv |
+                DataContext::ResourceReq |
+                DataContext::ResourceHmu |
+                DataContext::ResourcePrf |
+                DataContext::ResourceIcl |
+                DataContext::ResourceRcl
+            )
+        );
+
+        // Check if we have a known path for the destination
+        // This applies to non-announce packets going to Single destinations
+        let use_path = !matches!(packet, Packet::Announce { .. })
+            && matches!(
+                &packet,
+                Packet::Data {
+                    destination: DataDestination::Single(_),
+                    ..
+                } | Packet::LinkRequest { .. }
+            )
+            && self.path_table.contains_key(&destination_hash);
+
+        if use_path {
+            let path_entry = self.path_table.get(&destination_hash).unwrap();
+            let path_hops = path_entry.hops;
+            let next_hop = path_entry.next_hop;
+            let outbound_interface = path_entry.receiving_interface;
+
+            // If there's more than one hop to the destination, insert into transport
+            // by adding the next hop address to the header
+            if path_hops > 1 && packet.transport_id().is_none() {
+                packet.insert_transport(next_hop);
+            }
+
+            // Generate receipt if needed
+            if generate_receipt {
+                self.receipts.push(Receipt {
+                    destination: destination_hash,
+                    packet_hash: packet.packet_hash(),
+                });
+            }
+
+            // Transmit on the specific interface
+            let raw = packet.to_bytes();
+            if let Some(iface) = self.interfaces.get_mut(outbound_interface) {
+                iface.transport.send(&raw);
+            }
+
+            // Update path timestamp
+            if let Some(entry) = self.path_table.get_mut(&destination_hash) {
+                entry.timestamp = now;
+            }
+
+            return true;
+        }
+
+        // No known path - broadcast on all interfaces (with filtering)
+        let mut sent = false;
+        let mut stored_hash = false;
 
         for (i, iface) in self.interfaces.iter_mut().enumerate() {
-            if Some(i) != exclude {
+            let mut should_transmit = true;
+
+            // If packet has an attached interface, only send on that one
+            if let Some(attached) = attached_interface {
+                if i != attached {
+                    should_transmit = false;
+                }
+            }
+
+            // For link packets, check if link is on this interface
+            if let Packet::LinkData { .. } | Packet::LinkProof { .. } = &packet {
+                // Link packets should only go on their attached interface
+                // This is handled by attached_interface above
+            }
+
+            // Announce rate limiting is handled by interface.send()
+            // which queues announces based on hop count priority
+
+            if should_transmit {
+                if !stored_hash {
+                    self.seen_packets.insert(packet.packet_hash());
+                    stored_hash = true;
+                }
+
+                // Generate receipt on first send
+                if !sent && generate_receipt {
+                    self.receipts.push(Receipt {
+                        destination: destination_hash,
+                        packet_hash: packet.packet_hash(),
+                    });
+                }
+
                 iface.send(packet.clone(), hops, &mut self.rng, now);
+                sent = true;
             }
         }
 
-        // "After the announce has been re-transmitted, and if no other nodes are heard
-        // retransmitting the announce with a greater hop count than when it left this
-        // node, transmitting it will be retried r times. By default, r is set to 1."
-        if let Some(pending) = self
-            .pending_announces
-            .iter_mut()
-            .find(|a| a.destination == dest)
-            && pending.retries_remaining > 0
-        {
-            pending.retry_at = now + Duration::from_millis(self.retry_delay_ms);
-        }
+        sent
     }
 
     pub fn poll(&mut self, now: Instant) {
@@ -1149,7 +1209,8 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 to_send.push((
                     pending.destination,
                     pending.hops,
-                    pending.app_data.clone(),
+                    pending.has_ratchet,
+                    pending.data.clone(),
                     pending.source_interface,
                 ));
             }
@@ -1157,8 +1218,8 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         // Remove announces with no retries left
         self.pending_announces.retain(|a| a.retries_remaining > 0);
 
-        for (dest, hops, data, source) in to_send {
-            let packet = self.make_announce_packet(dest, hops, data);
+        for (dest, hops, has_ratchet, data, source) in to_send {
+            let packet = self.make_announce_packet(dest, hops, has_ratchet, data);
             self.outbound(packet, Some(source), now);
         }
 
@@ -1204,7 +1265,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         for link_id in to_keepalive {
             self.send_link_packet(
                 link_id,
-                Context::Keepalive,
+                LinkContext::Keepalive,
                 &[crate::link::KEEPALIVE_REQUEST],
                 now,
             );
@@ -1214,26 +1275,14 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             if let Some(link) = self.established_links.get(&link_id)
                 && link.state != LinkState::Closed
             {
+                use crate::packet::LinkDataDestination;
                 let close_data = link.encrypt(&mut self.rng, &link_id);
-                let header = crate::Header {
-                    ifac_flag: crate::IfacFlag::Open,
-                    header_type: crate::HeaderType::Type1,
-                    context_flag: crate::ContextFlag::Unset,
-                    propagation_type: crate::PropagationType::Broadcast,
-                    destination_type: crate::DestinationType::Link,
-                    packet_type: PacketType::Data,
+                let packet = Packet::LinkData {
                     hops: 0,
+                    destination: LinkDataDestination::Direct(link_id),
+                    context: LinkContext::LinkClose,
+                    data: close_data,
                 };
-                let packet = Packet::new(
-                    header,
-                    None,
-                    Addresses::Single {
-                        transport_id: link_id,
-                    },
-                    Context::LinkClose,
-                    close_data,
-                )
-                .unwrap();
                 for iface in &mut self.interfaces {
                     iface.send(packet.clone(), 0, &mut self.rng, now);
                 }
@@ -1244,9 +1293,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
 
     fn drain_service_outbound(&mut self, now: Instant) {
         use crate::crypto::SingleDestEncryption;
-        use crate::{
-            Context, ContextFlag, DestinationType, Header, HeaderType, IfacFlag, PropagationType,
-        };
+        use crate::packet::LinkDataDestination;
 
         let mut messages = Vec::new();
         for entry in &mut self.services {
@@ -1260,27 +1307,14 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 OutboundMessage::LinkData { link_id, data } => {
                     if let Some(link) = self.established_links.get(&link_id) {
                         let ciphertext = link.encrypt(&mut self.rng, &data);
-                        let header = Header {
-                            ifac_flag: IfacFlag::Open,
-                            header_type: HeaderType::Type1,
-                            context_flag: ContextFlag::Unset,
-                            propagation_type: PropagationType::Broadcast,
-                            destination_type: DestinationType::Link,
-                            packet_type: PacketType::Data,
+                        let packet = Packet::LinkData {
                             hops: 0,
+                            destination: LinkDataDestination::Direct(link_id),
+                            context: LinkContext::None,
+                            data: ciphertext,
                         };
-                        if let Ok(packet) = Packet::new(
-                            header,
-                            None,
-                            Addresses::Single {
-                                transport_id: link_id,
-                            },
-                            Context::None,
-                            ciphertext,
-                        ) {
-                            for iface in &mut self.interfaces {
-                                iface.send(packet.clone(), 0, &mut self.rng, now);
-                            }
+                        for iface in &mut self.interfaces {
+                            iface.send(packet.clone(), 0, &mut self.rng, now);
                         }
                     }
                 }
@@ -1294,28 +1328,15 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         let mut payload = ephemeral_pub.as_bytes().to_vec();
                         payload.extend(ciphertext);
 
-                        let header = Header {
-                            ifac_flag: IfacFlag::Open,
-                            header_type: HeaderType::Type1,
-                            context_flag: ContextFlag::Unset,
-                            propagation_type: PropagationType::Broadcast,
-                            destination_type: DestinationType::Single,
-                            packet_type: PacketType::Data,
+                        let packet = Packet::Data {
                             hops: 0,
+                            destination: DataDestination::Single(destination),
+                            context: DataContext::None,
+                            data: payload,
                         };
-                        if let Ok(packet) = Packet::new(
-                            header,
-                            None,
-                            Addresses::Single {
-                                transport_id: destination,
-                            },
-                            Context::None,
-                            payload,
-                        ) {
-                            let target = entry.receiving_interface;
-                            if let Some(iface) = self.interfaces.get_mut(target) {
-                                iface.send(packet, 0, &mut self.rng, now);
-                            }
+                        let target = entry.receiving_interface;
+                        if let Some(iface) = self.interfaces.get_mut(target) {
+                            iface.send(packet, 0, &mut self.rng, now);
                         }
                     }
                 }
@@ -1333,27 +1354,14 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                             crate::crypto::sha256(&ciphertext)[..16].try_into().unwrap();
                         link.pending_requests.insert(request_id, service_addr);
 
-                        let header = Header {
-                            ifac_flag: IfacFlag::Open,
-                            header_type: HeaderType::Type1,
-                            context_flag: ContextFlag::Unset,
-                            propagation_type: PropagationType::Broadcast,
-                            destination_type: DestinationType::Link,
-                            packet_type: PacketType::Data,
+                        let packet = Packet::LinkData {
                             hops: 0,
+                            destination: LinkDataDestination::Direct(link_id),
+                            context: LinkContext::None,
+                            data: ciphertext,
                         };
-                        if let Ok(packet) = Packet::new(
-                            header,
-                            None,
-                            Addresses::Single {
-                                transport_id: link_id,
-                            },
-                            Context::Request,
-                            ciphertext,
-                        ) {
-                            for iface in &mut self.interfaces {
-                                iface.send(packet.clone(), 0, &mut self.rng, now);
-                            }
+                        for iface in &mut self.interfaces {
+                            iface.send(packet.clone(), 0, &mut self.rng, now);
                         }
                     }
                 }
@@ -1366,27 +1374,14 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         let resp = crate::Response::new(request_id, data);
                         let ciphertext = link.encrypt(&mut self.rng, &resp.encode());
 
-                        let header = Header {
-                            ifac_flag: IfacFlag::Open,
-                            header_type: HeaderType::Type1,
-                            context_flag: ContextFlag::Unset,
-                            propagation_type: PropagationType::Broadcast,
-                            destination_type: DestinationType::Link,
-                            packet_type: PacketType::Data,
+                        let packet = Packet::LinkData {
                             hops: 0,
+                            destination: LinkDataDestination::Direct(link_id),
+                            context: LinkContext::None,
+                            data: ciphertext,
                         };
-                        if let Ok(packet) = Packet::new(
-                            header,
-                            None,
-                            Addresses::Single {
-                                transport_id: link_id,
-                            },
-                            Context::Response,
-                            ciphertext,
-                        ) {
-                            for iface in &mut self.interfaces {
-                                iface.send(packet.clone(), 0, &mut self.rng, now);
-                            }
+                        for iface in &mut self.interfaces {
+                            iface.send(packet.clone(), 0, &mut self.rng, now);
                         }
                     }
                 }
@@ -1394,89 +1389,49 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         }
     }
 
-    fn make_announce_packet(&self, dest: Address, hops: u8, data: Vec<u8>) -> Packet {
-        use crate::{
-            Context, ContextFlag, DestinationType, Header, HeaderType, IfacFlag, PropagationType,
-        };
-        let header = Header {
-            ifac_flag: IfacFlag::Open,
-            header_type: HeaderType::Type1,
-            context_flag: ContextFlag::Unset,
-            propagation_type: PropagationType::Broadcast,
-            destination_type: DestinationType::Single,
-            packet_type: PacketType::Announce,
+    fn make_announce_packet(
+        &self,
+        dest: Address,
+        hops: u8,
+        has_ratchet: bool,
+        data: Vec<u8>,
+    ) -> Packet {
+        use crate::packet::AnnounceDestination;
+        Packet::Announce {
             hops,
-        };
-        Packet::new(
-            header,
-            None,
-            Addresses::Single { transport_id: dest },
-            Context::None,
+            destination: AnnounceDestination::Single(dest),
+            has_ratchet,
             data,
-        )
-        .unwrap()
+        }
     }
 
-    // "The link request is addressed to the destination hash of the desired destination"
     fn make_link_request_packet(
         &self,
         dest: Address,
         transport_id: Option<Address>,
         data: Vec<u8>,
     ) -> Packet {
-        use crate::{
-            Context, ContextFlag, DestinationType, Header, HeaderType, IfacFlag, PropagationType,
+        use crate::packet::LinkRequestDestination;
+        let destination = match transport_id {
+            Some(tid) => LinkRequestDestination::Transport {
+                transport_id: tid,
+                destination: dest,
+            },
+            None => LinkRequestDestination::Direct(dest),
         };
-        let (header_type, propagation_type, addresses) = match transport_id {
-            Some(tid) => (
-                HeaderType::Type2,
-                PropagationType::Transport,
-                Addresses::Double {
-                    transport_id: tid,
-                    final_destination: dest,
-                },
-            ),
-            None => (
-                HeaderType::Type1,
-                PropagationType::Broadcast,
-                Addresses::Single { transport_id: dest },
-            ),
-        };
-        let header = Header {
-            ifac_flag: IfacFlag::Open,
-            header_type,
-            context_flag: ContextFlag::Unset,
-            propagation_type,
-            destination_type: DestinationType::Link,
-            packet_type: PacketType::LinkRequest,
+        Packet::LinkRequest {
             hops: 0,
-        };
-        Packet::new(header, None, addresses, Context::None, data).unwrap()
+            destination,
+            data,
+        }
     }
 
-    // "This packet is addressed to the link id of the link."
     fn make_link_proof_packet(&self, link_id: LinkId, data: Vec<u8>) -> Packet {
-        use crate::{
-            Context, ContextFlag, DestinationType, Header, HeaderType, IfacFlag, PropagationType,
-        };
-        let header = Header {
-            ifac_flag: IfacFlag::Open,
-            header_type: HeaderType::Type1,
-            context_flag: ContextFlag::Unset,
-            propagation_type: PropagationType::Broadcast,
-            destination_type: DestinationType::Link,
-            packet_type: PacketType::Proof,
+        use crate::packet::LinkProofDestination;
+        Packet::LinkProof {
             hops: 0,
-        };
-        Packet::new(
-            header,
-            None,
-            Addresses::Single {
-                transport_id: link_id,
-            },
-            Context::None,
+            destination: LinkProofDestination::Direct(link_id),
             data,
-        )
-        .unwrap()
+        }
     }
 }

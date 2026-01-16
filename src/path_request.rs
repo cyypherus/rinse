@@ -1,4 +1,4 @@
-use crate::Address;
+use crate::packet::Address;
 
 // "reticulum.path.request" hashed to 16 bytes
 const PATH_REQUEST_DEST: Address = compute_path_request_dest();
