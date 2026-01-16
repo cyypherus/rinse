@@ -172,7 +172,7 @@ pub struct Node<T, S, R = ThreadRng> {
     pending_outbound_links: HashMap<LinkId, PendingLink>,
     pub(crate) established_links: HashMap<LinkId, EstablishedLink>,
     link_table: HashMap<LinkId, LinkTableEntry>,
-    outbound_resources: HashMap<[u8; 32], (LinkId, crate::resource::OutboundResource)>,
+    outbound_resources: HashMap<[u8; 32], (LinkId, Address, crate::resource::OutboundResource)>,
     inbound_resources: HashMap<[u8; 32], (LinkId, crate::resource::InboundResource)>,
     pending_resource_adverts: HashMap<[u8; 32], (LinkId, crate::resource::ResourceAdvertisement)>,
 }
@@ -424,13 +424,18 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         }
 
         if let Packet::Data { context, .. } = packet {
+            if matches!(context, DataContext::CacheRequest | DataContext::Channel) {
+                return true;
+            }
+        }
+
+        if let Packet::LinkData { context, .. } = packet {
             if matches!(
                 context,
-                DataContext::Resource
-                    | DataContext::ResourceReq
-                    | DataContext::ResourcePrf
-                    | DataContext::CacheRequest
-                    | DataContext::Channel
+                LinkContext::Resource
+                    | LinkContext::ResourceReq
+                    | LinkContext::ResourcePrf
+                    | LinkContext::Channel
             ) {
                 return true;
             }
@@ -808,7 +813,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 let mut should_add = false;
                 let hops = packet.hops();
 
-                if hops >= self.max_hops + 1 {
+                if hops > self.max_hops {
                     log::debug!(
                         "Announce for <{}> exceeded max hops ({} >= {})",
                         hex::encode(destination_hash),
@@ -934,7 +939,19 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 if let Some(plaintext) = link.decrypt(data) {
                     link.touch_inbound(now);
 
-                    if *context == LinkContext::Response {
+                    // Handle resource contexts
+                    if matches!(
+                        context,
+                        LinkContext::Resource
+                            | LinkContext::ResourceAdv
+                            | LinkContext::ResourceReq
+                            | LinkContext::ResourceHmu
+                            | LinkContext::ResourcePrf
+                            | LinkContext::ResourceIcl
+                            | LinkContext::ResourceRcl
+                    ) {
+                        self.handle_resource_packet(link_id, *context, &plaintext, now);
+                    } else if *context == LinkContext::Response {
                         if let Some(resp) = crate::Response::decode(&plaintext) {
                             if let Some(service_addr) =
                                 link.pending_requests.remove(&resp.request_id)
@@ -980,21 +997,6 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                         };
                         self.services[service_idx].service.inbound(msg);
                     }
-                }
-            }
-        }
-
-        // Handle resource-context Data packets addressed to a link
-        if let Packet::Data {
-            data,
-            context,
-            destination: DataDestination::Link(pkt_link_id),
-            ..
-        } = &packet
-        {
-            if let Some(link) = self.established_links.get(pkt_link_id) {
-                if let Some(plaintext) = link.decrypt(data) {
-                    self.handle_resource_packet(*pkt_link_id, *context, &plaintext, now);
                 }
             }
         }
@@ -1187,22 +1189,12 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
         // Check if we should generate a receipt for this packet
         // Only for DATA packets to Single/Group destinations (not Plain)
-        // and not for resource-related contexts
         let generate_receipt = matches!(
             &packet,
             Packet::Data {
                 destination: DataDestination::Single(_) | DataDestination::Group(_),
-                context,
                 ..
-            } if !matches!(context,
-                DataContext::Resource |
-                DataContext::ResourceAdv |
-                DataContext::ResourceReq |
-                DataContext::ResourceHmu |
-                DataContext::ResourcePrf |
-                DataContext::ResourceIcl |
-                DataContext::ResourceRcl
-            )
+            }
         );
 
         // Check if we have a known path for the destination
@@ -1412,14 +1404,14 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
     fn handle_resource_packet(
         &mut self,
         link_id: LinkId,
-        context: DataContext,
+        context: LinkContext,
         plaintext: &[u8],
         now: Instant,
     ) {
-        use crate::resource::{InboundResource, MAPHASH_LEN, ResourceAdvertisement};
+        use crate::resource::{MAPHASH_LEN, ResourceAdvertisement};
 
         match context {
-            DataContext::ResourceAdv => {
+            LinkContext::ResourceAdv => {
                 if let Some(adv) = ResourceAdvertisement::decode(plaintext) {
                     let hash = adv.hash;
                     if let Some(service_idx) = self.established_links.get(&link_id).and_then(|l| {
@@ -1439,7 +1431,9 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     }
                 }
             }
-            DataContext::ResourceReq => {
+            LinkContext::ResourceReq => {
+                use crate::packet::LinkDataDestination;
+
                 if plaintext.len() < 33 {
                     return;
                 }
@@ -1454,17 +1448,17 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     .map(|c| [c[0], c[1], c[2], c[3]])
                     .collect();
 
-                if let Some((_, resource)) = self.outbound_resources.get_mut(&hash) {
+                if let Some((_, _, resource)) = self.outbound_resources.get_mut(&hash) {
                     resource.mark_transferring();
 
                     for part_hash in requested_hashes {
                         if let Some(part_data) = resource.get_part(&part_hash) {
                             if let Some(link) = self.established_links.get(&link_id) {
                                 let ciphertext = link.encrypt(&mut self.rng, part_data);
-                                let packet = Packet::Data {
+                                let packet = Packet::LinkData {
                                     hops: 0,
-                                    destination: DataDestination::Link(link_id),
-                                    context: DataContext::Resource,
+                                    destination: LinkDataDestination::Direct(link_id),
+                                    context: LinkContext::Resource,
                                     data: ciphertext,
                                 };
                                 for iface in &mut self.interfaces {
@@ -1480,10 +1474,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                                 let mut payload = hash.to_vec();
                                 payload.extend(&hmu_data);
                                 let ciphertext = link.encrypt(&mut self.rng, &payload);
-                                let packet = Packet::Data {
+                                let packet = Packet::LinkData {
                                     hops: 0,
-                                    destination: DataDestination::Link(link_id),
-                                    context: DataContext::ResourceHmu,
+                                    destination: LinkDataDestination::Direct(link_id),
+                                    context: LinkContext::ResourceHmu,
                                     data: ciphertext,
                                 };
                                 for iface in &mut self.interfaces {
@@ -1494,7 +1488,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     }
                 }
             }
-            DataContext::Resource => {
+            LinkContext::Resource => {
                 let mut completed = None;
                 for (hash, (res_link_id, resource)) in &mut self.inbound_resources {
                     if *res_link_id == link_id {
@@ -1528,7 +1522,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     self.complete_resource(link_id, hash, now);
                 }
             }
-            DataContext::ResourceHmu => {
+            LinkContext::ResourceHmu => {
                 if plaintext.len() < 32 {
                     return;
                 }
@@ -1539,21 +1533,21 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     self.send_resource_request(link_id, hash, now);
                 }
             }
-            DataContext::ResourcePrf => {
+            LinkContext::ResourcePrf => {
                 if plaintext.len() < 64 {
                     return;
                 }
                 let hash: [u8; 32] = plaintext[..32].try_into().unwrap();
                 let proof: [u8; 32] = plaintext[32..64].try_into().unwrap();
-                if let Some((res_link_id, resource)) = self.outbound_resources.get_mut(&hash) {
+                if let Some((res_link_id, service_addr, resource)) =
+                    self.outbound_resources.get_mut(&hash)
+                {
                     if resource.verify_proof(&proof) {
                         resource.mark_complete();
-                        if let Some(service_idx) =
-                            self.established_links.get(res_link_id).and_then(|l| {
-                                self.services
-                                    .iter()
-                                    .position(|s| s.address == l.destination)
-                            })
+                        if let Some(service_idx) = self
+                            .services
+                            .iter()
+                            .position(|s| s.address == *service_addr)
                         {
                             let msg = InboundMessage::ResourceComplete {
                                 link_id: *res_link_id,
@@ -1566,7 +1560,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     }
                 }
             }
-            DataContext::ResourceIcl | DataContext::ResourceRcl => {
+            LinkContext::ResourceIcl | LinkContext::ResourceRcl => {
                 if plaintext.len() < 32 {
                     return;
                 }
@@ -1589,6 +1583,8 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
     }
 
     fn complete_resource(&mut self, link_id: LinkId, hash: [u8; 32], now: Instant) {
+        use crate::packet::LinkDataDestination;
+
         if let Some((_, resource)) = self.inbound_resources.remove(&hash) {
             if let Some(link) = self.established_links.get(&link_id) {
                 if let Some(data) = resource.assemble(link) {
@@ -1596,10 +1592,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     let mut payload = hash.to_vec();
                     payload.extend(&proof);
                     let ciphertext = link.encrypt(&mut self.rng, &payload);
-                    let packet = Packet::Data {
+                    let packet = Packet::LinkData {
                         hops: 0,
-                        destination: DataDestination::Link(link_id),
-                        context: DataContext::ResourcePrf,
+                        destination: LinkDataDestination::Direct(link_id),
+                        context: LinkContext::ResourcePrf,
                         data: ciphertext,
                     };
                     for iface in &mut self.interfaces {
@@ -1633,7 +1629,6 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
     fn send_resource_request(&mut self, link_id: LinkId, hash: [u8; 32], now: Instant) {
         use crate::packet::LinkDataDestination;
-        use crate::resource::MAPHASH_LEN;
 
         if let Some((_, resource)) = self.inbound_resources.get_mut(&hash) {
             let needed = resource.needed_hashes();
@@ -1641,14 +1636,13 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 return;
             }
 
+            let exhausted = resource.is_hashmap_exhausted();
             let mut payload = Vec::new();
-            payload.push(if resource.is_hashmap_exhausted() {
-                1u8
-            } else {
-                0u8
-            });
-            if let Some(last_hash) = resource.last_hashmap_hash() {
-                payload.extend(&last_hash);
+            payload.push(if exhausted { 1u8 } else { 0u8 });
+            if exhausted {
+                if let Some(last_hash) = resource.last_hashmap_hash() {
+                    payload.extend(&last_hash);
+                }
             }
             payload.extend(&hash);
             for h in needed {
@@ -1657,10 +1651,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
             if let Some(link) = self.established_links.get(&link_id) {
                 let ciphertext = link.encrypt(&mut self.rng, &payload);
-                let packet = Packet::Data {
+                let packet = Packet::LinkData {
                     hops: 0,
-                    destination: DataDestination::Link(link_id),
-                    context: DataContext::ResourceReq,
+                    destination: LinkDataDestination::Direct(link_id),
+                    context: LinkContext::ResourceReq,
                     data: ciphertext,
                 };
                 for iface in &mut self.interfaces {
@@ -1791,14 +1785,15 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                         let hash = resource.hash;
 
                         let ciphertext = link.encrypt(&mut self.rng, &adv_data);
-                        let packet = Packet::Data {
+                        let packet = Packet::LinkData {
                             hops: 0,
-                            destination: DataDestination::Link(link_id),
-                            context: DataContext::ResourceAdv,
+                            destination: LinkDataDestination::Direct(link_id),
+                            context: LinkContext::ResourceAdv,
                             data: ciphertext,
                         };
 
-                        self.outbound_resources.insert(hash, (link_id, resource));
+                        self.outbound_resources
+                            .insert(hash, (link_id, service_addr, resource));
 
                         for iface in &mut self.interfaces {
                             iface.send(packet.clone(), 0, &mut self.rng, now);
@@ -1820,10 +1815,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                         let mut payload = vec![0u8]; // flags
                         payload.extend(&hash);
                         let ciphertext = link.encrypt(&mut self.rng, &payload);
-                        let packet = Packet::Data {
+                        let packet = Packet::LinkData {
                             hops: 0,
-                            destination: DataDestination::Link(link_id),
-                            context: DataContext::ResourceRcl,
+                            destination: LinkDataDestination::Direct(link_id),
+                            context: LinkContext::ResourceRcl,
                             data: ciphertext,
                         };
                         for iface in &mut self.interfaces {
@@ -2384,5 +2379,90 @@ mod tests {
             &a.services[0].service.inbox[0],
             InboundMessage::Response { data, .. } if data == b"response data"
         ));
+    }
+
+    #[test]
+    fn resource_two_nodes() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        a.add_service(svc("sender"));
+        let addr_b = b.add_service(svc("receiver"));
+        let now = Instant::now();
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(addr_b, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let test_data = b"Hello, this is a resource transfer test with some data!".to_vec();
+        a.services[0]
+            .service
+            .outbox
+            .push_back(OutboundMessage::ResourceSend {
+                link_id,
+                data: test_data.clone(),
+                metadata: Some(b"test-meta".to_vec()),
+                compress: false,
+            });
+        a.poll(now);
+        println!("a.outbound_resources: {}", a.outbound_resources.len());
+        println!(
+            "a.interfaces[0].transport.outbox: {}",
+            a.interfaces[0].transport.outbox.len()
+        );
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        println!("b.inbox.len: {}", b.services[0].service.inbox.len());
+        println!(
+            "b.pending_resource_adverts: {}",
+            b.pending_resource_adverts.len()
+        );
+
+        assert!(b.services[0].service.inbox.iter().any(|m| matches!(
+            m,
+            InboundMessage::ResourceAdvertised { size, .. } if *size > 0
+        )));
+
+        let hash = match &b.services[0].service.inbox[0] {
+            InboundMessage::ResourceAdvertised { hash, .. } => *hash,
+            _ => panic!("expected ResourceAdvertised"),
+        };
+
+        b.services[0]
+            .service
+            .outbox
+            .push_back(OutboundMessage::ResourceAccept { link_id, hash });
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let b_complete = b.services[0].service.inbox.iter().any(|m| {
+            matches!(
+                m,
+                InboundMessage::ResourceComplete { data, .. } if data == &test_data
+            )
+        });
+        assert!(b_complete, "receiver should have complete resource");
+
+        let a_complete = a.services[0]
+            .service
+            .inbox
+            .iter()
+            .any(|m| matches!(m, InboundMessage::ResourceComplete { .. }));
+        assert!(a_complete, "sender should get completion notification");
     }
 }

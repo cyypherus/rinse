@@ -1,5 +1,6 @@
 pub const ADDR_LEN: usize = 16;
 pub type Address = [u8; ADDR_LEN];
+pub type LinkId = Address;
 
 const DEST_SINGLE: u8 = 0b00;
 const DEST_GROUP: u8 = 0b01;
@@ -17,13 +18,6 @@ const CTX_LRPROOF: u8 = 0xFF;
 #[repr(u8)]
 pub enum DataContext {
     None = 0x00,
-    Resource = 0x01,
-    ResourceAdv = 0x02,
-    ResourceReq = 0x03,
-    ResourceHmu = 0x04,
-    ResourcePrf = 0x05,
-    ResourceIcl = 0x06,
-    ResourceRcl = 0x07,
     CacheRequest = 0x08,
     PathResponse = 0x0B,
     Command = 0x0C,
@@ -35,6 +29,13 @@ pub enum DataContext {
 #[repr(u8)]
 pub enum LinkContext {
     None = 0x00,
+    Resource = 0x01,
+    ResourceAdv = 0x02,
+    ResourceReq = 0x03,
+    ResourceHmu = 0x04,
+    ResourcePrf = 0x05,
+    ResourceIcl = 0x06,
+    ResourceRcl = 0x07,
     Request = 0x09,
     Response = 0x0A,
     Channel = 0x0E,
@@ -155,13 +156,6 @@ impl DataContext {
     fn from_byte(b: u8) -> Option<Self> {
         match b {
             0x00 => Some(Self::None),
-            0x01 => Some(Self::Resource),
-            0x02 => Some(Self::ResourceAdv),
-            0x03 => Some(Self::ResourceReq),
-            0x04 => Some(Self::ResourceHmu),
-            0x05 => Some(Self::ResourcePrf),
-            0x06 => Some(Self::ResourceIcl),
-            0x07 => Some(Self::ResourceRcl),
             0x08 => Some(Self::CacheRequest),
             0x0B => Some(Self::PathResponse),
             0x0C => Some(Self::Command),
@@ -176,6 +170,13 @@ impl LinkContext {
     fn from_byte(b: u8) -> Option<Self> {
         match b {
             0x00 => Some(Self::None),
+            0x01 => Some(Self::Resource),
+            0x02 => Some(Self::ResourceAdv),
+            0x03 => Some(Self::ResourceReq),
+            0x04 => Some(Self::ResourceHmu),
+            0x05 => Some(Self::ResourcePrf),
+            0x06 => Some(Self::ResourceIcl),
+            0x07 => Some(Self::ResourceRcl),
             0x09 => Some(Self::Request),
             0x0A => Some(Self::Response),
             0x0E => Some(Self::Channel),

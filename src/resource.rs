@@ -412,7 +412,7 @@ impl ResourceAdvertisement {
                     original_hash.copy_from_slice(&data[i..i + 32]);
                     i += 32;
                 }
-                b'f' if i + 1 <= data.len() => {
+                b'f' if i < data.len() => {
                     flags = data[i];
                     i += 1;
                 }
