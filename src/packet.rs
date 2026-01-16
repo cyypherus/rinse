@@ -1,6 +1,18 @@
 pub const ADDR_LEN: usize = 16;
 pub type Address = [u8; ADDR_LEN];
 
+const DEST_SINGLE: u8 = 0b00;
+const DEST_GROUP: u8 = 0b01;
+const DEST_PLAIN: u8 = 0b10;
+const DEST_LINK: u8 = 0b11;
+
+const PKT_DATA: u8 = 0b00;
+const PKT_ANNOUNCE: u8 = 0b01;
+const PKT_LINKREQUEST: u8 = 0b10;
+const PKT_PROOF: u8 = 0b11;
+
+const CTX_LRPROOF: u8 = 0xFF;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DataContext {
@@ -25,6 +37,9 @@ pub enum DataContext {
 #[repr(u8)]
 pub enum LinkContext {
     None = 0x00,
+    Request = 0x09,
+    Response = 0x0A,
+    Channel = 0x0E,
     Keepalive = 0xFA,
     LinkIdentify = 0xFB,
     LinkClose = 0xFC,
@@ -165,6 +180,9 @@ impl LinkContext {
     fn from_byte(b: u8) -> Option<Self> {
         match b {
             0x00 => Some(Self::None),
+            0x09 => Some(Self::Request),
+            0x0A => Some(Self::Response),
+            0x0E => Some(Self::Channel),
             0xFA => Some(Self::Keepalive),
             0xFB => Some(Self::LinkIdentify),
             0xFC => Some(Self::LinkClose),
@@ -275,8 +293,8 @@ impl Packet {
         };
 
         match packet_type {
-            0b00 => {
-                if destination_type == 0b11 {
+            PKT_DATA => {
+                if destination_type == DEST_LINK {
                     let context =
                         LinkContext::from_byte(context_byte).ok_or(ParseError::InvalidContext)?;
                     let destination = match transport_id {
@@ -296,10 +314,10 @@ impl Packet {
                     let context =
                         DataContext::from_byte(context_byte).ok_or(ParseError::InvalidContext)?;
                     let destination = match (destination_type, transport_id, is_transport) {
-                        (0b00, None, false) => DataDestination::Single(destination_hash),
-                        (0b01, None, false) => DataDestination::Group(destination_hash),
-                        (0b10, None, false) => DataDestination::Plain(destination_hash),
-                        (0b00, Some(tid), true) => DataDestination::Transport {
+                        (DEST_SINGLE, None, false) => DataDestination::Single(destination_hash),
+                        (DEST_GROUP, None, false) => DataDestination::Group(destination_hash),
+                        (DEST_PLAIN, None, false) => DataDestination::Plain(destination_hash),
+                        (DEST_SINGLE, Some(tid), true) => DataDestination::Transport {
                             transport_id: tid,
                             destination: destination_hash,
                         },
@@ -313,8 +331,8 @@ impl Packet {
                     })
                 }
             }
-            0b01 => {
-                if destination_type != 0b00 {
+            PKT_ANNOUNCE => {
+                if destination_type != DEST_SINGLE {
                     return Err(ParseError::InvalidDestinationType);
                 }
                 let has_ratchet = context_flag == 1;
@@ -332,8 +350,8 @@ impl Packet {
                     data,
                 })
             }
-            0b10 => {
-                if destination_type != 0b11 {
+            PKT_LINKREQUEST => {
+                if destination_type != DEST_SINGLE {
                     return Err(ParseError::InvalidDestinationType);
                 }
                 let destination = match transport_id {
@@ -349,8 +367,8 @@ impl Packet {
                     data,
                 })
             }
-            0b11 => {
-                if context_byte == 0xFF {
+            PKT_PROOF => {
+                if context_byte == CTX_LRPROOF {
                     let destination = match transport_id {
                         None => LinkProofDestination::Direct(destination_hash),
                         Some(tid) => LinkProofDestination::Transport {
@@ -370,8 +388,8 @@ impl Packet {
                     let context =
                         ProofContext::from_byte(context_byte).ok_or(ParseError::InvalidContext)?;
                     let destination = match destination_type {
-                        0b00 => ProofDestination::Single(destination_hash),
-                        0b11 => ProofDestination::Link(destination_hash),
+                        DEST_SINGLE => ProofDestination::Single(destination_hash),
+                        DEST_LINK => ProofDestination::Link(destination_hash),
                         _ => return Err(ParseError::InvalidDestinationType),
                     };
                     Ok(Packet::Proof {
@@ -518,25 +536,25 @@ impl Packet {
 
         let destination_type: u8 = match self {
             Packet::Data { destination, .. } => match destination {
-                DataDestination::Single(_) | DataDestination::Transport { .. } => 0b00,
-                DataDestination::Group(_) => 0b01,
-                DataDestination::Plain(_) => 0b10,
+                DataDestination::Single(_) | DataDestination::Transport { .. } => DEST_SINGLE,
+                DataDestination::Group(_) => DEST_GROUP,
+                DataDestination::Plain(_) => DEST_PLAIN,
             },
-            Packet::Announce { .. } => 0b00,
+            Packet::Announce { .. } => DEST_SINGLE,
             Packet::Proof { destination, .. } => match destination {
-                ProofDestination::Single(_) => 0b00,
-                ProofDestination::Link(_) => 0b11,
+                ProofDestination::Single(_) => DEST_SINGLE,
+                ProofDestination::Link(_) => DEST_LINK,
             },
-            Packet::LinkData { .. } => 0b11,
-            Packet::LinkRequest { .. } => 0b00, // Link requests go to SINGLE destinations
-            Packet::LinkProof { .. } => 0b11,   // Link proofs go to link_id (LINK type)
+            Packet::LinkData { .. } => DEST_LINK,
+            Packet::LinkRequest { .. } => DEST_SINGLE,
+            Packet::LinkProof { .. } => DEST_LINK,
         };
 
         let packet_type: u8 = match self {
-            Packet::Data { .. } | Packet::LinkData { .. } => 0b00,
-            Packet::Announce { .. } => 0b01,
-            Packet::LinkRequest { .. } => 0b10,
-            Packet::Proof { .. } | Packet::LinkProof { .. } => 0b11,
+            Packet::Data { .. } | Packet::LinkData { .. } => PKT_DATA,
+            Packet::Announce { .. } => PKT_ANNOUNCE,
+            Packet::LinkRequest { .. } => PKT_LINKREQUEST,
+            Packet::Proof { .. } | Packet::LinkProof { .. } => PKT_PROOF,
         };
 
         (header_type << 6)
@@ -553,7 +571,7 @@ impl Packet {
             Packet::Proof { context, .. } => *context as u8,
             Packet::LinkData { context, .. } => *context as u8,
             Packet::LinkRequest { .. } => 0x00,
-            Packet::LinkProof { .. } => 0xFF,
+            Packet::LinkProof { .. } => CTX_LRPROOF,
         }
     }
 

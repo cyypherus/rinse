@@ -865,25 +865,69 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             }
         }
 
-        if let Packet::LinkData { data, .. } = &packet {
-            // Data for a link - decrypt with link keys
-            if let Some(link) = self.established_links.get_mut(&link_id)
-                && let Some(plaintext) = link.decrypt(data)
-            {
-                link.touch_inbound(now);
+        if let Packet::LinkData { data, context, .. } = &packet {
+            log::trace!(
+                "[DECODE 4: LINKDATA] ciphertext {} bytes: {}",
+                data.len(),
+                hex::encode(data)
+            );
+            if let Some(link) = self.established_links.get_mut(&link_id) {
+                if let Some(plaintext) = link.decrypt(data) {
+                    log::trace!(
+                        "[DECODE 5: DECRYPTED] plaintext {} bytes: {}",
+                        plaintext.len(),
+                        hex::encode(&plaintext)
+                    );
+                    link.touch_inbound(now);
 
-                // Find the service this link belongs to
-                if let Some(service_idx) = self
-                    .services
-                    .iter()
-                    .position(|s| s.address == link.destination)
-                {
-                    let msg = InboundMessage::LinkData {
-                        link_id,
-                        data: plaintext,
-                    };
-                    self.services[service_idx].service.inbound(msg);
+                    if let Some(service_idx) = self
+                        .services
+                        .iter()
+                        .position(|s| s.address == link.destination)
+                    {
+                        let msg = match context {
+                            LinkContext::Request => {
+                                if let Some(req) = crate::Request::decode(&plaintext) {
+                                    let request_id: crate::RequestId =
+                                        packet.packet_hash()[..16].try_into().unwrap();
+                                    InboundMessage::Request {
+                                        link_id,
+                                        request_id,
+                                        path_hash: req.path_hash,
+                                        data: req.data,
+                                    }
+                                } else {
+                                    InboundMessage::LinkData {
+                                        link_id,
+                                        data: plaintext,
+                                    }
+                                }
+                            }
+                            LinkContext::Response => {
+                                if let Some(resp) = crate::Response::decode(&plaintext) {
+                                    InboundMessage::Response {
+                                        request_id: resp.request_id,
+                                        data: resp.data,
+                                    }
+                                } else {
+                                    InboundMessage::LinkData {
+                                        link_id,
+                                        data: plaintext,
+                                    }
+                                }
+                            }
+                            _ => InboundMessage::LinkData {
+                                link_id,
+                                data: plaintext,
+                            },
+                        };
+                        self.services[service_idx].service.inbound(msg);
+                    }
+                } else {
+                    log::trace!("[DECODE 5: DECRYPT FAILED] context={:?}", context);
                 }
+            } else {
+                log::trace!("[DECODE 4: NO LINK] link_id=<{}>", hex::encode(link_id));
             }
         }
 
@@ -1350,16 +1394,16 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         let encoded = req.encode();
                         let ciphertext = link.encrypt(&mut self.rng, &encoded);
 
-                        let request_id: crate::RequestId =
-                            crate::crypto::sha256(&ciphertext)[..16].try_into().unwrap();
-                        link.pending_requests.insert(request_id, service_addr);
-
                         let packet = Packet::LinkData {
                             hops: 0,
                             destination: LinkDataDestination::Direct(link_id),
-                            context: LinkContext::None,
+                            context: LinkContext::Request,
                             data: ciphertext,
                         };
+                        let request_id: crate::RequestId =
+                            packet.packet_hash()[..16].try_into().unwrap();
+                        link.pending_requests.insert(request_id, service_addr);
+
                         for iface in &mut self.interfaces {
                             iface.send(packet.clone(), 0, &mut self.rng, now);
                         }
@@ -1377,7 +1421,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         let packet = Packet::LinkData {
                             hops: 0,
                             destination: LinkDataDestination::Direct(link_id),
-                            context: LinkContext::None,
+                            context: LinkContext::Response,
                             data: ciphertext,
                         };
                         for iface in &mut self.interfaces {

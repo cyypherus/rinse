@@ -52,9 +52,10 @@ impl LinkRequest {
 // Link Proof: 115 bytes on wire
 // Header Type 2, link_id + transport_id addresses
 // Context: LinkProof (0xFD)
-// Data: encryption_public (32) + signature (64) = 96 bytes
+// Data: signature (64) + encryption_public (32) + signalling_bytes (3) = 99 bytes
 pub(crate) struct LinkProof {
     pub encryption_public: X25519Public,
+    pub signalling_bytes: [u8; 3],
     pub signature: Signature,
 }
 
@@ -64,45 +65,53 @@ impl LinkProof {
         responder_encryption_public: &X25519Public,
         responder_signing_key: &SigningKey,
     ) -> Self {
-        // signed_data = link_id + pub_bytes + sig_pub_bytes
-        let mut sign_data = Vec::with_capacity(80);
+        // signed_data = link_id + pub_bytes + sig_pub_bytes + signalling_bytes
+        // For now, use default signalling_bytes (MTU 500, mode 0)
+        let signalling_bytes = [0x01, 0xf4, 0x00]; // MTU=500, mode=0
+        let mut sign_data = Vec::with_capacity(83);
         sign_data.extend_from_slice(link_id);
         sign_data.extend_from_slice(responder_encryption_public.as_bytes());
         sign_data.extend_from_slice(responder_signing_key.verifying_key().as_bytes());
+        sign_data.extend_from_slice(&signalling_bytes);
         let signature = sign(responder_signing_key, &sign_data);
         Self {
             encryption_public: *responder_encryption_public,
+            signalling_bytes,
             signature,
         }
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        // proof_data = signature + pub_bytes
-        let mut out = Vec::with_capacity(96);
+        // proof_data = signature + pub_bytes + signalling_bytes
+        let mut out = Vec::with_capacity(99);
         out.extend_from_slice(&self.signature.to_bytes());
         out.extend_from_slice(self.encryption_public.as_bytes());
+        out.extend_from_slice(&self.signalling_bytes);
         out
     }
 
     pub fn parse(data: &[u8]) -> Option<Self> {
-        // proof_data = signature (64) + pub_bytes (32)
-        if data.len() < 96 {
+        // proof_data = signature (64) + pub_bytes (32) + signalling_bytes (3)
+        if data.len() < 99 {
             return None;
         }
         let signature = Signature::from_bytes(&data[..64].try_into().ok()?);
         let encryption_public = X25519Public::from(<[u8; 32]>::try_from(&data[64..96]).ok()?);
+        let signalling_bytes = <[u8; 3]>::try_from(&data[96..99]).ok()?;
         Some(Self {
             encryption_public,
+            signalling_bytes,
             signature,
         })
     }
 
     pub fn verify(&self, link_id: &LinkId, responder_signing_key: &VerifyingKey) -> bool {
-        // signed_data = link_id + pub_bytes + sig_pub_bytes
-        let mut sign_data = Vec::with_capacity(80);
+        // signed_data = link_id + pub_bytes + sig_pub_bytes + signalling_bytes
+        let mut sign_data = Vec::with_capacity(83);
         sign_data.extend_from_slice(link_id);
         sign_data.extend_from_slice(self.encryption_public.as_bytes());
         sign_data.extend_from_slice(responder_signing_key.as_bytes());
+        sign_data.extend_from_slice(&self.signalling_bytes);
         verify(responder_signing_key, &sign_data, &self.signature)
     }
 }
