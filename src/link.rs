@@ -143,7 +143,6 @@ pub(crate) fn decode_rtt(data: &[u8]) -> Option<f64> {
 pub(crate) struct PendingLink {
     pub link_id: LinkId,
     pub initiator_encryption_secret: StaticSecret,
-    pub initiator_encryption_public: X25519Public,
     pub destination: Address,
     pub request_time: Instant,
 }
@@ -350,7 +349,7 @@ mod tests {
         let pending = PendingLink {
             link_id,
             initiator_encryption_secret: initiator_keypair.secret,
-            initiator_encryption_public: initiator_keypair.public,
+
             destination: dest,
             request_time: now,
         };
@@ -404,7 +403,6 @@ mod tests {
         let pending = PendingLink {
             link_id,
             initiator_encryption_secret: initiator_enc.secret,
-            initiator_encryption_public: initiator_enc.public,
             destination: dest,
             request_time: now,
         };
@@ -464,7 +462,7 @@ mod tests {
         let pending = PendingLink {
             link_id,
             initiator_encryption_secret: initiator_keypair.secret,
-            initiator_encryption_public: initiator_keypair.public,
+
             destination: dest,
             request_time,
         };
@@ -487,7 +485,7 @@ mod tests {
         let pending = PendingLink {
             link_id,
             initiator_encryption_secret: initiator_keypair.secret,
-            initiator_encryption_public: initiator_keypair.public,
+
             destination: dest,
             request_time: now,
         };

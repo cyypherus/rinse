@@ -394,7 +394,6 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             PendingLink {
                 link_id,
                 initiator_encryption_secret: ephemeral.secret,
-                initiator_encryption_public: ephemeral.public,
                 destination,
                 request_time: now,
             },
