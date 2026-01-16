@@ -132,7 +132,7 @@ pub struct Node<T, S, R = ThreadRng> {
     reverse_table: HashMap<Address, ReverseTableEntry>,
     control_hashes: std::collections::HashSet<Address>,
     receipts: Vec<Receipt>,
-    services: Vec<ServiceEntry<S>>,
+    pub(crate) services: Vec<ServiceEntry<S>>,
     pub(crate) interfaces: Vec<Interface<T>>,
     pending_outbound_links: HashMap<LinkId, PendingLink>,
     pub(crate) established_links: HashMap<LinkId, EstablishedLink>,
@@ -890,7 +890,23 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 if let Some(plaintext) = link.decrypt(data) {
                     link.touch_inbound(now);
 
-                    if let Some(service_idx) = self
+                    if *context == LinkContext::Response {
+                        if let Some(resp) = crate::Response::decode(&plaintext) {
+                            if let Some(service_addr) =
+                                link.pending_requests.remove(&resp.request_id)
+                            {
+                                if let Some(service_idx) =
+                                    self.services.iter().position(|s| s.address == service_addr)
+                                {
+                                    let msg = InboundMessage::Response {
+                                        request_id: resp.request_id,
+                                        data: resp.data,
+                                    };
+                                    self.services[service_idx].service.inbound(msg);
+                                }
+                            }
+                        }
+                    } else if let Some(service_idx) = self
                         .services
                         .iter()
                         .position(|s| s.address == link.destination)
@@ -905,19 +921,6 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                                         request_id,
                                         path_hash: req.path_hash,
                                         data: req.data,
-                                    }
-                                } else {
-                                    InboundMessage::LinkData {
-                                        link_id,
-                                        data: plaintext,
-                                    }
-                                }
-                            }
-                            LinkContext::Response => {
-                                if let Some(resp) = crate::Response::decode(&plaintext) {
-                                    InboundMessage::Response {
-                                        request_id: resp.request_id,
-                                        data: resp.data,
                                     }
                                 } else {
                                     InboundMessage::LinkData {
@@ -1384,9 +1387,17 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                         let mut payload = ephemeral_pub.as_bytes().to_vec();
                         payload.extend(ciphertext);
 
+                        let dest = if entry.hops > 1 {
+                            DataDestination::Transport {
+                                transport_id: entry.next_hop,
+                                destination,
+                            }
+                        } else {
+                            DataDestination::Single(destination)
+                        };
                         let packet = Packet::Data {
                             hops: 0,
-                            destination: DataDestination::Single(destination),
+                            destination: dest,
                             context: DataContext::None,
                             data: payload,
                         };
@@ -1550,6 +1561,7 @@ mod tests {
     struct TestService {
         name: String,
         inbox: Vec<InboundMessage>,
+        outbox: VecDeque<OutboundMessage>,
     }
 
     impl Service for TestService {
@@ -1560,7 +1572,7 @@ mod tests {
             self.inbox.push(msg);
         }
         fn outbound(&mut self) -> Option<OutboundMessage> {
-            None
+            self.outbox.pop_front()
         }
     }
 
@@ -1568,6 +1580,7 @@ mod tests {
         TestService {
             name: name.into(),
             inbox: Vec::new(),
+            outbox: VecDeque::new(),
         }
     }
 
@@ -1766,5 +1779,231 @@ mod tests {
         c.poll(now);
 
         assert_eq!(c.services[0].service.inbox.len(), 1);
+    }
+
+    #[test]
+    fn single_data_two_nodes() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let addr_a = a.add_service(svc("sender"));
+        let addr_b = b.add_service(svc("receiver"));
+        let now = Instant::now();
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        a.services[0]
+            .service
+            .outbox
+            .push_back(OutboundMessage::SingleData {
+                destination: addr_b,
+                data: b"hello".to_vec(),
+            });
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        assert_eq!(b.services[0].service.inbox.len(), 1);
+        assert!(matches!(
+            &b.services[0].service.inbox[0],
+            InboundMessage::SingleData { data } if data == b"hello"
+        ));
+    }
+
+    #[test]
+    fn single_data_three_nodes() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        let mut c: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+        b.add_interface(test_interface());
+        c.add_interface(test_interface());
+
+        a.add_service(svc("sender"));
+        let addr_c = c.add_service(svc("receiver"));
+        let now = Instant::now();
+
+        c.announce(addr_c, now);
+        c.poll(now);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        a.services[0]
+            .service
+            .outbox
+            .push_back(OutboundMessage::SingleData {
+                destination: addr_c,
+                data: b"hello".to_vec(),
+            });
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 1, &mut c, 0);
+        c.poll(now);
+
+        assert_eq!(c.services[0].service.inbox.len(), 1);
+        assert!(matches!(
+            &c.services[0].service.inbox[0],
+            InboundMessage::SingleData { data } if data == b"hello"
+        ));
+    }
+
+    #[test]
+    fn request_response_two_nodes() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        a.add_service(svc("client"));
+        let addr_b = b.add_service(svc("server"));
+        let now = Instant::now();
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(addr_b, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        a.services[0]
+            .service
+            .outbox
+            .push_back(OutboundMessage::Request {
+                link_id,
+                path: "test.path".into(),
+                data: b"request data".to_vec(),
+            });
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        assert_eq!(b.services[0].service.inbox.len(), 1);
+        let (req_link_id, req_id) = match &b.services[0].service.inbox[0] {
+            InboundMessage::Request {
+                link_id,
+                request_id,
+                data,
+                ..
+            } => {
+                assert_eq!(data, b"request data");
+                (*link_id, *request_id)
+            }
+            _ => panic!("expected Request"),
+        };
+
+        b.services[0]
+            .service
+            .outbox
+            .push_back(OutboundMessage::Response {
+                link_id: req_link_id,
+                request_id: req_id,
+                data: b"response data".to_vec(),
+            });
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        assert_eq!(a.services[0].service.inbox.len(), 1);
+        assert!(matches!(
+            &a.services[0].service.inbox[0],
+            InboundMessage::Response { data, .. } if data == b"response data"
+        ));
+    }
+
+    #[test]
+    fn request_response_three_nodes() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        let mut c: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+        b.add_interface(test_interface());
+        c.add_interface(test_interface());
+
+        a.add_service(svc("client"));
+        let addr_c = c.add_service(svc("server"));
+        let now = Instant::now();
+
+        c.announce(addr_c, now);
+        c.poll(now);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(addr_c, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 1, &mut c, 0);
+        c.poll(now);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        a.services[0]
+            .service
+            .outbox
+            .push_back(OutboundMessage::Request {
+                link_id,
+                path: "test.path".into(),
+                data: b"request data".to_vec(),
+            });
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 1, &mut c, 0);
+        c.poll(now);
+
+        assert_eq!(c.services[0].service.inbox.len(), 1);
+        let (req_link_id, req_id) = match &c.services[0].service.inbox[0] {
+            InboundMessage::Request {
+                link_id,
+                request_id,
+                data,
+                ..
+            } => {
+                assert_eq!(data, b"request data");
+                (*link_id, *request_id)
+            }
+            _ => panic!("expected Request"),
+        };
+
+        c.services[0]
+            .service
+            .outbox
+            .push_back(OutboundMessage::Response {
+                link_id: req_link_id,
+                request_id: req_id,
+                data: b"response data".to_vec(),
+            });
+        c.poll(now);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        assert_eq!(a.services[0].service.inbox.len(), 1);
+        assert!(matches!(
+            &a.services[0].service.inbox[0],
+            InboundMessage::Response { data, .. } if data == b"response data"
+        ));
     }
 }
