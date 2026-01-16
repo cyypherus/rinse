@@ -133,7 +133,6 @@ pub(crate) fn decode_rtt(data: &[u8]) -> Option<f64> {
         let bytes: [u8; 8] = data[1..9].try_into().ok()?;
         Some(f64::from_be_bytes(bytes))
     } else if data.len() >= 5 && data[0] == 0xca {
-        // float32
         let bytes: [u8; 4] = data[1..5].try_into().ok()?;
         Some(f32::from_be_bytes(bytes) as f64)
     } else {
@@ -165,6 +164,7 @@ pub(crate) struct EstablishedLink {
     pub activated_at: Option<Instant>,
     pub last_inbound: Instant,
     pub last_outbound: Instant,
+    pub last_keepalive_sent: Option<Instant>,
     pub rtt_ms: Option<u64>,
     keys: LinkKeys,
     pub(crate) pending_requests: std::collections::HashMap<crate::RequestId, Address>,
@@ -185,6 +185,7 @@ impl EstablishedLink {
             .diffie_hellman(responder_public)
             .to_bytes();
         let keys = LinkEncryption::derive_keys(&shared_key, &pending.link_id);
+        let rtt_ms = now.duration_since(pending.request_time).as_millis() as u64;
         Self {
             link_id: pending.link_id,
             destination: pending.destination,
@@ -193,7 +194,8 @@ impl EstablishedLink {
             activated_at: Some(now),
             last_inbound: now,
             last_outbound: now,
-            rtt_ms: None,
+            last_keepalive_sent: None,
+            rtt_ms: Some(rtt_ms),
             keys,
             pending_requests: std::collections::HashMap::new(),
         }
@@ -216,6 +218,7 @@ impl EstablishedLink {
             activated_at: None,
             last_inbound: now,
             last_outbound: now,
+            last_keepalive_sent: None,
             rtt_ms: None,
             keys,
             pending_requests: std::collections::HashMap::new(),
@@ -239,6 +242,14 @@ impl EstablishedLink {
 
     pub(crate) fn touch_outbound(&mut self, now: Instant) {
         self.last_outbound = now;
+    }
+
+    pub(crate) fn set_rtt(&mut self, rtt_ms: u64) {
+        self.rtt_ms = Some(rtt_ms);
+    }
+
+    pub(crate) fn rtt_seconds(&self) -> Option<f64> {
+        self.rtt_ms.map(|ms| ms as f64 / 1000.0)
     }
 
     pub(crate) fn keepalive_interval_secs(&self) -> u64 {
@@ -436,5 +447,66 @@ mod tests {
         data.extend_from_slice(&rtt.to_be_bytes());
         let decoded = super::decode_rtt(&data).unwrap();
         assert!((decoded - 0.025).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rtt_measured_on_link_establishment() {
+        let mut rng = test_rng();
+        let initiator_keypair = EphemeralKeyPair::generate(&mut rng);
+        let responder_keypair = EphemeralKeyPair::generate(&mut rng);
+        let dest: Address = [0xAB; 16];
+        let link_id: LinkId = [0xCD; 16];
+
+        let request_time = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let proof_time = Instant::now();
+
+        let pending = PendingLink {
+            link_id,
+            initiator_encryption_secret: initiator_keypair.secret,
+            initiator_encryption_public: initiator_keypair.public,
+            destination: dest,
+            request_time,
+        };
+
+        let link = EstablishedLink::from_initiator(pending, &responder_keypair.public, proof_time);
+
+        assert!(link.rtt_ms.is_some());
+        assert!(link.rtt_ms.unwrap() >= 10);
+    }
+
+    #[test]
+    fn keepalive_interval_scales_with_rtt() {
+        let mut rng = test_rng();
+        let initiator_keypair = EphemeralKeyPair::generate(&mut rng);
+        let responder_keypair = EphemeralKeyPair::generate(&mut rng);
+        let dest: Address = [0xAB; 16];
+        let link_id: LinkId = [0xCD; 16];
+        let now = Instant::now();
+
+        let pending = PendingLink {
+            link_id,
+            initiator_encryption_secret: initiator_keypair.secret,
+            initiator_encryption_public: initiator_keypair.public,
+            destination: dest,
+            request_time: now,
+        };
+
+        let mut link = EstablishedLink::from_initiator(pending, &responder_keypair.public, now);
+
+        // With no/zero RTT, should use max keepalive
+        link.rtt_ms = Some(0);
+        assert_eq!(link.keepalive_interval_secs(), KEEPALIVE_MIN_SECS);
+
+        // With 1750ms RTT (KEEPALIVE_MAX_RTT), should use max keepalive
+        link.rtt_ms = Some(1750);
+        assert_eq!(link.keepalive_interval_secs(), KEEPALIVE_MAX_SECS);
+
+        // With 875ms RTT (half of max), should use ~180s (half of max)
+        link.rtt_ms = Some(875);
+        assert_eq!(link.keepalive_interval_secs(), 180);
+
+        // Stale time is 2x keepalive
+        assert_eq!(link.stale_time_secs(), 360);
     }
 }

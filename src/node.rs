@@ -8,11 +8,11 @@ use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 use crate::announce::{AnnounceBuilder, AnnounceData};
 use crate::crypto::{EphemeralKeyPair, sha256};
-pub use crate::link::LinkId;
-use crate::link::{EstablishedLink, LinkProof, LinkRequest, LinkState, PendingLink};
+use crate::link::{EstablishedLink, LinkId, LinkProof, LinkRequest, LinkState, PendingLink};
 use crate::packet::{Address, DataContext, DataDestination, LinkContext, Packet};
 use crate::packet_hashlist::PacketHashlist;
 use crate::path_request::PathRequest;
+use crate::request::{Request, Response};
 use crate::{Interface, Transport};
 use ed25519_dalek::Signature;
 
@@ -939,8 +939,12 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 if let Some(plaintext) = link.decrypt(data) {
                     link.touch_inbound(now);
 
-                    // Handle resource contexts
-                    if matches!(
+                    // Handle keepalive
+                    if *context == LinkContext::Keepalive {
+                        self.handle_keepalive(link_id, &plaintext, now);
+                    } else if *context == LinkContext::LinkRtt {
+                        self.handle_link_rtt(link_id, &plaintext);
+                    } else if matches!(
                         context,
                         LinkContext::Resource
                             | LinkContext::ResourceAdv
@@ -952,7 +956,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     ) {
                         self.handle_resource_packet(link_id, *context, &plaintext, now);
                     } else if *context == LinkContext::Response {
-                        if let Some(resp) = crate::Response::decode(&plaintext) {
+                        if let Some(resp) = Response::decode(&plaintext) {
                             if let Some(service_addr) =
                                 link.pending_requests.remove(&resp.request_id)
                             {
@@ -974,7 +978,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     {
                         let msg = match context {
                             LinkContext::Request => {
-                                if let Some(req) = crate::Request::decode(&plaintext) {
+                                if let Some(req) = Request::decode(&plaintext) {
                                     let request_id: crate::RequestId =
                                         packet.packet_hash()[..16].try_into().unwrap();
                                     InboundMessage::Request {
@@ -1085,12 +1089,20 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
                 // Establish the link using the responder's public key from the proof
                 let link = EstablishedLink::from_initiator(pending, &proof.encryption_public, now);
+                let rtt_secs = link.rtt_seconds();
 
                 self.established_links.insert(destination_hash, link);
 
+                // Send LRRTT packet to inform responder of the measured RTT
+                if let Some(rtt) = rtt_secs {
+                    let rtt_data = crate::link::encode_rtt(rtt);
+                    self.send_link_packet(destination_hash, LinkContext::LinkRtt, &rtt_data, now);
+                }
+
                 log::debug!(
-                    "Link <{}> established as initiator",
-                    hex::encode(destination_hash)
+                    "Link <{}> established as initiator, RTT: {:?}ms",
+                    hex::encode(destination_hash),
+                    rtt_secs.map(|r| (r * 1000.0) as u64)
                 );
             }
         }
@@ -1373,6 +1385,9 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         }
 
         for link_id in to_keepalive {
+            if let Some(link) = self.established_links.get_mut(&link_id) {
+                link.last_keepalive_sent = Some(now);
+            }
             self.send_link_packet(
                 link_id,
                 LinkContext::Keepalive,
@@ -1398,6 +1413,54 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 }
             }
             self.established_links.remove(&link_id);
+        }
+    }
+
+    fn handle_keepalive(&mut self, link_id: LinkId, plaintext: &[u8], now: Instant) {
+        use crate::link::{KEEPALIVE_REQUEST, KEEPALIVE_RESPONSE};
+        use crate::packet::LinkDataDestination;
+
+        if plaintext.is_empty() {
+            return;
+        }
+
+        if let Some(link) = self.established_links.get_mut(&link_id) {
+            if plaintext[0] == KEEPALIVE_REQUEST && !link.is_initiator {
+                // Responder: reply to keepalive request
+                let response = link.encrypt(&mut self.rng, &[KEEPALIVE_RESPONSE]);
+                let packet = Packet::LinkData {
+                    hops: 0,
+                    destination: LinkDataDestination::Direct(link_id),
+                    context: LinkContext::Keepalive,
+                    data: response,
+                };
+                for iface in &mut self.interfaces {
+                    iface.send(packet.clone(), 0, &mut self.rng, now);
+                }
+            } else if plaintext[0] == KEEPALIVE_RESPONSE && link.is_initiator {
+                // Initiator: received keepalive response, update RTT
+                if let Some(sent_at) = link.last_keepalive_sent {
+                    let rtt_ms = now.duration_since(sent_at).as_millis() as u64;
+                    link.set_rtt(rtt_ms);
+                    link.last_keepalive_sent = None;
+                }
+            }
+        }
+    }
+
+    fn handle_link_rtt(&mut self, link_id: LinkId, plaintext: &[u8]) {
+        use crate::link::decode_rtt;
+
+        // LRRTT packet from initiator telling responder the measured RTT
+        if let Some(rtt_secs) = decode_rtt(plaintext) {
+            if let Some(link) = self.established_links.get_mut(&link_id) {
+                if !link.is_initiator {
+                    let rtt_ms = (rtt_secs * 1000.0) as u64;
+                    link.set_rtt(rtt_ms);
+                    link.state = LinkState::Active;
+                    link.activated_at = Some(std::time::Instant::now());
+                }
+            }
         }
     }
 
@@ -1727,7 +1790,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     data,
                 } => {
                     if let Some(link) = self.established_links.get_mut(&link_id) {
-                        let req = crate::Request::new(&path, data);
+                        let req = Request::new(&path, data);
                         let encoded = req.encode();
                         let ciphertext = link.encrypt(&mut self.rng, &encoded);
 
@@ -1752,7 +1815,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     data,
                 } => {
                     if let Some(link) = self.established_links.get(&link_id) {
-                        let resp = crate::Response::new(request_id, data);
+                        let resp = Response::new(request_id, data);
                         let ciphertext = link.encrypt(&mut self.rng, &resp.encode());
 
                         let packet = Packet::LinkData {
@@ -2464,5 +2527,269 @@ mod tests {
             .iter()
             .any(|m| matches!(m, InboundMessage::ResourceComplete { .. }));
         assert!(a_complete, "sender should get completion notification");
+    }
+
+    #[test]
+    fn rtt_measured_and_propagated() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let addr_b = b.add_service(svc("server"));
+        let now = Instant::now();
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(addr_b, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        // After link establishment, initiator (a) should have RTT measured
+        let a_link = a.established_links.get(&link_id).unwrap();
+        assert!(a_link.rtt_ms.is_some(), "initiator should have RTT");
+        assert!(a_link.is_initiator);
+
+        // LRRTT packet should have been sent, transfer it
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        // Now responder (b) should also have RTT from LRRTT packet
+        let b_link = b
+            .established_links
+            .values()
+            .find(|l| l.link_id == link_id)
+            .unwrap();
+        assert!(
+            b_link.rtt_ms.is_some(),
+            "responder should have RTT from LRRTT"
+        );
+        assert!(!b_link.is_initiator);
+        assert_eq!(b_link.state, LinkState::Active);
+    }
+
+    #[test]
+    fn keepalive_timing_adapts_to_rtt() {
+        use std::time::Duration;
+
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let addr_b = b.add_service(svc("server"));
+        let now = Instant::now();
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(addr_b, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        // Helper to count keepalives sent over a time period
+        let count_keepalives = |node: &mut TestNode,
+                                link: LinkId,
+                                start: Instant,
+                                duration_secs: u64,
+                                step_secs: u64|
+         -> u64 {
+            let mut count = 0u64;
+            let mut t = start;
+            let end = start + Duration::from_secs(duration_secs);
+            while t < end {
+                // Keep inbound fresh to avoid stale
+                if let Some(l) = node.established_links.get_mut(&link) {
+                    l.last_inbound = t;
+                }
+                let before = node
+                    .established_links
+                    .get(&link)
+                    .and_then(|l| l.last_keepalive_sent);
+                node.poll(t);
+                let after = node
+                    .established_links
+                    .get(&link)
+                    .and_then(|l| l.last_keepalive_sent);
+                if after.is_some() && after != before {
+                    count += 1;
+                    // Simulate response to clear last_keepalive_sent
+                    if let Some(l) = node.established_links.get_mut(&link) {
+                        l.last_keepalive_sent = None;
+                        l.last_outbound = t;
+                    }
+                }
+                t += Duration::from_secs(step_secs);
+            }
+            count
+        };
+
+        // Test with low RTT (0ms -> 5s interval)
+        // Over 60 seconds, expect ~12 keepalives (60/5)
+        if let Some(link) = a.established_links.get_mut(&link_id) {
+            link.set_rtt(0);
+            link.last_outbound = now;
+            link.last_inbound = now;
+            link.last_keepalive_sent = None;
+        }
+        let low_rtt_count = count_keepalives(&mut a, link_id, now, 60, 1);
+        assert!(
+            low_rtt_count >= 10 && low_rtt_count <= 14,
+            "low RTT (5s interval): expected ~12 keepalives in 60s, got {}",
+            low_rtt_count
+        );
+
+        // Test with high RTT (1750ms -> 360s interval)
+        // Over 60 seconds, expect 0 keepalives
+        let now2 = now + Duration::from_secs(100);
+        if let Some(link) = a.established_links.get_mut(&link_id) {
+            link.set_rtt(1750);
+            link.last_outbound = now2;
+            link.last_inbound = now2;
+            link.last_keepalive_sent = None;
+        }
+        let high_rtt_count = count_keepalives(&mut a, link_id, now2, 60, 1);
+        assert_eq!(
+            high_rtt_count, 0,
+            "high RTT (360s interval): expected 0 keepalives in 60s, got {}",
+            high_rtt_count
+        );
+    }
+
+    #[test]
+    fn stale_link_closed() {
+        use std::time::Duration;
+
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let addr_b = b.add_service(svc("server"));
+        let now = Instant::now();
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(addr_b, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        assert!(a.established_links.contains_key(&link_id));
+
+        // With RTT ~0, stale_time = 10s (KEEPALIVE_MIN * STALE_FACTOR = 5 * 2)
+        // Simulate no inbound traffic for longer than stale_time
+        let stale_future = now + Duration::from_secs(15);
+
+        a.poll(stale_future);
+
+        assert!(
+            !a.established_links.contains_key(&link_id),
+            "link should be closed after stale timeout"
+        );
+    }
+
+    #[test]
+    fn keepalive_request_response() {
+        use std::time::Duration;
+
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let addr_b = b.add_service(svc("server"));
+        let now = Instant::now();
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(addr_b, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        // Set a known RTT value that we'll expect to change after keepalive
+        if let Some(link) = a.established_links.get_mut(&link_id) {
+            link.set_rtt(9999);
+        }
+        let rtt_before = a.established_links.get(&link_id).unwrap().rtt_ms.unwrap();
+        assert_eq!(rtt_before, 9999);
+
+        // Set up to trigger keepalive: outbound old enough, but inbound recent enough to not be stale
+        // With RTT 9999ms, keepalive_interval = 360s (clamped to max), stale_time = 720s
+        let future = now + Duration::from_secs(400);
+
+        if let Some(link) = a.established_links.get_mut(&link_id) {
+            link.last_outbound = now;
+            link.last_inbound = future - Duration::from_secs(100);
+        }
+
+        a.poll(future);
+
+        // Check keepalive was sent
+        let keepalive_sent_at = a
+            .established_links
+            .get(&link_id)
+            .unwrap()
+            .last_keepalive_sent;
+        assert!(
+            keepalive_sent_at.is_some(),
+            "keepalive should have been sent"
+        );
+
+        // Transfer keepalive request to b
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(future);
+
+        // Simulate some time passing for the response (50ms round trip)
+        let response_time = future + Duration::from_millis(50);
+
+        // Transfer keepalive response back to a
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(response_time);
+
+        // RTT should be updated from keepalive measurement
+        let a_link = a.established_links.get(&link_id).unwrap();
+        assert!(
+            a_link.last_keepalive_sent.is_none(),
+            "keepalive should be acknowledged"
+        );
+        let rtt_after = a_link.rtt_ms.unwrap();
+        assert_eq!(
+            rtt_after, 50,
+            "RTT should be exactly 50ms from keepalive roundtrip"
+        );
+        assert!(
+            rtt_after >= 50 && rtt_after <= 100,
+            "RTT should be ~50ms from keepalive roundtrip, got {}ms",
+            rtt_after
+        );
     }
 }

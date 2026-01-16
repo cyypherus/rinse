@@ -1,6 +1,5 @@
 pub const ADDR_LEN: usize = 16;
 pub type Address = [u8; ADDR_LEN];
-pub type LinkId = Address;
 
 const DEST_SINGLE: u8 = 0b00;
 const DEST_GROUP: u8 = 0b01;

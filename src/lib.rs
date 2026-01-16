@@ -13,7 +13,8 @@ mod request;
 mod resource;
 pub mod transports;
 
-pub use interface::*;
-pub use node::*;
-pub use packet::*;
-pub use request::*;
+pub use interface::{Interface, Transport};
+pub use link::LinkId;
+pub use node::{InboundMessage, Node, OutboundMessage, Service};
+pub use packet::Address;
+pub use request::{PathHash, RequestId, path_hash};
