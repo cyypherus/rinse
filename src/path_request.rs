@@ -43,18 +43,6 @@ impl PathRequest {
         out
     }
 
-    pub fn parse(data: &[u8]) -> Option<Self> {
-        if data.len() < 32 {
-            return None;
-        }
-        let destination_hash: Address = data[..16].try_into().ok()?;
-        let tag: Address = data[16..32].try_into().ok()?;
-        Some(Self {
-            destination_hash,
-            tag,
-        })
-    }
-
     pub fn destination() -> Address {
         PATH_REQUEST_DEST
     }
@@ -68,22 +56,5 @@ mod tests {
     fn path_request_destination_hash() {
         let expected = crate::crypto::sha256(b"reticulum.path.request");
         assert_eq!(&PATH_REQUEST_DEST, &expected[..16]);
-    }
-
-    #[test]
-    fn path_request_roundtrip() {
-        let dest: Address = [0xAB; 16];
-        let tag: Address = [0xCD; 16];
-        let request = PathRequest::new(dest, tag);
-        let bytes = request.to_bytes();
-        let parsed = PathRequest::parse(&bytes).unwrap();
-        assert_eq!(parsed.destination_hash, dest);
-        assert_eq!(parsed.tag, tag);
-    }
-
-    #[test]
-    fn path_request_too_short() {
-        let short = [0u8; 31];
-        assert!(PathRequest::parse(&short).is_none());
     }
 }

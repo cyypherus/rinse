@@ -34,15 +34,8 @@ pub(crate) enum PendingAction {
         path: String,
         data: Vec<u8>,
     },
-    Respond {
-        request_id: RequestId,
-        data: Vec<u8>,
-    },
     Announce {
         app_data: Option<Vec<u8>>,
-    },
-    RequestPath {
-        destination: Address,
     },
 }
 
@@ -67,13 +60,6 @@ impl NodeHandle<'_> {
         });
     }
 
-    pub fn respond(&mut self, request_id: RequestId, data: &[u8]) {
-        self.pending.push(PendingAction::Respond {
-            request_id,
-            data: data.to_vec(),
-        });
-    }
-
     pub fn announce(&mut self) {
         self.pending
             .push(PendingAction::Announce { app_data: None });
@@ -83,11 +69,6 @@ impl NodeHandle<'_> {
         self.pending.push(PendingAction::Announce {
             app_data: Some(app_data.to_vec()),
         });
-    }
-
-    pub fn request_path(&mut self, destination: Address) {
-        self.pending
-            .push(PendingAction::RequestPath { destination });
     }
 
     pub fn destinations(&self) -> impl Iterator<Item = &Destination> {
@@ -113,7 +94,8 @@ pub trait Service {
         from: Address,
         path: &str,
         data: &[u8],
-    ) {
+    ) -> Option<Vec<u8>> {
+        None
     }
 
     #[allow(unused_variables)]

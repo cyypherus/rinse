@@ -15,6 +15,9 @@ mod request;
 mod resource;
 pub mod transports;
 
+#[cfg(feature = "tokio")]
+mod async_io;
+
 pub use handle::{Destination, NodeHandle, RequestError, RespondError, Service};
 pub use identity::Identity;
 pub use interface::{Interface, Transport};
@@ -23,3 +26,6 @@ pub use node::Node;
 pub use packet::Address;
 pub(crate) use request::WireRequestId;
 pub use request::{PathHash, RequestId, path_hash};
+
+#[cfg(feature = "tokio")]
+pub use async_io::{AsyncNode, AsyncTransport, IncomingRequest};

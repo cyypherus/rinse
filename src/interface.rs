@@ -215,7 +215,7 @@ impl<T: Transport> Interface<T> {
         }
     }
 
-    pub(crate) fn poll(&mut self, now: Instant) {
+    pub(crate) fn poll(&mut self, now: Instant) -> Option<Instant> {
         let mut i = 0;
         while i < self.delayed.len() {
             if self.delayed[i].send_at <= now {
@@ -243,6 +243,8 @@ impl<T: Transport> Interface<T> {
                 break;
             }
         }
+
+        self.delayed.iter().map(|d| d.send_at).min()
     }
 }
 

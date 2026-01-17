@@ -26,9 +26,4 @@ impl PacketHashlist {
         }
         self.current.insert(hash);
     }
-
-    pub(crate) fn remove(&mut self, hash: &[u8; 32]) {
-        self.current.remove(hash);
-        self.prev.remove(hash);
-    }
 }

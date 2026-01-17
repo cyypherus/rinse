@@ -4,11 +4,11 @@ use std::net::TcpStream;
 
 use crate::Transport;
 
-const HDLC_FLAG: u8 = 0x7E;
-const HDLC_ESC: u8 = 0x7D;
-const HDLC_ESC_MASK: u8 = 0x20;
+pub(crate) const HDLC_FLAG: u8 = 0x7E;
+pub(crate) const HDLC_ESC: u8 = 0x7D;
+pub(crate) const HDLC_ESC_MASK: u8 = 0x20;
 
-fn hdlc_escape(data: &[u8]) -> Vec<u8> {
+pub(crate) fn hdlc_escape(data: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(data.len() * 2);
     for &byte in data {
         if byte == HDLC_ESC || byte == HDLC_FLAG {
@@ -21,7 +21,7 @@ fn hdlc_escape(data: &[u8]) -> Vec<u8> {
     result
 }
 
-fn hdlc_unescape(data: &[u8]) -> Vec<u8> {
+pub(crate) fn hdlc_unescape(data: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(data.len());
     let mut escape = false;
     for &byte in data {

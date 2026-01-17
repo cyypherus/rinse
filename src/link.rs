@@ -158,7 +158,6 @@ pub(crate) enum LinkState {
 }
 
 pub(crate) struct EstablishedLink {
-    pub link_id: LinkId,
     pub destination: Address,
     pub is_initiator: bool,
     pub state: LinkState,
@@ -189,7 +188,6 @@ impl EstablishedLink {
         let keys = LinkEncryption::derive_keys(&shared_key, &pending.link_id);
         let rtt_ms = now.duration_since(pending.request_time).as_millis() as u64;
         Self {
-            link_id: pending.link_id,
             destination: pending.destination,
             is_initiator: true,
             state: LinkState::Active,
@@ -213,7 +211,6 @@ impl EstablishedLink {
         let shared_key = responder_secret.diffie_hellman(initiator_public).to_bytes();
         let keys = LinkEncryption::derive_keys(&shared_key, &link_id);
         Self {
-            link_id,
             destination,
             is_initiator: false,
             state: LinkState::Handshake,
@@ -378,8 +375,6 @@ mod tests {
             .decrypt(&response_ciphertext)
             .expect("decrypt");
         assert_eq!(response_decrypted, response);
-
-        assert_eq!(initiator_link.link_id, responder_link.link_id);
     }
 
     #[test]

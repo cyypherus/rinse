@@ -60,6 +60,7 @@ const DEFAULT_RETRY_DELAY_MS: u64 = 4000;
 const LOCAL_REBROADCASTS_MAX: u8 = 2;
 const PATHFINDER_RW_MS: u64 = 500;
 const ESTABLISHMENT_TIMEOUT_PER_HOP_SECS: u64 = 6;
+const PATH_REQUEST_TIMEOUT_SECS: u64 = 15;
 
 pub(crate) struct ServiceEntry<S> {
     service: S,
@@ -83,6 +84,7 @@ struct PathEntry {
     receiving_interface: usize,
     encryption_key: X25519Public,
     signing_key: VerifyingKey,
+    #[allow(dead_code)]
     ratchet_key: Option<X25519Public>,
     app_data: Option<Vec<u8>>,
 }
@@ -109,14 +111,13 @@ struct LinkTableEntry {
 
 struct ReverseTableEntry {
     receiving_interface: usize,
-    outbound_interface: usize,
 }
 
 pub struct Node<T, S, R = ThreadRng> {
     transport: bool,
     max_hops: u8,
     retries: u8,
-    pub(crate) retry_delay_ms: u64,
+    retry_delay_ms: u64,
     rng: R,
     transport_id: Address,
     path_table: HashMap<Address, PathEntry>,
@@ -145,6 +146,7 @@ pub struct Node<T, S, R = ThreadRng> {
     inbound_request_links: HashMap<RequestId, (WireRequestId, LinkId)>,
     destination_links: HashMap<Address, LinkId>,
     pending_outbound_requests: HashMap<Address, Vec<(Address, RequestId, String, Vec<u8>)>>,
+    pending_path_requests: HashMap<Address, Instant>,
 }
 
 impl<T: Transport, S: Service> Node<T, S, ThreadRng> {
@@ -180,6 +182,7 @@ impl<T: Transport, S: Service> Node<T, S, ThreadRng> {
             inbound_request_links: HashMap::new(),
             destination_links: HashMap::new(),
             pending_outbound_requests: HashMap::new(),
+            pending_path_requests: HashMap::new(),
         }
     }
 }
@@ -216,6 +219,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             inbound_request_links: HashMap::new(),
             destination_links: HashMap::new(),
             pending_outbound_requests: HashMap::new(),
+            pending_path_requests: HashMap::new(),
         }
     }
 
@@ -241,18 +245,34 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
     where
         F: FnOnce(&mut S, &mut NodeHandle),
     {
+        self.dispatch_to_service_with_result(service_idx, now, |service, handle| {
+            f(service, handle);
+        });
+    }
+
+    fn dispatch_to_service_with_result<F, Ret>(
+        &mut self,
+        service_idx: usize,
+        now: Instant,
+        f: F,
+    ) -> Ret
+    where
+        F: FnOnce(&mut S, &mut NodeHandle) -> Ret,
+        Ret: Default,
+    {
         let destinations = self.build_destinations();
-        let pending = {
+        let (pending, result) = {
             let Node { services, .. } = self;
             let entry = &mut services[service_idx];
             let mut handle = NodeHandle {
                 destinations: &destinations,
                 pending: Vec::new(),
             };
-            f(&mut entry.service, &mut handle);
-            handle.pending
+            let result = f(&mut entry.service, &mut handle);
+            (handle.pending, result)
         };
         self.process_pending_actions(service_idx, pending, now);
+        result
     }
 
     fn process_pending_actions(
@@ -273,10 +293,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     path,
                     data,
                 } => {
-                    self.send_request(service_addr, destination, &path, data, now);
-                }
-                PendingAction::Respond { request_id, data } => {
-                    self.send_response(service_idx, request_id, data, now);
+                    self.request(service_addr, destination, &path, &data, now);
                 }
                 PendingAction::Announce { app_data } => {
                     if let Some(data) = app_data {
@@ -284,9 +301,6 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     } else {
                         self.announce(service_addr, now);
                     }
-                }
-                PendingAction::RequestPath { destination } => {
-                    self.request_path(destination, now);
                 }
             }
         }
@@ -322,19 +336,26 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         }
     }
 
-    pub(crate) fn send_request(
+    pub fn request(
         &mut self,
         service_addr: Address,
         destination: Address,
         path: &str,
-        data: Vec<u8>,
+        data: &[u8],
         now: Instant,
     ) -> RequestId {
         let mut id_bytes = [0u8; 16];
         self.rng.fill_bytes(&mut id_bytes);
         let local_request_id = RequestId(id_bytes);
 
-        self.send_request_inner(service_addr, destination, local_request_id, path, data, now);
+        self.send_request_inner(
+            service_addr,
+            destination,
+            local_request_id,
+            path,
+            data.to_vec(),
+            now,
+        );
 
         local_request_id
     }
@@ -378,7 +399,9 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 .or_default()
                 .push((service_addr, local_request_id, path.to_string(), data));
 
-            self.link(destination, Some(service_addr), now);
+            if self.link(destination, Some(service_addr), now).is_none() {
+                self.request_path(destination, now);
+            }
         }
     }
 
@@ -471,9 +494,16 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 } => {
                     self.inbound_request_links
                         .insert(request_id, (wire_request_id, link_id));
-                    self.dispatch_to_service(service_idx, now, |service, handle| {
-                        service.on_request(handle, request_id, from, &path, &data);
-                    });
+                    let response = self.dispatch_to_service_with_result(
+                        service_idx,
+                        now,
+                        |service, handle| {
+                            service.on_request(handle, request_id, from, &path, &data)
+                        },
+                    );
+                    if let Some(response_data) = response {
+                        self.send_response(service_idx, request_id, response_data, now);
+                    }
                 }
                 ServiceNotification::RequestResult {
                     service_idx,
@@ -690,7 +720,9 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         }
     }
 
-    pub fn request_path(&mut self, destination: Address, now: Instant) {
+    fn request_path(&mut self, destination: Address, now: Instant) {
+        self.pending_path_requests.insert(destination, now);
+
         let mut tag = [0u8; 16];
         self.rng.fill_bytes(&mut tag);
 
@@ -705,6 +737,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         for iface in &mut self.interfaces {
             iface.send(packet.clone(), 0, now);
         }
+    }
+
+    pub fn send_raw(&mut self, destination: Address, data: &[u8], now: Instant) {
+        self.send_single_data(destination, data, now);
     }
 
     // "When a node in the network wants to establish verified connectivity with another node,
@@ -780,6 +816,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             return false;
         }
 
+        // These contexts bypass duplicate detection
         if let Packet::LinkData {
             context: LinkContext::Keepalive,
             ..
@@ -806,6 +843,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             return true;
         }
 
+        // PLAIN/GROUP packets with hops > 1 are invalid
         if let Packet::Data {
             destination: DataDestination::Plain(_) | DataDestination::Group(_),
             hops,
@@ -814,6 +852,17 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             && *hops > 1
         {
             log::debug!("Dropped PLAIN/GROUP packet with hops {}", hops);
+            return false;
+        }
+
+        // Duplicate detection for remaining packets
+        let packet_hash = packet.packet_hash();
+        if self.seen_packets.contains(&packet_hash) {
+            // SINGLE announces are allowed even if duplicate (re-announcements)
+            if matches!(packet, Packet::Announce { .. }) {
+                return true;
+            }
+            log::debug!("Filtered duplicate packet <{}>", hex::encode(packet_hash));
             return false;
         }
 
@@ -835,6 +884,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 return None;
             }
         };
+
+        if !self.accept_packet(&packet) {
+            return None;
+        }
 
         packet.increment_hops();
 
@@ -938,7 +991,6 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                             destination_hash,
                             ReverseTableEntry {
                                 receiving_interface: interface_index,
-                                outbound_interface,
                             },
                         );
                     }
@@ -1171,6 +1223,15 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
                     if is_new_destination {
                         notifications.push(ServiceNotification::DestinationsChanged);
+                    }
+
+                    self.pending_path_requests.remove(&destination_hash);
+
+                    if self
+                        .pending_outbound_requests
+                        .contains_key(&destination_hash)
+                    {
+                        self.link(destination_hash, None, now);
                     }
                 }
             }
@@ -1639,7 +1700,12 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         sent
     }
 
-    pub fn poll(&mut self, now: Instant) {
+    pub fn poll(&mut self, now: Instant) -> Option<std::time::Duration> {
+        let mut next_wake: Option<Instant> = None;
+        let mut update_wake = |t: Instant| {
+            next_wake = Some(next_wake.map_or(t, |w| w.min(t)));
+        };
+
         // Receive from all interfaces
         let mut received = Vec::new();
         for (i, iface) in self.interfaces.iter_mut().enumerate() {
@@ -1653,7 +1719,9 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
         // Process outbound queues
         for iface in &mut self.interfaces {
-            iface.poll(now);
+            if let Some(t) = iface.poll(now) {
+                update_wake(t);
+            }
         }
 
         // Handle pending announce rebroadcasts
@@ -1661,6 +1729,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         for pending in &mut self.pending_announces {
             if pending.retry_at <= now && pending.retries_remaining > 0 {
                 pending.retries_remaining -= 1;
+                pending.retry_at = now + std::time::Duration::from_millis(self.retry_delay_ms);
                 to_send.push((
                     pending.destination,
                     pending.hops,
@@ -1668,6 +1737,11 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     pending.data.clone(),
                     pending.source_interface,
                 ));
+                if pending.retries_remaining > 0 {
+                    update_wake(pending.retry_at);
+                }
+            } else if pending.retries_remaining > 0 {
+                update_wake(pending.retry_at);
             }
         }
         // Remove announces with no retries left
@@ -1684,10 +1758,14 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             self.outbound(packet, Some(source), now);
         }
 
-        self.maintain_links(now);
+        if let Some(t) = self.maintain_links(now) {
+            update_wake(t);
+        }
 
         for iface in &mut self.interfaces {
-            iface.poll(now);
+            if let Some(t) = iface.poll(now) {
+                update_wake(t);
+            }
         }
 
         // Remove disconnected interfaces
@@ -1697,9 +1775,16 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         if removed > 0 {
             log::debug!("Removed {} disconnected interface(s)", removed);
         }
+
+        next_wake.map(|t| t.saturating_duration_since(now))
     }
 
-    fn maintain_links(&mut self, now: Instant) {
+    fn maintain_links(&mut self, now: Instant) -> Option<Instant> {
+        let mut next_wake: Option<Instant> = None;
+        let mut update_wake = |t: Instant| {
+            next_wake = Some(next_wake.map_or(t, |w| w.min(t)));
+        };
+
         // Check for timed out pending links
         let mut timed_out_pending: Vec<(LinkId, Address, Option<Address>)> = Vec::new();
         for (link_id, pending) in &self.pending_outbound_links {
@@ -1712,12 +1797,16 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             let elapsed = now.duration_since(pending.request_time).as_secs();
             if elapsed >= timeout_secs {
                 timed_out_pending.push((*link_id, pending.destination, pending.initiating_service));
+            } else {
+                let timeout_at =
+                    pending.request_time + std::time::Duration::from_secs(timeout_secs);
+                update_wake(timeout_at);
             }
         }
 
         // Handle timed out pending links
         let mut notifications = Vec::new();
-        for (link_id, destination, initiating_service) in timed_out_pending {
+        for (link_id, destination, _initiating_service) in timed_out_pending {
             self.pending_outbound_links.remove(&link_id);
 
             // Fail any queued requests for this destination
@@ -1740,6 +1829,39 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 hex::encode(link_id),
                 hex::encode(destination)
             );
+        }
+
+        // Check for timed out path requests
+        let mut timed_out_paths: Vec<Address> = Vec::new();
+        for (destination, request_time) in &self.pending_path_requests {
+            let elapsed = now.duration_since(*request_time).as_secs();
+            if elapsed >= PATH_REQUEST_TIMEOUT_SECS {
+                timed_out_paths.push(*destination);
+            } else {
+                let timeout_at =
+                    *request_time + std::time::Duration::from_secs(PATH_REQUEST_TIMEOUT_SECS);
+                update_wake(timeout_at);
+            }
+        }
+
+        for destination in timed_out_paths {
+            self.pending_path_requests.remove(&destination);
+
+            if let Some(queued) = self.pending_outbound_requests.remove(&destination) {
+                for (service_addr, local_request_id, _path, _data) in queued {
+                    if let Some(service_idx) =
+                        self.services.iter().position(|s| s.address == service_addr)
+                    {
+                        notifications.push(ServiceNotification::RequestResult {
+                            service_idx,
+                            request_id: local_request_id,
+                            result: Err(crate::handle::RequestError::Timeout),
+                        });
+                    }
+                }
+            }
+
+            log::debug!("Path request for <{}> timed out", hex::encode(destination));
         }
 
         if !notifications.is_empty() {
@@ -1774,7 +1896,18 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 // 2. No keepalive already pending (waiting for response)
                 if since_inbound >= keepalive_secs && link.last_keepalive_sent.is_none() {
                     to_keepalive.push(*link_id);
+                } else if link.last_keepalive_sent.is_none() {
+                    // Schedule wake for next keepalive check
+                    let next_keepalive =
+                        link.last_inbound + std::time::Duration::from_secs(keepalive_secs);
+                    update_wake(next_keepalive);
                 }
+            }
+
+            // Schedule wake for stale check
+            let stale_at = link.last_inbound + std::time::Duration::from_secs(stale_secs);
+            if stale_at > now {
+                update_wake(stale_at);
             }
         }
 
@@ -1808,6 +1941,8 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             }
             self.established_links.remove(&link_id);
         }
+
+        next_wake
     }
 
     fn handle_keepalive(&mut self, link_id: LinkId, plaintext: &[u8], now: Instant) {
@@ -2311,21 +2446,19 @@ mod tests {
 
         fn on_request(
             &mut self,
-            handle: &mut NodeHandle,
+            _handle: &mut NodeHandle,
             request_id: RequestId,
             from: Address,
             path: &str,
             data: &[u8],
-        ) {
+        ) -> Option<Vec<u8>> {
             self.state.borrow_mut().requests.push(ReceivedRequest {
                 request_id,
                 from,
                 path: path.to_string(),
                 data: data.to_vec(),
             });
-            if let Some(ref response) = self.auto_response {
-                handle.respond(request_id, response);
-            }
+            self.auto_response.clone()
         }
 
         fn on_request_result(
@@ -2465,7 +2598,7 @@ mod tests {
         a.poll(now);
 
         assert!(a.established_links.contains_key(&link_id));
-        assert!(b.established_links.values().any(|l| l.link_id == link_id));
+        assert!(b.established_links.contains_key(&link_id));
     }
 
     #[test]
@@ -2502,7 +2635,7 @@ mod tests {
         a.poll(later);
 
         assert!(a.established_links.contains_key(&link_id));
-        assert!(c.established_links.values().any(|l| l.link_id == link_id));
+        assert!(c.established_links.contains_key(&link_id));
     }
 
     #[test]
@@ -2623,10 +2756,10 @@ mod tests {
 
         // Link should be established on both sides
         assert!(a.established_links.contains_key(&link_id));
-        assert!(b.established_links.values().any(|l| l.link_id == link_id));
+        assert!(b.established_links.contains_key(&link_id));
 
         // Send request from A to B
-        a.send_request(addr_a, addr_b, "test.path", b"request data".to_vec(), now);
+        a.request(addr_a, addr_b, "test.path", b"request data", now);
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -2697,10 +2830,10 @@ mod tests {
 
         // Link should be established on both ends
         assert!(a.established_links.contains_key(&link_id));
-        assert!(c.established_links.values().any(|l| l.link_id == link_id));
+        assert!(c.established_links.contains_key(&link_id));
 
         // Send request from A to C (via B)
-        a.send_request(addr_a, addr_c, "test.path", b"request data".to_vec(), later);
+        a.request(addr_a, addr_c, "test.path", b"request data", later);
         a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(later);
@@ -2762,10 +2895,10 @@ mod tests {
 
         // Link should be established
         assert!(a.established_links.contains_key(&link_id));
-        assert!(b.established_links.values().any(|l| l.link_id == link_id));
+        assert!(b.established_links.contains_key(&link_id));
 
         // Send request from A to B
-        a.send_request(addr_a, addr_b, "test.path", b"request".to_vec(), now);
+        a.request(addr_a, addr_b, "test.path", b"request", now);
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -2848,7 +2981,7 @@ mod tests {
         a.poll(now);
 
         // Send request
-        a.send_request(addr_a, addr_b, "test.path", b"req".to_vec(), now);
+        a.request(addr_a, addr_b, "test.path", b"req", now);
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -2914,7 +3047,7 @@ mod tests {
         a.poll(later);
 
         // Send request
-        a.send_request(addr_a, addr_c, "test.path", b"req".to_vec(), later);
+        a.request(addr_a, addr_c, "test.path", b"req", later);
         a.poll(later);
 
         // Transfer until complete
@@ -2969,11 +3102,7 @@ mod tests {
         b.poll(now);
 
         // Now responder (b) should also have RTT from LRRTT packet
-        let b_link = b
-            .established_links
-            .values()
-            .find(|l| l.link_id == link_id)
-            .unwrap();
+        let b_link = b.established_links.get(&link_id).unwrap();
         assert!(
             b_link.rtt_ms.is_some(),
             "responder should have RTT from LRRTT"
@@ -3102,7 +3231,7 @@ mod tests {
         a.poll(now);
 
         // Queue a request while link is pending
-        a.send_request(addr_a, addr_b, "test.path", b"data".to_vec(), now);
+        a.request(addr_a, addr_b, "test.path", b"data", now);
         a.poll(now);
 
         // Verify link is pending
@@ -3310,7 +3439,7 @@ mod tests {
             "link should be established over IFAC"
         );
         assert!(
-            b.established_links.values().any(|l| l.link_id == link_id),
+            b.established_links.contains_key(&link_id),
             "B should have established link"
         );
 
@@ -3436,7 +3565,7 @@ mod tests {
         assert!(a.is_link_established(&link_id));
         assert_eq!(state_b.borrow().requests.len(), 0);
 
-        a.send_request(addr_a, addr_b, "test.path", b"hello".to_vec(), now);
+        a.request(addr_a, addr_b, "test.path", b"hello", now);
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -3482,7 +3611,7 @@ mod tests {
 
         assert!(a.is_link_established(&link_id));
 
-        let request_id = a.send_request(addr_a, addr_b, "test.path", b"hello".to_vec(), now);
+        let request_id = a.request(addr_a, addr_b, "test.path", b"hello", now);
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -3522,7 +3651,7 @@ mod tests {
         let _link_id = a.link(addr_b, None, now).unwrap();
         a.poll(now);
 
-        let request_id = a.send_request(addr_a, addr_b, "test.path", b"hello".to_vec(), now);
+        let request_id = a.request(addr_a, addr_b, "test.path", b"hello", now);
         a.poll(now);
 
         // Time out the link
@@ -3570,7 +3699,7 @@ mod tests {
 
         assert!(a.is_link_established(&link_id));
 
-        a.send_request(addr_a, addr_b, "test.path", b"hello".to_vec(), now);
+        a.request(addr_a, addr_b, "test.path", b"hello", now);
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -3661,7 +3790,7 @@ mod tests {
         assert!(a.is_link_established(&link_id));
 
         // First request
-        let request_id_1 = a.send_request(addr_a, addr_b, "echo", b"first".to_vec(), now);
+        let request_id_1 = a.request(addr_a, addr_b, "echo", b"first", now);
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -3676,7 +3805,7 @@ mod tests {
         assert_eq!(state_a.borrow().responses[0].request_id, request_id_1);
 
         // Second request
-        let request_id_2 = a.send_request(addr_a, addr_b, "echo", b"second".to_vec(), now);
+        let request_id_2 = a.request(addr_a, addr_b, "echo", b"second", now);
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -3732,7 +3861,7 @@ mod tests {
         assert!(a.is_link_established(&link_id));
 
         // First request
-        a.send_request(addr_a, addr_b, "echo", b"first".to_vec(), now);
+        a.request(addr_a, addr_b, "echo", b"first", now);
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -3746,7 +3875,7 @@ mod tests {
         );
 
         // Second request on same link
-        a.send_request(addr_a, addr_b, "echo", b"second".to_vec(), now);
+        a.request(addr_a, addr_b, "echo", b"second", now);
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -3760,7 +3889,7 @@ mod tests {
         );
 
         // Third request for good measure
-        a.send_request(addr_a, addr_b, "echo", b"third".to_vec(), now);
+        a.request(addr_a, addr_b, "echo", b"third", now);
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);

@@ -61,7 +61,7 @@ impl Identity {
         out
     }
 
-    pub fn hash(&self) -> [u8; 16] {
+    pub(crate) fn hash(&self) -> [u8; 16] {
         sha256(&self.public_key())[..16].try_into().unwrap()
     }
 }
