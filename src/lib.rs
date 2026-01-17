@@ -19,4 +19,5 @@ pub use interface::{Interface, Transport};
 pub use link::LinkId;
 pub use node::Node;
 pub use packet::Address;
+pub(crate) use request::WireRequestId;
 pub use request::{PathHash, RequestId, path_hash};

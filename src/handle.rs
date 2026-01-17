@@ -6,6 +6,7 @@ use crate::request::RequestId;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestError {
     Timeout,
+    LinkFailed,
     LinkClosed,
     TransferFailed,
 }
@@ -46,7 +47,6 @@ pub(crate) enum PendingAction {
 }
 
 pub struct NodeHandle<'a> {
-    pub(crate) service_address: Address,
     pub(crate) destinations: &'a [Destination],
     pub(crate) pending: Vec<PendingAction>,
 }

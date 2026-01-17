@@ -167,7 +167,8 @@ pub(crate) struct EstablishedLink {
     pub last_keepalive_sent: Option<Instant>,
     pub rtt_ms: Option<u64>,
     keys: LinkKeys,
-    pub(crate) pending_requests: std::collections::HashMap<crate::RequestId, Address>,
+    pub(crate) pending_requests:
+        std::collections::HashMap<crate::WireRequestId, (Address, crate::RequestId)>,
 }
 
 const KEEPALIVE_MAX_SECS: u64 = 360;

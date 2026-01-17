@@ -3,7 +3,12 @@ use serde_bytes::ByteBuf;
 
 use crate::crypto::sha256;
 
-pub type RequestId = [u8; 16];
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RequestId(pub [u8; 16]);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WireRequestId(pub [u8; 16]);
+
 pub type PathHash = [u8; 16];
 
 pub fn path_hash(path: &str) -> PathHash {
@@ -56,21 +61,19 @@ impl Request {
     }
 }
 
-#[derive(Serialize, Deserialize)]
 pub struct Response {
-    pub request_id: RequestId,
-    #[serde(with = "serde_bytes")]
+    pub request_id: WireRequestId,
     pub data: Vec<u8>,
 }
 
 impl Response {
-    pub fn new(request_id: RequestId, data: Vec<u8>) -> Self {
+    pub fn new(request_id: WireRequestId, data: Vec<u8>) -> Self {
         Self { request_id, data }
     }
 
     pub fn encode(&self) -> Vec<u8> {
         rmp_serde::to_vec(&(
-            ByteBuf::from(self.request_id.to_vec()),
+            ByteBuf::from(self.request_id.0.to_vec()),
             ByteBuf::from(self.data.clone()),
         ))
         .unwrap_or_default()
@@ -84,7 +87,7 @@ impl Response {
         let mut request_id = [0u8; 16];
         request_id.copy_from_slice(&request_id_buf);
         Some(Self {
-            request_id,
+            request_id: WireRequestId(request_id),
             data: data_buf.into_vec(),
         })
     }
@@ -105,10 +108,10 @@ mod tests {
 
     #[test]
     fn response_roundtrip() {
-        let resp = Response::new([0xAB; 16], b"world".to_vec());
+        let resp = Response::new(WireRequestId([0xAB; 16]), b"world".to_vec());
         let encoded = resp.encode();
         let decoded = Response::decode(&encoded).unwrap();
-        assert_eq!(decoded.request_id, [0xAB; 16]);
+        assert_eq!(decoded.request_id, WireRequestId([0xAB; 16]));
         assert_eq!(decoded.data, b"world");
     }
 
@@ -147,13 +150,13 @@ mod tests {
         let python_packed =
             hex::decode("92c410ababababababababababababababababc405776f726c64").unwrap();
         let resp = Response::decode(&python_packed).unwrap();
-        assert_eq!(resp.request_id, [0xAB; 16]);
+        assert_eq!(resp.request_id, WireRequestId([0xAB; 16]));
         assert_eq!(resp.data, b"world");
     }
 
     #[test]
     fn response_encode_matches_python() {
-        let resp = Response::new([0xAB; 16], b"world".to_vec());
+        let resp = Response::new(WireRequestId([0xAB; 16]), b"world".to_vec());
         let encoded = resp.encode();
         // Python: 92c410ababababababababababababababababc405776f726c64
         assert_eq!(

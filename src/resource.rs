@@ -14,7 +14,6 @@ pub(crate) enum ResourceStatus {
     Queued,
     Advertised,
     Transferring,
-    AwaitingProof,
 }
 
 pub(crate) struct OutboundResource {
@@ -97,10 +96,6 @@ impl OutboundResource {
         }
     }
 
-    pub fn num_parts(&self) -> usize {
-        self.parts.len()
-    }
-
     pub fn transfer_size(&self) -> usize {
         self.parts.iter().map(|p| p.len()).sum()
     }
@@ -156,10 +151,6 @@ impl OutboundResource {
         self.status = ResourceStatus::Transferring;
     }
 
-    pub fn mark_awaiting_proof(&mut self) {
-        self.status = ResourceStatus::AwaitingProof;
-    }
-
     pub fn verify_proof(&self, proof: &[u8]) -> bool {
         proof == self.expected_proof
     }
@@ -167,14 +158,12 @@ impl OutboundResource {
 
 pub(crate) struct InboundResource {
     pub hash: [u8; 32],
-    pub original_hash: [u8; 32],
     pub random_hash: [u8; 4],
     pub status: ResourceStatus,
     pub compressed: bool,
     pub is_response: bool,
     pub request_id: Option<Vec<u8>>,
     num_parts: usize,
-    transfer_size: usize,
     hashmap: Vec<[u8; MAPHASH_LEN]>,
     hashmap_height: usize,
     parts: Vec<Option<Vec<u8>>>,
@@ -204,14 +193,12 @@ impl InboundResource {
 
         Self {
             hash: adv.hash,
-            original_hash: adv.original_hash,
             random_hash: adv.random_hash,
             status: ResourceStatus::Queued,
             compressed: adv.compressed,
             is_response: adv.is_response,
             request_id: adv.request_id.clone(),
             num_parts: adv.num_parts,
-            transfer_size: adv.transfer_size,
             hashmap,
             hashmap_height,
             parts: vec![None; adv.num_parts],
@@ -221,13 +208,6 @@ impl InboundResource {
             waiting_for_hmu: false,
             consecutive_completed_height: -1,
         }
-    }
-
-    pub fn progress(&self) -> f32 {
-        if self.num_parts == 0 {
-            return 1.0;
-        }
-        self.received_count as f32 / self.num_parts as f32
     }
 
     fn get_map_hash(&self, data: &[u8]) -> [u8; MAPHASH_LEN] {
@@ -286,12 +266,6 @@ impl InboundResource {
         }
         self.hashmap_height += new_hashes.len();
         self.waiting_for_hmu = false;
-    }
-
-    pub fn should_request_next(&self) -> bool {
-        self.outstanding_parts == 0
-            && !self.waiting_for_hmu
-            && self.status == ResourceStatus::Transferring
     }
 
     pub fn needed_hashes(&mut self) -> (Vec<[u8; MAPHASH_LEN]>, bool) {
