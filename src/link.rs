@@ -66,8 +66,9 @@ impl LinkProof {
         responder_signing_key: &SigningKey,
     ) -> Self {
         // signed_data = link_id + pub_bytes + sig_pub_bytes + signalling_bytes
-        // For now, use default signalling_bytes (MTU 500, mode 0)
-        let signalling_bytes = [0x01, 0xf4, 0x00]; // MTU=500, mode=0
+        // signalling_value = (mtu & 0x1FFFFF) + (((mode << 5) & 0xE0) << 16)
+        // MTU=500, mode=1 (AES_256_CBC) -> 0x2001F4 -> [0x20, 0x01, 0xF4]
+        let signalling_bytes = [0x20, 0x01, 0xF4]; // MTU=500, mode=1 (AES_256_CBC)
         let mut sign_data = Vec::with_capacity(83);
         sign_data.extend_from_slice(link_id);
         sign_data.extend_from_slice(responder_encryption_public.as_bytes());
