@@ -34,6 +34,10 @@ pub(crate) enum PendingAction {
         path: String,
         data: Vec<u8>,
     },
+    Respond {
+        request_id: RequestId,
+        data: Vec<u8>,
+    },
     Announce {
         app_data: Option<Vec<u8>>,
     },
@@ -71,6 +75,13 @@ impl NodeHandle<'_> {
         });
     }
 
+    pub fn respond(&mut self, request_id: RequestId, data: &[u8]) {
+        self.pending.push(PendingAction::Respond {
+            request_id,
+            data: data.to_vec(),
+        });
+    }
+
     pub fn destinations(&self) -> impl Iterator<Item = &Destination> {
         self.destinations.iter()
     }
@@ -94,8 +105,7 @@ pub trait Service {
         from: Address,
         path: &str,
         data: &[u8],
-    ) -> Option<Vec<u8>> {
-        None
+    ) {
     }
 
     #[allow(unused_variables)]

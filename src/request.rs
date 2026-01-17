@@ -11,7 +11,7 @@ pub struct WireRequestId(pub [u8; 16]);
 
 pub type PathHash = [u8; 16];
 
-pub fn path_hash(path: &str) -> PathHash {
+pub(crate) fn path_hash(path: &str) -> PathHash {
     let hash = sha256(path.as_bytes());
     hash[..16].try_into().unwrap()
 }

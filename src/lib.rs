@@ -24,8 +24,11 @@ pub use interface::{Interface, Transport};
 pub use link::LinkId;
 pub use node::Node;
 pub use packet::Address;
+pub use request::RequestId;
 pub(crate) use request::WireRequestId;
-pub use request::{PathHash, RequestId, path_hash};
 
 #[cfg(feature = "tokio")]
-pub use async_io::{AsyncNode, AsyncTransport, IncomingRequest};
+pub use async_io::{
+    AsyncNode, AsyncTransport, Destination as AsyncDestination, IncomingRaw, IncomingRequest,
+    ServiceHandle,
+};

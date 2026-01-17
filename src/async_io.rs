@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::handle::RequestError;
+use crate::handle::{RequestError, RespondError};
 use crate::packet::Address;
 use crate::request::RequestId;
 use crate::transports::tcp::{HDLC_FLAG, hdlc_escape, hdlc_unescape};
@@ -94,23 +94,32 @@ pub struct IncomingRequest {
     pub data: Vec<u8>,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
-pub struct PathTimeout;
+pub struct IncomingRaw {
+    pub from: Address,
+    pub data: Vec<u8>,
+}
+
+pub struct Destination {
+    pub address: Address,
+    pub app_data: Option<Vec<u8>>,
+    pub hops: u8,
+}
 
 type RequestWaiters =
     Arc<Mutex<HashMap<RequestId, oneshot::Sender<Result<Vec<u8>, RequestError>>>>>;
-type PathWaiters = Arc<Mutex<HashMap<Address, oneshot::Sender<()>>>>;
+type RespondWaiters = Arc<Mutex<HashMap<RequestId, oneshot::Sender<Result<(), RespondError>>>>>;
 
-struct ChannelService {
+struct BridgeService {
     name: String,
     paths: Vec<String>,
     request_tx: mpsc::UnboundedSender<IncomingRequest>,
+    raw_tx: mpsc::UnboundedSender<IncomingRaw>,
     request_waiters: RequestWaiters,
-    path_waiters: PathWaiters,
+    respond_waiters: RespondWaiters,
+    destinations_tx: mpsc::UnboundedSender<Vec<Destination>>,
 }
 
-impl Service for ChannelService {
+impl Service for BridgeService {
     fn name(&self) -> &str {
         &self.name
     }
@@ -126,14 +135,13 @@ impl Service for ChannelService {
         from: Address,
         path: &str,
         data: &[u8],
-    ) -> Option<Vec<u8>> {
+    ) {
         let _ = self.request_tx.send(IncomingRequest {
             request_id,
             from,
             path: path.to_string(),
             data: data.to_vec(),
         });
-        None
     }
 
     fn on_request_result(
@@ -148,136 +156,295 @@ impl Service for ChannelService {
         }
     }
 
-    fn on_raw(&mut self, _handle: &mut NodeHandle, _from: Address, _data: &[u8]) {}
-
-    fn on_destinations_changed(&mut self, handle: &mut NodeHandle) {
-        let mut waiters = self.path_waiters.lock().unwrap();
-        let known: std::collections::HashSet<Address> =
-            handle.destinations().map(|d| d.address).collect();
-        let found: Vec<Address> = waiters
-            .keys()
-            .filter(|addr| known.contains(*addr))
-            .copied()
-            .collect();
-        for addr in found {
-            if let Some(tx) = waiters.remove(&addr) {
-                let _ = tx.send(());
-            }
+    fn on_respond_result(
+        &mut self,
+        _handle: &mut NodeHandle,
+        request_id: RequestId,
+        result: Result<(), RespondError>,
+    ) {
+        let mut waiters = self.respond_waiters.lock().unwrap();
+        if let Some(tx) = waiters.remove(&request_id) {
+            let _ = tx.send(result);
         }
     }
+
+    fn on_raw(&mut self, _handle: &mut NodeHandle, from: Address, data: &[u8]) {
+        let _ = self.raw_tx.send(IncomingRaw {
+            from,
+            data: data.to_vec(),
+        });
+    }
+
+    fn on_destinations_changed(&mut self, handle: &mut NodeHandle) {
+        let destinations: Vec<Destination> = handle
+            .destinations()
+            .map(|d| Destination {
+                address: d.address,
+                app_data: d.app_data.clone(),
+                hops: d.hops,
+            })
+            .collect();
+        let _ = self.destinations_tx.send(destinations);
+    }
+}
+
+enum Command {
+    Announce {
+        service_addr: Address,
+        app_data: Option<Vec<u8>>,
+    },
+    Request {
+        service_addr: Address,
+        dest: Address,
+        path: String,
+        data: Vec<u8>,
+        reply: oneshot::Sender<RequestId>,
+    },
+    Respond {
+        request_id: RequestId,
+        data: Vec<u8>,
+    },
+    SendRaw {
+        dest: Address,
+        data: Vec<u8>,
+    },
+    GetDestinations {
+        reply: oneshot::Sender<Vec<Destination>>,
+    },
 }
 
 pub struct AsyncNode {
-    node: crate::Node<AsyncTransport, ChannelService>,
-    service_addr: Address,
+    node: crate::Node<AsyncTransport, BridgeService>,
+    command_tx: mpsc::UnboundedSender<Command>,
+    command_rx: mpsc::UnboundedReceiver<Command>,
     wake_tx: mpsc::Sender<()>,
     wake_rx: mpsc::Receiver<()>,
-    request_rx: mpsc::UnboundedReceiver<IncomingRequest>,
-    request_waiters: RequestWaiters,
-    path_waiters: PathWaiters,
 }
 
 impl AsyncNode {
-    pub fn new(name: &str, paths: &[&str], identity: &Identity, transport_enabled: bool) -> Self {
+    pub fn new(transport: bool) -> Self {
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (wake_tx, wake_rx) = mpsc::channel(16);
+
+        Self {
+            node: crate::Node::new(transport),
+            command_tx,
+            command_rx,
+            wake_tx,
+            wake_rx,
+        }
+    }
+
+    pub fn add_service(
+        &mut self,
+        name: &str,
+        paths: &[&str],
+        identity: &Identity,
+    ) -> ServiceHandle {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (raw_tx, raw_rx) = mpsc::unbounded_channel();
+        let (destinations_tx, destinations_rx) = mpsc::unbounded_channel();
         let request_waiters: RequestWaiters = Arc::new(Mutex::new(HashMap::new()));
-        let path_waiters: PathWaiters = Arc::new(Mutex::new(HashMap::new()));
+        let respond_waiters: RespondWaiters = Arc::new(Mutex::new(HashMap::new()));
 
-        let mut node = crate::Node::new(transport_enabled);
-
-        let service = ChannelService {
+        let service = BridgeService {
             name: name.to_string(),
             paths: paths.iter().map(|s| s.to_string()).collect(),
             request_tx,
+            raw_tx,
             request_waiters: request_waiters.clone(),
-            path_waiters: path_waiters.clone(),
+            respond_waiters: respond_waiters.clone(),
+            destinations_tx,
         };
-        let service_addr = node.add_service(service, identity);
 
-        Self {
-            node,
-            service_addr,
-            wake_tx,
-            wake_rx,
+        let service_addr = self.node.add_service(service, identity);
+
+        ServiceHandle {
+            address: service_addr,
+            command_tx: self.command_tx.clone(),
             request_rx,
+            raw_rx,
+            destinations_rx,
             request_waiters,
-            path_waiters,
+            respond_waiters,
         }
     }
 
-    pub fn service_addr(&self) -> Address {
-        self.service_addr
+    pub fn add_interface(&mut self, transport: AsyncTransport) {
+        self.node.add_interface(Interface::new(transport));
     }
 
-    pub fn destinations(&self) -> Vec<Address> {
-        self.node.known_destinations()
+    pub fn send_raw(&self, dest: Address, data: &[u8]) {
+        let _ = self.command_tx.send(Command::SendRaw {
+            dest,
+            data: data.to_vec(),
+        });
     }
 
-    pub fn announce(&mut self) {
-        self.node.announce(self.service_addr, Instant::now());
+    pub async fn destinations(&self) -> Vec<Destination> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self
+            .command_tx
+            .send(Command::GetDestinations { reply: reply_tx });
+        reply_rx.await.unwrap_or_default()
     }
 
-    pub async fn request(
-        &mut self,
-        destination: Address,
-        path: &str,
-        data: &[u8],
-    ) -> Result<Vec<u8>, RequestError> {
-        let request_id =
-            self.node
-                .request(self.service_addr, destination, path, data, Instant::now());
-
-        let (tx, rx) = oneshot::channel();
-        self.request_waiters.lock().unwrap().insert(request_id, tx);
-
-        tokio::pin!(rx);
-
-        loop {
-            let now = Instant::now();
-            let timeout = self.node.poll(now);
-            let sleep_duration = timeout.unwrap_or(Duration::from_secs(60));
-
-            tokio::select! {
-                biased;
-                result = &mut rx => {
-                    return result.unwrap_or(Err(RequestError::LinkFailed));
-                }
-                _ = self.wake_rx.recv() => {}
-                _ = tokio::time::sleep(sleep_duration) => {}
-            }
-        }
-    }
-
-    pub async fn recv_request(&mut self) -> IncomingRequest {
-        loop {
-            let now = Instant::now();
-            let timeout = self.node.poll(now);
-            let sleep_duration = timeout.unwrap_or(Duration::from_secs(60));
-
-            tokio::select! {
-                biased;
-                Some(req) = self.request_rx.recv() => {
-                    return req;
-                }
-                _ = self.wake_rx.recv() => {}
-                _ = tokio::time::sleep(sleep_duration) => {}
-            }
-        }
+    pub fn add_tcp_stream(&mut self, stream: TcpStream) {
+        let (transport, inbox, outbox, connected) = AsyncTransport::new_pair();
+        self.node.add_interface(Interface::new(transport));
+        let wake_tx = self.wake_tx.clone();
+        tokio::spawn(tcp_io_task(stream, inbox, outbox, connected, wake_tx));
     }
 
     pub async fn connect(&mut self, addr: &str) -> std::io::Result<()> {
         let stream = TcpStream::connect(addr).await?;
-        self.add_stream(stream);
+        self.add_tcp_stream(stream);
         Ok(())
     }
 
-    pub fn add_stream(&mut self, stream: TcpStream) {
-        let (transport, inbox, outbox, connected) = AsyncTransport::new_pair();
-        self.node.add_interface(Interface::new(transport));
+    pub async fn run(mut self) {
+        loop {
+            let now = Instant::now();
+            let timeout = self.node.poll(now);
+            let sleep_duration = timeout.unwrap_or(Duration::from_secs(60));
 
-        let wake_tx = self.wake_tx.clone();
-        tokio::spawn(tcp_io_task(stream, inbox, outbox, connected, wake_tx));
+            tokio::select! {
+                biased;
+                Some(cmd) = self.command_rx.recv() => {
+                    self.handle_command(cmd, now);
+                }
+                _ = self.wake_rx.recv() => {}
+                _ = tokio::time::sleep(sleep_duration) => {}
+            }
+        }
+    }
+
+    fn handle_command(&mut self, cmd: Command, now: Instant) {
+        match cmd {
+            Command::Announce {
+                service_addr,
+                app_data,
+            } => {
+                if let Some(data) = app_data {
+                    self.node
+                        .announce_with_app_data(service_addr, Some(data), now);
+                } else {
+                    self.node.announce(service_addr, now);
+                }
+            }
+            Command::Request {
+                service_addr,
+                dest,
+                path,
+                data,
+                reply,
+            } => {
+                let request_id = self.node.request(service_addr, dest, &path, &data, now);
+                let _ = reply.send(request_id);
+            }
+            Command::Respond { request_id, data } => {
+                self.node.respond(request_id, &data, now);
+            }
+            Command::SendRaw { dest, data } => {
+                self.node.send_raw(dest, &data, now);
+            }
+            Command::GetDestinations { reply } => {
+                let destinations: Vec<Destination> = self
+                    .node
+                    .known_destinations()
+                    .iter()
+                    .map(|addr| Destination {
+                        address: *addr,
+                        app_data: None,
+                        hops: 0,
+                    })
+                    .collect();
+                let _ = reply.send(destinations);
+            }
+        }
+    }
+}
+
+pub struct ServiceHandle {
+    address: Address,
+    command_tx: mpsc::UnboundedSender<Command>,
+    request_rx: mpsc::UnboundedReceiver<IncomingRequest>,
+    raw_rx: mpsc::UnboundedReceiver<IncomingRaw>,
+    destinations_rx: mpsc::UnboundedReceiver<Vec<Destination>>,
+    request_waiters: RequestWaiters,
+    respond_waiters: RespondWaiters,
+}
+
+impl ServiceHandle {
+    pub fn address(&self) -> Address {
+        self.address
+    }
+
+    pub fn announce(&self) {
+        let _ = self.command_tx.send(Command::Announce {
+            service_addr: self.address,
+            app_data: None,
+        });
+    }
+
+    pub fn announce_with_app_data(&self, app_data: &[u8]) {
+        let _ = self.command_tx.send(Command::Announce {
+            service_addr: self.address,
+            app_data: Some(app_data.to_vec()),
+        });
+    }
+
+    pub async fn request(
+        &self,
+        dest: Address,
+        path: &str,
+        data: &[u8],
+    ) -> Result<Vec<u8>, RequestError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::Request {
+            service_addr: self.address,
+            dest,
+            path: path.to_string(),
+            data: data.to_vec(),
+            reply: reply_tx,
+        });
+
+        let request_id = reply_rx.await.map_err(|_| RequestError::LinkFailed)?;
+
+        let (waiter_tx, waiter_rx) = oneshot::channel();
+        self.request_waiters
+            .lock()
+            .unwrap()
+            .insert(request_id, waiter_tx);
+
+        waiter_rx.await.unwrap_or(Err(RequestError::LinkFailed))
+    }
+
+    pub async fn respond(&self, request_id: RequestId, data: &[u8]) -> Result<(), RespondError> {
+        let (waiter_tx, waiter_rx) = oneshot::channel();
+        self.respond_waiters
+            .lock()
+            .unwrap()
+            .insert(request_id, waiter_tx);
+
+        let _ = self.command_tx.send(Command::Respond {
+            request_id,
+            data: data.to_vec(),
+        });
+
+        waiter_rx.await.unwrap_or(Err(RespondError::LinkClosed))
+    }
+
+    pub async fn recv_request(&mut self) -> Option<IncomingRequest> {
+        self.request_rx.recv().await
+    }
+
+    pub async fn recv_raw(&mut self) -> Option<IncomingRaw> {
+        self.raw_rx.recv().await
+    }
+
+    pub async fn recv_destinations_changed(&mut self) -> Option<Vec<Destination>> {
+        self.destinations_rx.recv().await
     }
 }
 

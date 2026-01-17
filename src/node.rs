@@ -143,7 +143,7 @@ pub struct Node<T, S, R = ThreadRng> {
     >,
     inbound_resources: HashMap<[u8; 32], (LinkId, crate::resource::InboundResource)>,
     pending_resource_adverts: HashMap<[u8; 32], (LinkId, crate::resource::ResourceAdvertisement)>,
-    inbound_request_links: HashMap<RequestId, (WireRequestId, LinkId)>,
+    inbound_request_links: HashMap<RequestId, (WireRequestId, LinkId, usize)>,
     destination_links: HashMap<Address, LinkId>,
     pending_outbound_requests: HashMap<Address, Vec<(Address, RequestId, String, Vec<u8>)>>,
     pending_path_requests: HashMap<Address, Instant>,
@@ -245,34 +245,18 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
     where
         F: FnOnce(&mut S, &mut NodeHandle),
     {
-        self.dispatch_to_service_with_result(service_idx, now, |service, handle| {
-            f(service, handle);
-        });
-    }
-
-    fn dispatch_to_service_with_result<F, Ret>(
-        &mut self,
-        service_idx: usize,
-        now: Instant,
-        f: F,
-    ) -> Ret
-    where
-        F: FnOnce(&mut S, &mut NodeHandle) -> Ret,
-        Ret: Default,
-    {
         let destinations = self.build_destinations();
-        let (pending, result) = {
+        let pending = {
             let Node { services, .. } = self;
             let entry = &mut services[service_idx];
             let mut handle = NodeHandle {
                 destinations: &destinations,
                 pending: Vec::new(),
             };
-            let result = f(&mut entry.service, &mut handle);
-            (handle.pending, result)
+            f(&mut entry.service, &mut handle);
+            handle.pending
         };
         self.process_pending_actions(service_idx, pending, now);
-        result
     }
 
     fn process_pending_actions(
@@ -301,6 +285,9 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     } else {
                         self.announce(service_addr, now);
                     }
+                }
+                PendingAction::Respond { request_id, data } => {
+                    self.send_response(request_id, data, now);
                 }
             }
         }
@@ -360,6 +347,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         local_request_id
     }
 
+    pub fn respond(&mut self, request_id: RequestId, data: &[u8], now: Instant) {
+        self.send_response(request_id, data.to_vec(), now);
+    }
+
     fn send_request_inner(
         &mut self,
         service_addr: Address,
@@ -405,16 +396,11 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         }
     }
 
-    fn send_response(
-        &mut self,
-        service_idx: usize,
-        request_id: RequestId,
-        data: Vec<u8>,
-        now: Instant,
-    ) {
+    fn send_response(&mut self, request_id: RequestId, data: Vec<u8>, now: Instant) {
         use crate::packet::LinkDataDestination;
 
-        if let Some((wire_request_id, link_id)) = self.inbound_request_links.remove(&request_id)
+        if let Some((wire_request_id, link_id, service_idx)) =
+            self.inbound_request_links.remove(&request_id)
             && let Some(link) = self.established_links.get(&link_id)
         {
             if data.len() <= LINK_MDU {
@@ -493,17 +479,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     data,
                 } => {
                     self.inbound_request_links
-                        .insert(request_id, (wire_request_id, link_id));
-                    let response = self.dispatch_to_service_with_result(
-                        service_idx,
-                        now,
-                        |service, handle| {
-                            service.on_request(handle, request_id, from, &path, &data)
-                        },
-                    );
-                    if let Some(response_data) = response {
-                        self.send_response(service_idx, request_id, response_data, now);
-                    }
+                        .insert(request_id, (wire_request_id, link_id, service_idx));
+                    self.dispatch_to_service(service_idx, now, |service, handle| {
+                        service.on_request(handle, request_id, from, &path, &data);
+                    });
                 }
                 ServiceNotification::RequestResult {
                     service_idx,
@@ -2446,19 +2425,21 @@ mod tests {
 
         fn on_request(
             &mut self,
-            _handle: &mut NodeHandle,
+            handle: &mut NodeHandle,
             request_id: RequestId,
             from: Address,
             path: &str,
             data: &[u8],
-        ) -> Option<Vec<u8>> {
+        ) {
             self.state.borrow_mut().requests.push(ReceivedRequest {
                 request_id,
                 from,
                 path: path.to_string(),
                 data: data.to_vec(),
             });
-            self.auto_response.clone()
+            if let Some(ref response) = self.auto_response {
+                handle.respond(request_id, response);
+            }
         }
 
         fn on_request_result(
