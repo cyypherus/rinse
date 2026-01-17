@@ -24,6 +24,7 @@ const DEFAULT_RETRY_DELAY_MS: u64 = 4000;
 const LOCAL_REBROADCASTS_MAX: u8 = 2;
 const PATHFINDER_RW_MS: u64 = 500;
 
+#[derive(Debug)]
 pub enum InboundMessage {
     LinkEstablished {
         link_id: LinkId,
@@ -72,6 +73,12 @@ pub enum InboundMessage {
 }
 
 pub enum OutboundMessage {
+    Link {
+        destination: Address,
+    },
+    CloseLink {
+        link_id: LinkId,
+    },
     LinkData {
         link_id: LinkId,
         data: Vec<u8>,
@@ -399,7 +406,12 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
     // "When a node in the network wants to establish verified connectivity with another node,
     // it will randomly generate a new X25519 private/public key pair. It then creates a
     // link request packet, and broadcast it."
-    pub fn link(&mut self, destination: Address, now: Instant) -> Option<LinkId> {
+    pub(crate) fn link(
+        &mut self,
+        destination: Address,
+        initiating_service: Option<Address>,
+        now: Instant,
+    ) -> Option<LinkId> {
         // Must have path to this destination
         let path_entry = self.path_table.get(&destination)?;
         let target_interface = path_entry.receiving_interface;
@@ -432,6 +444,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 initiator_encryption_secret: ephemeral.secret,
                 destination,
                 request_time: now,
+                initiating_service,
             },
         );
 
@@ -1073,6 +1086,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 }
 
                 // Establish the link using the responder's public key from the proof
+                let initiating_service = pending.initiating_service;
                 let link = EstablishedLink::from_initiator(pending, &proof.encryption_public, now);
                 let rtt_secs = link.rtt_seconds();
 
@@ -1082,6 +1096,19 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 if let Some(rtt) = rtt_secs {
                     let rtt_data = crate::link::encode_rtt(rtt);
                     self.send_link_packet(destination_hash, LinkContext::LinkRtt, &rtt_data, now);
+                }
+
+                // Notify initiating service
+                if let Some(service_addr) = initiating_service {
+                    if let Some(service_idx) =
+                        self.services.iter().position(|s| s.address == service_addr)
+                    {
+                        self.services[service_idx].service.inbound(
+                            InboundMessage::LinkEstablished {
+                                link_id: destination_hash,
+                            },
+                        );
+                    }
                 }
 
                 log::debug!(
@@ -1717,6 +1744,12 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
         for (service_addr, msg) in messages {
             match msg {
+                OutboundMessage::Link { destination } => {
+                    self.link(destination, Some(service_addr), now);
+                }
+                OutboundMessage::CloseLink { link_id } => {
+                    self.close_link(link_id, now);
+                }
                 OutboundMessage::LinkData { link_id, data } => {
                     if let Some(link) = self.established_links.get(&link_id) {
                         let ciphertext = link.encrypt(&mut self.rng, &data);
@@ -2074,7 +2107,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let link_id = a.link(addr_b, now).expect("link should be created");
+        let link_id = a.link(addr_b, None, now).expect("link should be created");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -2107,7 +2140,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(later);
 
-        let link_id = a.link(addr_c, later).expect("link should be created");
+        let link_id = a.link(addr_c, None, later).expect("link should be created");
         a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(later);
@@ -2137,7 +2170,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(addr_b, None, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -2149,7 +2182,16 @@ mod tests {
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
 
-        assert_eq!(b.services[0].service.inbox.len(), 1);
+        // B receives LinkEstablished + LinkData
+        assert_eq!(b.services[0].service.inbox.len(), 2);
+        assert!(matches!(
+            &b.services[0].service.inbox[0],
+            InboundMessage::LinkEstablished { .. }
+        ));
+        assert!(matches!(
+            &b.services[0].service.inbox[1],
+            InboundMessage::LinkData { .. }
+        ));
     }
 
     #[test]
@@ -2174,7 +2216,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(later);
 
-        let link_id = a.link(addr_c, later).unwrap();
+        let link_id = a.link(addr_c, None, later).unwrap();
         a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(later);
@@ -2192,7 +2234,12 @@ mod tests {
         transfer(&mut b, 1, &mut c, 0);
         c.poll(later);
 
-        assert_eq!(c.services[0].service.inbox.len(), 1);
+        // C receives LinkEstablished + LinkData
+        assert_eq!(c.services[0].service.inbox.len(), 2);
+        assert!(matches!(
+            &c.services[0].service.inbox[0],
+            InboundMessage::LinkEstablished { .. }
+        ));
     }
 
     #[test]
@@ -2288,7 +2335,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(addr_b, None, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -2307,8 +2354,13 @@ mod tests {
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
 
-        assert_eq!(b.services[0].service.inbox.len(), 1);
-        let (req_link_id, req_id) = match &b.services[0].service.inbox[0] {
+        // B receives LinkEstablished + Request
+        assert_eq!(b.services[0].service.inbox.len(), 2);
+        assert!(matches!(
+            &b.services[0].service.inbox[0],
+            InboundMessage::LinkEstablished { .. }
+        ));
+        let (req_link_id, req_id) = match &b.services[0].service.inbox[1] {
             InboundMessage::Request {
                 link_id,
                 request_id,
@@ -2333,6 +2385,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
+        // A only receives Response (no LinkEstablished since A initiated with None)
         assert_eq!(a.services[0].service.inbox.len(), 1);
         assert!(matches!(
             &a.services[0].service.inbox[0],
@@ -2363,7 +2416,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(later);
 
-        let link_id = a.link(addr_c, later).unwrap();
+        let link_id = a.link(addr_c, None, later).unwrap();
         a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(later);
@@ -2388,8 +2441,13 @@ mod tests {
         transfer(&mut b, 1, &mut c, 0);
         c.poll(later);
 
-        assert_eq!(c.services[0].service.inbox.len(), 1);
-        let (req_link_id, req_id) = match &c.services[0].service.inbox[0] {
+        // C receives LinkEstablished + Request
+        assert_eq!(c.services[0].service.inbox.len(), 2);
+        assert!(matches!(
+            &c.services[0].service.inbox[0],
+            InboundMessage::LinkEstablished { .. }
+        ));
+        let (req_link_id, req_id) = match &c.services[0].service.inbox[1] {
             InboundMessage::Request {
                 link_id,
                 request_id,
@@ -2439,7 +2497,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(addr_b, None, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -2470,14 +2528,18 @@ mod tests {
             b.pending_resource_adverts.len()
         );
 
+        // B receives LinkEstablished + ResourceAdvertised
         assert!(b.services[0].service.inbox.iter().any(|m| matches!(
             m,
             InboundMessage::ResourceAdvertised { size, .. } if *size > 0
         )));
 
-        let hash = match &b.services[0].service.inbox[0] {
+        let hash = match &b.services[0].service.inbox[1] {
             InboundMessage::ResourceAdvertised { hash, .. } => *hash,
-            _ => panic!("expected ResourceAdvertised"),
+            _ => panic!(
+                "expected ResourceAdvertised, got {:?}",
+                &b.services[0].service.inbox[1]
+            ),
         };
 
         b.services[0]
@@ -2523,7 +2585,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(addr_b, None, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -2570,7 +2632,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(addr_b, None, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -2665,7 +2727,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(addr_b, None, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -2705,7 +2767,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(addr_b, None, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -2811,7 +2873,7 @@ mod tests {
         );
 
         // A establishes link to B
-        let link_id = a.link(addr_b, now).expect("should create link");
+        let link_id = a.link(addr_b, None, now).expect("should create link");
         a.poll(now);
         println!(
             "A outbox after link request: {}",

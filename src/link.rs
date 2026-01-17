@@ -145,6 +145,7 @@ pub(crate) struct PendingLink {
     pub initiator_encryption_secret: StaticSecret,
     pub destination: Address,
     pub request_time: Instant,
+    pub initiating_service: Option<Address>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,9 +350,9 @@ mod tests {
         let pending = PendingLink {
             link_id,
             initiator_encryption_secret: initiator_keypair.secret,
-
             destination: dest,
             request_time: now,
+            initiating_service: None,
         };
 
         let initiator_link =
@@ -405,6 +406,7 @@ mod tests {
             initiator_encryption_secret: initiator_enc.secret,
             destination: dest,
             request_time: now,
+            initiating_service: None,
         };
         let initiator_link = EstablishedLink::from_initiator(pending, &responder_enc.public, now);
 
@@ -462,9 +464,9 @@ mod tests {
         let pending = PendingLink {
             link_id,
             initiator_encryption_secret: initiator_keypair.secret,
-
             destination: dest,
             request_time,
+            initiating_service: None,
         };
 
         let link = EstablishedLink::from_initiator(pending, &responder_keypair.public, proof_time);
@@ -485,9 +487,9 @@ mod tests {
         let pending = PendingLink {
             link_id,
             initiator_encryption_secret: initiator_keypair.secret,
-
             destination: dest,
             request_time: now,
+            initiating_service: None,
         };
 
         let mut link = EstablishedLink::from_initiator(pending, &responder_keypair.public, now);
