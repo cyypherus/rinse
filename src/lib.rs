@@ -4,6 +4,7 @@
 mod announce;
 mod crypto;
 mod handle;
+mod identity;
 mod interface;
 mod link;
 mod node;
@@ -15,6 +16,7 @@ mod resource;
 pub mod transports;
 
 pub use handle::{Destination, NodeHandle, RequestError, RespondError, Service};
+pub use identity::Identity;
 pub use interface::{Interface, Transport};
 pub use link::LinkId;
 pub use node::Node;

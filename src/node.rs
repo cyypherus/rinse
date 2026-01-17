@@ -614,28 +614,19 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         log::debug!("Closed link <{}>", hex::encode(link_id));
     }
 
-    pub fn add_service(&mut self, service: S) -> Address {
+    pub fn add_service(&mut self, service: S, identity: &crate::identity::Identity) -> Address {
         let name = service.name();
         let name_hash: [u8; 10] = sha256(name.as_bytes())[..10].try_into().unwrap();
 
-        let mut enc_bytes = [0u8; 32];
-        self.rng.fill_bytes(&mut enc_bytes);
-        let encryption_secret = StaticSecret::from(enc_bytes);
-        let encryption_public = X25519Public::from(&encryption_secret);
+        let encryption_secret = StaticSecret::from(*identity.encryption_secret.as_bytes());
+        let encryption_public = identity.encryption_public;
+        let signing_key = SigningKey::from_bytes(identity.signing_key.as_bytes());
 
-        let mut sig_bytes = [0u8; 32];
-        self.rng.fill_bytes(&mut sig_bytes);
-        let signing_key = SigningKey::from_bytes(&sig_bytes);
-
-        // Compute address: hash(name_hash || identity_hash)
-        let mut public_key = [0u8; 64];
-        public_key[..32].copy_from_slice(encryption_public.as_bytes());
-        public_key[32..].copy_from_slice(signing_key.verifying_key().as_bytes());
-        let identity_hash = &sha256(&public_key)[..16];
+        let identity_hash = identity.hash();
 
         let mut hash_material = Vec::new();
         hash_material.extend_from_slice(&name_hash);
-        hash_material.extend_from_slice(identity_hash);
+        hash_material.extend_from_slice(&identity_hash);
         let address: Address = sha256(&hash_material)[..16].try_into().unwrap();
 
         log::info!(
@@ -2381,6 +2372,12 @@ mod tests {
         TestService::new(name)
     }
 
+    fn id(seed: u64) -> crate::identity::Identity {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        crate::identity::Identity::generate(&mut rng)
+    }
+
     #[test]
     fn announce_two_nodes() {
         let mut a: TestNode = Node::new(true);
@@ -2388,7 +2385,7 @@ mod tests {
         a.add_interface(test_interface());
         b.add_interface(test_interface());
 
-        let addr = a.add_service(svc("test"));
+        let addr = a.add_service(svc("test"), &id(1));
         let now = Instant::now();
 
         a.announce(addr, now);
@@ -2409,7 +2406,7 @@ mod tests {
         b.add_interface(test_interface());
         c.add_interface(test_interface());
 
-        let addr = a.add_service(svc("test"));
+        let addr = a.add_service(svc("test"), &id(1));
         let now = Instant::now();
         let later = now + std::time::Duration::from_secs(1);
 
@@ -2433,7 +2430,7 @@ mod tests {
         b.add_interface(test_interface());
         b.add_interface(test_interface());
 
-        let addr = a.add_service(svc("test"));
+        let addr = a.add_service(svc("test"), &id(1));
         let now = Instant::now();
 
         a.announce(addr, now);
@@ -2452,7 +2449,7 @@ mod tests {
         a.add_interface(test_interface());
         b.add_interface(test_interface());
 
-        let addr_b = b.add_service(svc("server"));
+        let addr_b = b.add_service(svc("server"), &id(1));
         let now = Instant::now();
 
         b.announce(addr_b, now);
@@ -2481,7 +2478,7 @@ mod tests {
         b.add_interface(test_interface());
         c.add_interface(test_interface());
 
-        let addr_c = c.add_service(svc("server"));
+        let addr_c = c.add_service(svc("server"), &id(1));
         let now = Instant::now();
         let later = now + std::time::Duration::from_secs(1);
 
@@ -2517,7 +2514,7 @@ mod tests {
 
         let svc_b = svc("server");
         let state_b = svc_b.state();
-        let addr_b = b.add_service(svc_b);
+        let addr_b = b.add_service(svc_b, &id(1));
         let now = Instant::now();
 
         b.announce(addr_b, now);
@@ -2555,7 +2552,7 @@ mod tests {
 
         let svc_c = svc("server");
         let state_c = svc_c.state();
-        let addr_c = c.add_service(svc_c);
+        let addr_c = c.add_service(svc_c, &id(1));
         let now = Instant::now();
         let later = now + std::time::Duration::from_secs(1);
 
@@ -2600,13 +2597,13 @@ mod tests {
 
         let svc_a = svc("client");
         let state_a = svc_a.state();
-        let addr_a = a.add_service(svc_a);
+        let addr_a = a.add_service(svc_a, &id(1));
 
         let svc_b = svc("server")
             .with_paths(&["test.path"])
             .with_auto_response(b"response data".to_vec());
         let state_b = svc_b.state();
-        let addr_b = b.add_service(svc_b);
+        let addr_b = b.add_service(svc_b, &id(1));
         let now = Instant::now();
 
         b.announce(addr_b, now);
@@ -2666,13 +2663,13 @@ mod tests {
 
         let svc_a = svc("client");
         let state_a = svc_a.state();
-        let addr_a = a.add_service(svc_a);
+        let addr_a = a.add_service(svc_a, &id(1));
 
         let svc_c = svc("server")
             .with_paths(&["test.path"])
             .with_auto_response(b"response data".to_vec());
         let state_c = svc_c.state();
-        let addr_c = c.add_service(svc_c);
+        let addr_c = c.add_service(svc_c, &id(1));
         let now = Instant::now();
         let later = now + std::time::Duration::from_secs(1);
 
@@ -2744,11 +2741,11 @@ mod tests {
 
         let svc_a = svc("client");
         let state_a = svc_a.state();
-        let addr_a = a.add_service(svc_a);
+        let addr_a = a.add_service(svc_a, &id(1));
 
         let svc_b = svc("server").with_auto_response(large_response.clone());
         let state_b = svc_b.state();
-        let addr_b = b.add_service(svc_b);
+        let addr_b = b.add_service(svc_b, &id(1));
         let now = Instant::now();
 
         b.announce(addr_b, now);
@@ -2830,12 +2827,12 @@ mod tests {
 
         let svc_a = svc("client");
         let state_a = svc_a.state();
-        let addr_a = a.add_service(svc_a);
+        let addr_a = a.add_service(svc_a, &id(1));
 
         let svc_b = svc("server")
             .with_paths(&["test.path"])
             .with_auto_response(large_response.clone());
-        let addr_b = b.add_service(svc_b);
+        let addr_b = b.add_service(svc_b, &id(1));
         let now = Instant::now();
 
         // Establish link
@@ -2886,12 +2883,12 @@ mod tests {
 
         let svc_a = svc("client");
         let state_a = svc_a.state();
-        let addr_a = a.add_service(svc_a);
+        let addr_a = a.add_service(svc_a, &id(1));
 
         let svc_c = svc("server")
             .with_paths(&["test.path"])
             .with_auto_response(large_response.clone());
-        let addr_c = c.add_service(svc_c);
+        let addr_c = c.add_service(svc_c, &id(1));
         let now = Instant::now();
         let later = now + std::time::Duration::from_secs(1);
 
@@ -2947,7 +2944,7 @@ mod tests {
         a.add_interface(test_interface());
         b.add_interface(test_interface());
 
-        let addr_b = b.add_service(svc("server"));
+        let addr_b = b.add_service(svc("server"), &id(1));
         let now = Instant::now();
 
         b.announce(addr_b, now);
@@ -2994,7 +2991,7 @@ mod tests {
         a.add_interface(test_interface());
         b.add_interface(test_interface());
 
-        let addr_b = b.add_service(svc("server"));
+        let addr_b = b.add_service(svc("server"), &id(1));
         let now = Instant::now();
 
         b.announce(addr_b, now);
@@ -3089,9 +3086,9 @@ mod tests {
 
         let svc_a = svc("client");
         let state_a = svc_a.state();
-        let addr_a = a.add_service(svc_a);
+        let addr_a = a.add_service(svc_a, &id(1));
 
-        let addr_b = b.add_service(svc("server").with_paths(&["test.path"]));
+        let addr_b = b.add_service(svc("server").with_paths(&["test.path"]), &id(2));
         let now = Instant::now();
 
         // Announce B so A knows the path
@@ -3143,7 +3140,7 @@ mod tests {
         a.add_interface(test_interface());
         b.add_interface(test_interface());
 
-        let addr_b = b.add_service(svc("server"));
+        let addr_b = b.add_service(svc("server"), &id(1));
         let now = Instant::now();
 
         b.announce(addr_b, now);
@@ -3183,7 +3180,7 @@ mod tests {
         a.add_interface(test_interface());
         b.add_interface(test_interface());
 
-        let addr_b = b.add_service(svc("server"));
+        let addr_b = b.add_service(svc("server"), &id(1));
         let now = Instant::now();
 
         b.announce(addr_b, now);
@@ -3279,10 +3276,10 @@ mod tests {
         ));
         b.add_interface(make_ifac_interface(shared_ifac_identity, shared_ifac_key));
 
-        let _addr_a = a.add_service(svc("client"));
+        let _addr_a = a.add_service(svc("client"), &id(1));
         let svc_b = svc("server");
         let state_b = svc_b.state();
-        let addr_b = b.add_service(svc_b);
+        let addr_b = b.add_service(svc_b, &id(1));
         let now = Instant::now();
 
         // B announces
@@ -3354,7 +3351,7 @@ mod tests {
             Interface::new(MockTransport::new()).with_ifac(ifac_identity_b, ifac_key_b, 8);
         b.add_interface(iface_b);
 
-        let addr_b = b.add_service(svc("server"));
+        let addr_b = b.add_service(svc("server"), &id(1));
         let now = Instant::now();
 
         // B announces
@@ -3381,8 +3378,8 @@ mod tests {
 
         let svc_a = svc("client");
         let state_a = svc_a.state();
-        let _addr_a = a.add_service(svc_a);
-        let addr_b = b.add_service(svc("server"));
+        let _addr_a = a.add_service(svc_a, &id(1));
+        let addr_b = b.add_service(svc("server"), &id(1));
         let now = Instant::now();
 
         assert_eq!(state_a.borrow().destinations_changed_count, 0);
@@ -3418,10 +3415,10 @@ mod tests {
         a.add_interface(test_interface());
         b.add_interface(test_interface());
 
-        let addr_a = a.add_service(svc("client"));
+        let addr_a = a.add_service(svc("client"), &id(1));
         let svc_b = svc("server").with_paths(&["test.path"]);
         let state_b = svc_b.state();
-        let addr_b = b.add_service(svc_b);
+        let addr_b = b.add_service(svc_b, &id(1));
         let now = Instant::now();
 
         b.announce(addr_b, now);
@@ -3462,11 +3459,12 @@ mod tests {
 
         let svc_a = svc("client");
         let state_a = svc_a.state();
-        let addr_a = a.add_service(svc_a);
+        let addr_a = a.add_service(svc_a, &id(1));
         let addr_b = b.add_service(
             svc("server")
                 .with_paths(&["test.path"])
                 .with_auto_response(b"response".to_vec()),
+            &id(2),
         );
         let now = Instant::now();
 
@@ -3511,8 +3509,8 @@ mod tests {
 
         let svc_a = svc("client");
         let state_a = svc_a.state();
-        let addr_a = a.add_service(svc_a);
-        let addr_b = b.add_service(svc("server"));
+        let addr_a = a.add_service(svc_a, &id(1));
+        let addr_b = b.add_service(svc("server"), &id(1));
         let now = Instant::now();
 
         b.announce(addr_b, now);
@@ -3550,12 +3548,12 @@ mod tests {
         a.add_interface(test_interface());
         b.add_interface(test_interface());
 
-        let addr_a = a.add_service(svc("client"));
+        let addr_a = a.add_service(svc("client"), &id(1));
         let svc_b = svc("server")
             .with_paths(&["test.path"])
             .with_auto_response(b"small".to_vec());
         let state_b = svc_b.state();
-        let addr_b = b.add_service(svc_b);
+        let addr_b = b.add_service(svc_b, &id(1));
         let now = Instant::now();
 
         b.announce(addr_b, now);
@@ -3595,10 +3593,10 @@ mod tests {
         a.add_interface(test_interface());
         b.add_interface(test_interface());
 
-        let _addr_a = a.add_service(svc("client"));
+        let _addr_a = a.add_service(svc("client"), &id(1));
         let svc_b = svc("server");
         let state_b = svc_b.state();
-        let addr_b = b.add_service(svc_b);
+        let addr_b = b.add_service(svc_b, &id(1));
         let now = Instant::now();
 
         b.announce(addr_b, now);
@@ -3638,11 +3636,12 @@ mod tests {
 
         let svc_a = svc("client");
         let state_a = svc_a.state();
-        let addr_a = a.add_service(svc_a);
+        let addr_a = a.add_service(svc_a, &id(1));
         let addr_b = b.add_service(
             svc("server")
                 .with_paths(&["echo"])
                 .with_auto_response(b"response".to_vec()),
+            &id(2),
         );
         let now = Instant::now();
 
@@ -3702,12 +3701,13 @@ mod tests {
         // Client that sends request when it discovers server
         let svc_a = svc("client");
         let state_a = svc_a.state();
-        let addr_a = a.add_service(svc_a);
+        let addr_a = a.add_service(svc_a, &id(1));
 
         let addr_b = b.add_service(
             svc("server")
                 .with_paths(&["echo"])
                 .with_auto_response(b"response".to_vec()),
+            &id(2),
         );
         let now = Instant::now();
 
