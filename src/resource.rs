@@ -6,25 +6,21 @@ pub(crate) const MAPHASH_LEN: usize = 4;
 pub(crate) const HASHMAP_IS_NOT_EXHAUSTED: u8 = 0x00;
 pub(crate) const HASHMAP_IS_EXHAUSTED: u8 = 0xFF;
 const WINDOW_MIN: usize = 2;
-const WINDOW_MAX_SLOW: usize = 10;
 const WINDOW_MAX_FAST: usize = 75;
 const SDU: usize = 470;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResourceStatus {
+pub(crate) enum ResourceStatus {
     Queued,
     Advertised,
     Transferring,
     AwaitingProof,
-    Assembling,
-    Complete,
-    Failed,
 }
 
 pub(crate) struct OutboundResource {
     pub hash: [u8; 32],
-    pub original_hash: [u8; 32],
     pub random_hash: [u8; 4],
+    expected_proof: [u8; 32],
     pub status: ResourceStatus,
     pub metadata: Option<Vec<u8>>,
     pub compressed: bool,
@@ -33,7 +29,6 @@ pub(crate) struct OutboundResource {
     parts: Vec<Vec<u8>>,
     hashmap: Vec<[u8; MAPHASH_LEN]>,
     hashmap_sent: usize,
-    window: usize,
 }
 
 impl OutboundResource {
@@ -46,23 +41,34 @@ impl OutboundResource {
         is_response: bool,
         request_id: Option<Vec<u8>>,
     ) -> Self {
-        let original_hash: [u8; 32] = sha256(&data);
-
-        let processed = if compress {
-            bz2_compress(&data).unwrap_or(data)
-        } else {
-            data
-        };
-
         let mut random_hash = [0u8; 4];
         rng.fill_bytes(&mut random_hash);
 
+        // hash = SHA256(original_data + random_hash) - always over uncompressed
+        let mut hash_input = data.clone();
+        hash_input.extend(&random_hash);
+        let hash: [u8; 32] = sha256(&hash_input);
+
+        // expected_proof = SHA256(original_data + hash) - always over uncompressed
+        let mut proof_input = data.clone();
+        proof_input.extend(&hash);
+        let expected_proof: [u8; 32] = sha256(&proof_input);
+
+        // Compress for transmission if beneficial
+        let (to_send, compressed) = if compress {
+            if let Some(compressed_data) = bz2_compress(&data) {
+                (compressed_data, true)
+            } else {
+                (data, false)
+            }
+        } else {
+            (data, false)
+        };
+
         let mut plaintext = random_hash.to_vec();
-        plaintext.extend(&processed);
+        plaintext.extend(&to_send);
 
         let encrypted = link.encrypt(rng, &plaintext);
-
-        let hash: [u8; 32] = sha256(&encrypted);
 
         let parts: Vec<Vec<u8>> = encrypted.chunks(SDU).map(|c| c.to_vec()).collect();
 
@@ -78,17 +84,16 @@ impl OutboundResource {
 
         Self {
             hash,
-            original_hash,
             random_hash,
+            expected_proof,
             status: ResourceStatus::Queued,
             metadata,
-            compressed: compress,
+            compressed,
             is_response,
             request_id,
             parts,
             hashmap,
             hashmap_sent: 0,
-            window: WINDOW_MIN,
         }
     }
 
@@ -121,7 +126,7 @@ impl OutboundResource {
             num_parts: self.parts.len(),
             hash: self.hash,
             random_hash: self.random_hash,
-            original_hash: self.original_hash,
+            original_hash: self.hash, // Same as hash for non-segmented resources
             segment_index: 1,
             total_segments: 1,
             hashmap: hashmap_chunk,
@@ -156,18 +161,7 @@ impl OutboundResource {
     }
 
     pub fn verify_proof(&self, proof: &[u8]) -> bool {
-        let mut proof_material = self.hash.to_vec();
-        proof_material.extend(&self.original_hash);
-        let expected = sha256(&proof_material);
-        proof == expected
-    }
-
-    pub fn mark_complete(&mut self) {
-        self.status = ResourceStatus::Complete;
-    }
-
-    pub fn mark_failed(&mut self) {
-        self.status = ResourceStatus::Failed;
+        proof == self.expected_proof
     }
 }
 
@@ -342,7 +336,7 @@ impl InboundResource {
         self.received_count == self.num_parts
     }
 
-    pub fn assemble(&self, link: &EstablishedLink) -> Option<Vec<u8>> {
+    pub fn assemble(&self, link: &EstablishedLink) -> Option<(Vec<u8>, [u8; 32])> {
         if !self.is_complete() {
             return None;
         }
@@ -353,11 +347,6 @@ impl InboundResource {
             .filter_map(|p| p.as_ref())
             .flat_map(|p| p.iter().copied())
             .collect();
-
-        let hash: [u8; 32] = sha256(&encrypted);
-        if hash != self.hash {
-            return None;
-        }
 
         let plaintext = link.decrypt(&encrypted)?;
 
@@ -377,30 +366,24 @@ impl InboundResource {
             data.to_vec()
         };
 
-        let original_hash: [u8; 32] = sha256(&result);
-        if original_hash != self.original_hash {
+        // Verify hash = SHA256(plaintext + random_hash)
+        let mut hash_input = result.clone();
+        hash_input.extend(&self.random_hash);
+        let calculated_hash = sha256(&hash_input);
+        if calculated_hash != self.hash {
             return None;
         }
 
-        Some(result)
-    }
+        // Compute proof = SHA256(plaintext + hash)
+        let mut proof_input = result.clone();
+        proof_input.extend(&self.hash);
+        let proof = sha256(&proof_input);
 
-    pub fn generate_proof(&self) -> [u8; 32] {
-        let mut proof_material = self.hash.to_vec();
-        proof_material.extend(&self.original_hash);
-        sha256(&proof_material)
+        Some((result, proof))
     }
 
     pub fn mark_transferring(&mut self) {
         self.status = ResourceStatus::Transferring;
-    }
-
-    pub fn mark_complete(&mut self) {
-        self.status = ResourceStatus::Complete;
-    }
-
-    pub fn mark_failed(&mut self) {
-        self.status = ResourceStatus::Failed;
     }
 }
 

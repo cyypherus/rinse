@@ -21,11 +21,15 @@ enum ServiceNotification {
         path: String,
         data: Vec<u8>,
     },
-    Response {
+    RequestResult {
         service_idx: usize,
         request_id: RequestId,
-        from: Address,
-        data: Vec<u8>,
+        result: Result<(Address, Vec<u8>), crate::handle::RequestError>,
+    },
+    RespondResult {
+        service_idx: usize,
+        request_id: RequestId,
+        result: Result<(), crate::handle::RespondError>,
     },
     Data {
         service_idx: usize,
@@ -123,7 +127,15 @@ pub struct Node<T, S, R = ThreadRng> {
     pending_outbound_links: HashMap<LinkId, PendingLink>,
     pub(crate) established_links: HashMap<LinkId, EstablishedLink>,
     link_table: HashMap<LinkId, LinkTableEntry>,
-    outbound_resources: HashMap<[u8; 32], (LinkId, Address, crate::resource::OutboundResource)>,
+    outbound_resources: HashMap<
+        [u8; 32],
+        (
+            LinkId,
+            Address,
+            Option<usize>,
+            crate::resource::OutboundResource,
+        ),
+    >,
     inbound_resources: HashMap<[u8; 32], (LinkId, crate::resource::InboundResource)>,
     pending_resource_adverts: HashMap<[u8; 32], (LinkId, crate::resource::ResourceAdvertisement)>,
     inbound_request_links: HashMap<RequestId, LinkId>,
@@ -209,17 +221,6 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         id
     }
 
-    pub fn register_path(&mut self, service_address: Address, path: &str) {
-        let path_hash = crate::request::path_hash(path);
-        if let Some(entry) = self
-            .services
-            .iter_mut()
-            .find(|s| s.address == service_address)
-        {
-            entry.registered_paths.insert(path_hash, path.to_string());
-        }
-    }
-
     fn build_destinations(&self) -> Vec<Destination> {
         self.path_table
             .iter()
@@ -272,7 +273,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     self.send_request(service_addr, destination, &path, data, now);
                 }
                 PendingAction::Respond { request_id, data } => {
-                    self.send_response(request_id, data, now);
+                    self.send_response(service_idx, request_id, data, now);
                 }
                 PendingAction::Announce { app_data } => {
                     if let Some(data) = app_data {
@@ -359,7 +360,13 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         }
     }
 
-    fn send_response(&mut self, request_id: RequestId, data: Vec<u8>, now: Instant) {
+    fn send_response(
+        &mut self,
+        service_idx: usize,
+        request_id: RequestId,
+        data: Vec<u8>,
+        now: Instant,
+    ) {
         use crate::packet::LinkDataDestination;
 
         if let Some(link_id) = self.inbound_request_links.remove(&request_id) {
@@ -377,6 +384,16 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     for iface in &mut self.interfaces {
                         iface.send(packet.clone(), 0, now);
                     }
+                    // Small responses are sent directly - notify success immediately
+                    // (no proof mechanism for direct responses)
+                    self.dispatch_notifications(
+                        vec![ServiceNotification::RespondResult {
+                            service_idx,
+                            request_id,
+                            result: Ok(()),
+                        }],
+                        now,
+                    );
                 } else {
                     let mut resource = crate::resource::OutboundResource::new(
                         &mut self.rng,
@@ -399,8 +416,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                         data: ciphertext,
                     };
 
-                    self.outbound_resources
-                        .insert(hash, (link_id, link.destination, resource));
+                    self.outbound_resources.insert(
+                        hash,
+                        (link_id, link.destination, Some(service_idx), resource),
+                    );
 
                     for iface in &mut self.interfaces {
                         iface.send(packet.clone(), 0, now);
@@ -426,16 +445,23 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                         service.on_request(handle, request_id, from, &path, &data);
                     });
                 }
-                ServiceNotification::Response {
+                ServiceNotification::RequestResult {
                     service_idx,
                     request_id,
-                    from,
-                    data,
+                    result,
                 } => {
                     self.dispatch_to_service(service_idx, now, |service, handle| {
-                        service.on_response(handle, from, &data);
+                        service.on_request_result(handle, request_id, result);
                     });
-                    let _ = request_id; // TODO: could pass to callback if needed
+                }
+                ServiceNotification::RespondResult {
+                    service_idx,
+                    request_id,
+                    result,
+                } => {
+                    self.dispatch_to_service(service_idx, now, |service, handle| {
+                        service.on_respond_result(handle, request_id, result);
+                    });
                 }
                 ServiceNotification::Data {
                     service_idx,
@@ -534,6 +560,12 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             hex::encode(identity_hash)
         );
 
+        let mut registered_paths = HashMap::new();
+        for path in service.paths() {
+            let path_hash = crate::request::path_hash(path);
+            registered_paths.insert(path_hash, path.to_string());
+        }
+
         self.services.push(ServiceEntry {
             service,
             address,
@@ -541,7 +573,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             encryption_secret,
             encryption_public,
             signing_key,
-            registered_paths: HashMap::new(),
+            registered_paths,
         });
 
         address
@@ -1157,11 +1189,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                         self.services.iter().position(|s| s.address == service_addr)
                 {
                     let from = link.destination;
-                    notifications.push(ServiceNotification::Response {
+                    notifications.push(ServiceNotification::RequestResult {
                         service_idx,
                         request_id: resp.request_id,
-                        from,
-                        data: resp.data,
+                        result: Ok((from, resp.data)),
                     });
                 }
             } else if let Some(service_idx) = self
@@ -1733,7 +1764,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     .map(|c| [c[0], c[1], c[2], c[3]])
                     .collect();
 
-                if let Some((_, _, resource)) = self.outbound_resources.get_mut(&hash) {
+                if let Some((_, _, _, resource)) = self.outbound_resources.get_mut(&hash) {
                     resource.mark_transferring();
 
                     for part_hash in requested_hashes {
@@ -1803,10 +1834,27 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 }
                 let hash: [u8; 32] = plaintext[..32].try_into().unwrap();
                 let proof: [u8; 32] = plaintext[32..64].try_into().unwrap();
-                if let Some((_, _, resource)) = self.outbound_resources.get_mut(&hash)
+                if let Some((_, _, service_idx, resource)) = self.outbound_resources.get(&hash)
                     && resource.verify_proof(&proof)
                 {
-                    resource.mark_complete();
+                    let service_idx = *service_idx;
+                    let request_id = resource
+                        .request_id
+                        .as_ref()
+                        .and_then(|r| r.get(..16).and_then(|b| <[u8; 16]>::try_from(b).ok()));
+                    self.outbound_resources.remove(&hash);
+
+                    // Notify service that response was delivered
+                    if let (Some(service_idx), Some(request_id)) = (service_idx, request_id) {
+                        self.dispatch_notifications(
+                            vec![ServiceNotification::RespondResult {
+                                service_idx,
+                                request_id,
+                                result: Ok(()),
+                            }],
+                            now,
+                        );
+                    }
                 }
             }
             LinkContext::ResourceIcl | LinkContext::ResourceRcl => {
@@ -1828,9 +1876,8 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         if let Some((_, resource)) = self.inbound_resources.remove(&hash)
             && let Some(link) = self.established_links.get(&link_id)
         {
-            if let Some(data) = resource.assemble(link) {
+            if let Some((data, proof)) = resource.assemble(link) {
                 // Send proof
-                let proof = resource.generate_proof();
                 let mut payload = hash.to_vec();
                 payload.extend(&proof);
                 let ciphertext = link.encrypt(&mut self.rng, &payload);
@@ -1867,11 +1914,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                                     .map(|l| l.destination)
                                     .unwrap_or([0u8; 16]);
 
-                                let notification = ServiceNotification::Response {
+                                let notification = ServiceNotification::RequestResult {
                                     service_idx,
                                     request_id,
-                                    from,
-                                    data,
+                                    result: Ok((from, data)),
                                 };
                                 self.dispatch_notifications(vec![notification], now);
                             }
@@ -2032,6 +2078,7 @@ mod tests {
 
     #[derive(Clone)]
     struct ReceivedResponse {
+        request_id: RequestId,
         from: Address,
         data: Vec<u8>,
     }
@@ -2051,6 +2098,7 @@ mod tests {
 
     struct TestService {
         name: String,
+        paths: Vec<String>,
         state: Rc<RefCell<TestServiceState>>,
         auto_response: Option<Vec<u8>>,
     }
@@ -2059,9 +2107,15 @@ mod tests {
         fn new(name: &str) -> Self {
             Self {
                 name: name.into(),
+                paths: Vec::new(),
                 state: Rc::new(RefCell::new(TestServiceState::default())),
                 auto_response: None,
             }
+        }
+
+        fn with_paths(mut self, paths: &[&str]) -> Self {
+            self.paths = paths.iter().map(|s| s.to_string()).collect();
+            self
         }
 
         fn with_auto_response(mut self, response: Vec<u8>) -> Self {
@@ -2077,6 +2131,10 @@ mod tests {
     impl Service for TestService {
         fn name(&self) -> &str {
             &self.name
+        }
+
+        fn paths(&self) -> Vec<&str> {
+            self.paths.iter().map(|s| s.as_str()).collect()
         }
 
         fn on_raw(&mut self, _handle: &mut NodeHandle, from: Address, data: &[u8]) {
@@ -2105,11 +2163,19 @@ mod tests {
             }
         }
 
-        fn on_response(&mut self, _handle: &mut NodeHandle, from: Address, data: &[u8]) {
-            self.state.borrow_mut().responses.push(ReceivedResponse {
-                from,
-                data: data.to_vec(),
-            });
+        fn on_request_result(
+            &mut self,
+            _handle: &mut NodeHandle,
+            request_id: RequestId,
+            result: Result<(Address, Vec<u8>), crate::handle::RequestError>,
+        ) {
+            if let Ok((from, data)) = result {
+                self.state.borrow_mut().responses.push(ReceivedResponse {
+                    request_id,
+                    from,
+                    data,
+                });
+            }
         }
     }
 
@@ -2338,10 +2404,11 @@ mod tests {
         let state_a = svc_a.state();
         let addr_a = a.add_service(svc_a);
 
-        let svc_b = svc("server").with_auto_response(b"response data".to_vec());
+        let svc_b = svc("server")
+            .with_paths(&["test.path"])
+            .with_auto_response(b"response data".to_vec());
         let state_b = svc_b.state();
         let addr_b = b.add_service(svc_b);
-        b.register_path(addr_b, "test.path");
         let now = Instant::now();
 
         b.announce(addr_b, now);
@@ -2403,10 +2470,11 @@ mod tests {
         let state_a = svc_a.state();
         let addr_a = a.add_service(svc_a);
 
-        let svc_c = svc("server").with_auto_response(b"response data".to_vec());
+        let svc_c = svc("server")
+            .with_paths(&["test.path"])
+            .with_auto_response(b"response data".to_vec());
         let state_c = svc_c.state();
         let addr_c = c.add_service(svc_c);
-        c.register_path(addr_c, "test.path");
         let now = Instant::now();
         let later = now + std::time::Duration::from_secs(1);
 
@@ -2546,6 +2614,132 @@ mod tests {
             assert_eq!(state.responses.len(), 1);
             assert_eq!(state.responses[0].data, large_response);
         }
+
+        // Resources should be cleaned up
+        assert_eq!(a.inbound_resources.len(), 0);
+        assert_eq!(b.outbound_resources.len(), 0);
+    }
+
+    #[test]
+    fn multipart_resource_with_hashmap_updates() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        // 10KB response = ~21 parts at 470 bytes/part, needs multiple hashmap updates
+        let large_response: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
+
+        let svc_a = svc("client");
+        let state_a = svc_a.state();
+        let addr_a = a.add_service(svc_a);
+
+        let svc_b = svc("server")
+            .with_paths(&["test.path"])
+            .with_auto_response(large_response.clone());
+        let addr_b = b.add_service(svc_b);
+        let now = Instant::now();
+
+        // Establish link
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        a.link(addr_b, None, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        // Send request
+        a.send_request(addr_a, addr_b, "test.path", b"req".to_vec(), now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        // Transfer until complete (resource adv, requests, parts, hashmap updates, proof)
+        for _ in 0..50 {
+            transfer(&mut b, 0, &mut a, 0);
+            a.poll(now);
+            transfer(&mut a, 0, &mut b, 0);
+            b.poll(now);
+            if state_a.borrow().responses.len() == 1 {
+                break;
+            }
+        }
+
+        let state = state_a.borrow();
+        assert_eq!(state.responses.len(), 1);
+        assert_eq!(state.responses[0].data, large_response);
+    }
+
+    #[test]
+    fn resource_transfer_three_nodes() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        let mut c: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+        b.add_interface(test_interface());
+        c.add_interface(test_interface());
+
+        let large_response: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
+
+        let svc_a = svc("client");
+        let state_a = svc_a.state();
+        let addr_a = a.add_service(svc_a);
+
+        let svc_c = svc("server")
+            .with_paths(&["test.path"])
+            .with_auto_response(large_response.clone());
+        let addr_c = c.add_service(svc_c);
+        let now = Instant::now();
+        let later = now + std::time::Duration::from_secs(1);
+
+        // Propagate announce: C -> B -> A
+        c.announce(addr_c, now);
+        c.poll(now);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(now);
+        b.poll(later);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(later);
+
+        // Establish link A -> C (via B)
+        a.link(addr_c, None, later).unwrap();
+        a.poll(later);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(later);
+        transfer(&mut b, 1, &mut c, 0);
+        c.poll(later);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(later);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(later);
+
+        // Send request
+        a.send_request(addr_a, addr_c, "test.path", b"req".to_vec(), later);
+        a.poll(later);
+
+        // Transfer until complete
+        for _ in 0..30 {
+            transfer(&mut a, 0, &mut b, 0);
+            b.poll(later);
+            transfer(&mut b, 1, &mut c, 0);
+            c.poll(later);
+            transfer(&mut c, 0, &mut b, 1);
+            b.poll(later);
+            transfer(&mut b, 0, &mut a, 0);
+            a.poll(later);
+            if state_a.borrow().responses.len() == 1 {
+                break;
+            }
+        }
+
+        let state = state_a.borrow();
+        assert_eq!(state.responses.len(), 1);
+        assert_eq!(state.responses[0].data, large_response);
     }
 
     #[test]

@@ -3,6 +3,19 @@ use std::time::Instant;
 use crate::packet::Address;
 use crate::request::RequestId;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestError {
+    Timeout,
+    LinkClosed,
+    TransferFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RespondError {
+    LinkClosed,
+    TransferFailed,
+}
+
 pub struct Destination {
     pub address: Address,
     pub app_data: Option<Vec<u8>>,
@@ -104,7 +117,22 @@ pub trait Service {
     }
 
     #[allow(unused_variables)]
-    fn on_response(&mut self, handle: &mut NodeHandle, from: Address, data: &[u8]) {}
+    fn on_request_result(
+        &mut self,
+        handle: &mut NodeHandle,
+        request_id: RequestId,
+        result: Result<(Address, Vec<u8>), RequestError>,
+    ) {
+    }
+
+    #[allow(unused_variables)]
+    fn on_respond_result(
+        &mut self,
+        handle: &mut NodeHandle,
+        request_id: RequestId,
+        result: Result<(), RespondError>,
+    ) {
+    }
 
     #[allow(unused_variables)]
     fn on_destinations_changed(&mut self, handle: &mut NodeHandle) {}
