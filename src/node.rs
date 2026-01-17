@@ -512,15 +512,70 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
         self.send_link_packet(link_id, LinkContext::LinkClose, &ciphertext, now);
 
-        let (destination, service_idx) =
+        let (destination, pending_requests) =
             if let Some(link) = self.established_links.get_mut(&link_id) {
                 link.state = LinkState::Closed;
-                let dest = link.destination;
-                let idx = self.services.iter().position(|s| s.address == dest);
-                (Some(dest), idx)
+                let pending = std::mem::take(&mut link.pending_requests);
+                (Some(link.destination), pending)
             } else {
-                (None, None)
+                (None, std::collections::HashMap::new())
             };
+
+        // Notify services with pending requests on this link
+        let mut notifications = Vec::new();
+        for (request_id, service_addr) in pending_requests {
+            if let Some(service_idx) = self.services.iter().position(|s| s.address == service_addr)
+            {
+                notifications.push(ServiceNotification::RequestResult {
+                    service_idx,
+                    request_id,
+                    result: Err(crate::handle::RequestError::LinkClosed),
+                });
+            }
+        }
+
+        // Notify services with pending outbound resources (responses) on this link
+        let failed_resources: Vec<_> = self
+            .outbound_resources
+            .iter()
+            .filter(|(_, (lid, _, _, _))| *lid == link_id)
+            .map(|(hash, (_, _, service_idx, resource))| {
+                (
+                    *hash,
+                    *service_idx,
+                    resource
+                        .request_id
+                        .as_ref()
+                        .and_then(|r| r.get(..16).and_then(|b| <[u8; 16]>::try_from(b).ok())),
+                )
+            })
+            .collect();
+
+        for (hash, service_idx, request_id) in failed_resources {
+            self.outbound_resources.remove(&hash);
+            if let (Some(service_idx), Some(request_id)) = (service_idx, request_id) {
+                notifications.push(ServiceNotification::RespondResult {
+                    service_idx,
+                    request_id,
+                    result: Err(crate::handle::RespondError::LinkClosed),
+                });
+            }
+        }
+
+        // Clean up inbound resources on this link
+        let failed_inbound: Vec<_> = self
+            .inbound_resources
+            .iter()
+            .filter(|(_, (lid, _))| *lid == link_id)
+            .map(|(hash, _)| *hash)
+            .collect();
+        for hash in failed_inbound {
+            self.inbound_resources.remove(&hash);
+        }
+
+        if !notifications.is_empty() {
+            self.dispatch_notifications(notifications, now);
+        }
 
         if let Some(dest) = destination {
             self.destination_links.remove(&dest);
