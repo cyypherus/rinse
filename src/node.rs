@@ -369,8 +369,8 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
     ) {
         use crate::packet::LinkDataDestination;
 
-        if let Some(link_id) = self.inbound_request_links.remove(&request_id) {
-            if let Some(link) = self.established_links.get(&link_id) {
+        if let Some(link_id) = self.inbound_request_links.remove(&request_id)
+            && let Some(link) = self.established_links.get(&link_id) {
                 if data.len() <= LINK_MDU {
                     let resp = Response::new(request_id, data);
                     let ciphertext = link.encrypt(&mut self.rng, &resp.encode());
@@ -426,7 +426,6 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     }
                 }
             }
-        }
     }
 
     fn dispatch_notifications(&mut self, notifications: Vec<ServiceNotification>, now: Instant) {
@@ -1777,15 +1776,15 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
                 if let Some(adv) = ResourceAdvertisement::decode(plaintext) {
                     // Auto-accept if this is a response to a pending request
-                    if adv.is_response {
-                        if let Some(ref req_id_bytes) = adv.request_id {
-                            if let Some(link) = self.established_links.get(&link_id) {
+                    if adv.is_response
+                        && let Some(ref req_id_bytes) = adv.request_id
+                            && let Some(link) = self.established_links.get(&link_id) {
                                 // Check if we have a pending request with this ID
                                 let req_id: Option<RequestId> =
                                     req_id_bytes.get(..16).and_then(|b| b.try_into().ok());
 
-                                if let Some(request_id) = req_id {
-                                    if link.pending_requests.contains_key(&request_id) {
+                                if let Some(request_id) = req_id
+                                    && link.pending_requests.contains_key(&request_id) {
                                         // Auto-accept the resource
                                         let hash = adv.hash;
                                         let mut resource =
@@ -1796,10 +1795,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                                         self.inbound_resources.insert(hash, (link_id, resource));
                                         self.send_resource_request(link_id, hash, now);
                                     }
-                                }
                             }
-                        }
-                    }
                 }
             }
             LinkContext::ResourceReq => {
@@ -1930,8 +1926,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
         if let Some((_, resource)) = self.inbound_resources.remove(&hash)
             && let Some(link) = self.established_links.get(&link_id)
-        {
-            if let Some((data, proof)) = resource.assemble(link) {
+            && let Some((data, proof)) = resource.assemble(link) {
                 // Send proof
                 let mut payload = hash.to_vec();
                 payload.extend(&proof);
@@ -1947,8 +1942,8 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 }
 
                 // If this was a response to a pending request, deliver via on_response
-                if resource.is_response {
-                    if let Some(ref req_id_bytes) = resource.request_id {
+                if resource.is_response
+                    && let Some(ref req_id_bytes) = resource.request_id {
                         let req_id: Option<RequestId> =
                             req_id_bytes.get(..16).and_then(|b| b.try_into().ok());
 
@@ -1978,9 +1973,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                             }
                         }
                     }
-                }
             }
-        }
     }
 
     fn send_resource_request(&mut self, link_id: LinkId, hash: [u8; 32], now: Instant) {
