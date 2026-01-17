@@ -41,6 +41,7 @@ pub struct TcpTransport {
     stream: TcpStream,
     inbox: VecDeque<Vec<u8>>,
     frame_buffer: Vec<u8>,
+    connected: bool,
 }
 
 impl TcpTransport {
@@ -50,6 +51,7 @@ impl TcpTransport {
             stream,
             inbox: VecDeque::new(),
             frame_buffer: Vec::new(),
+            connected: true,
         })
     }
 
@@ -62,13 +64,19 @@ impl TcpTransport {
         let mut buf = [0u8; 4096];
         loop {
             match self.stream.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) => {
+                    self.connected = false;
+                    break;
+                }
                 Ok(n) => {
                     self.frame_buffer.extend_from_slice(&buf[..n]);
                     self.process_frames();
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
+                Err(_) => {
+                    self.connected = false;
+                    break;
+                }
             }
         }
     }
@@ -108,8 +116,9 @@ impl Transport for TcpTransport {
         frame.extend(escaped);
         frame.push(HDLC_FLAG);
 
-        let _ = self.stream.write_all(&frame);
-        let _ = self.stream.flush();
+        if self.stream.write_all(&frame).is_err() || self.stream.flush().is_err() {
+            self.connected = false;
+        }
     }
 
     fn recv(&mut self) -> Option<Vec<u8>> {
@@ -119,6 +128,10 @@ impl Transport for TcpTransport {
 
     fn bandwidth_available(&self) -> bool {
         true
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected
     }
 }
 

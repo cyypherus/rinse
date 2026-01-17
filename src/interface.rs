@@ -9,6 +9,9 @@ pub trait Transport: Send {
     fn send(&mut self, data: &[u8]);
     fn recv(&mut self) -> Option<Vec<u8>>;
     fn bandwidth_available(&self) -> bool;
+    fn is_connected(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Clone)]
@@ -73,6 +76,10 @@ impl<T: Transport> Interface<T> {
 
     fn bandwidth_available(&self) -> bool {
         self.transport.bandwidth_available()
+    }
+
+    pub(crate) fn is_connected(&self) -> bool {
+        self.transport.is_connected()
     }
 
     pub(crate) fn send(&mut self, packet: Packet, priority: u8, now: Instant) {
@@ -214,6 +221,7 @@ impl<T: Transport> Interface<T> {
             if self.delayed[i].send_at <= now {
                 let delayed = self.delayed.swap_remove(i);
                 if self.bandwidth_available() {
+                    log::trace!("[SEND] {}", delayed.packet.log_format());
                     let raw = delayed.packet.to_bytes();
                     let out = self.apply_ifac(&raw);
                     self.transport.send(&out);
@@ -227,6 +235,7 @@ impl<T: Transport> Interface<T> {
 
         while self.bandwidth_available() {
             if let Some(packet) = self.dequeue() {
+                log::trace!("[SEND] {}", packet.log_format());
                 let raw = packet.to_bytes();
                 let out = self.apply_ifac(&raw);
                 self.transport.send(&out);

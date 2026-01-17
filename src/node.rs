@@ -42,6 +42,7 @@ enum ServiceNotification {
         from: Address,
         data: Vec<u8>,
     },
+    DestinationsChanged,
 }
 use crate::link::{EstablishedLink, LinkId, LinkProof, LinkRequest, LinkState, PendingLink};
 use crate::packet::{Address, DataContext, DataDestination, LinkContext, Packet};
@@ -509,6 +510,13 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     self.dispatch_to_service(service_idx, now, |service, handle| {
                         service.on_raw(handle, from, &data);
                     });
+                }
+                ServiceNotification::DestinationsChanged => {
+                    for service_idx in 0..self.services.len() {
+                        self.dispatch_to_service(service_idx, now, |service, handle| {
+                            service.on_destinations_changed(handle);
+                        });
+                    }
                 }
             }
         }
@@ -1097,6 +1105,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 }
 
                 let mut should_add = false;
+                let mut is_new_destination = false;
                 let hops = packet.hops();
 
                 if hops > self.max_hops {
@@ -1119,6 +1128,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     }
                 } else {
                     should_add = true;
+                    is_new_destination = true;
                 }
 
                 if should_add {
@@ -1167,6 +1177,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                         hops,
                         hex::encode(received_from)
                     );
+
+                    if is_new_destination {
+                        notifications.push(ServiceNotification::DestinationsChanged);
+                    }
                 }
             }
         }
@@ -1683,6 +1697,14 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
         for iface in &mut self.interfaces {
             iface.poll(now);
+        }
+
+        // Remove disconnected interfaces
+        let before_count = self.interfaces.len();
+        self.interfaces.retain(|iface| iface.is_connected());
+        let removed = before_count - self.interfaces.len();
+        if removed > 0 {
+            log::debug!("Removed {} disconnected interface(s)", removed);
         }
     }
 
@@ -2226,11 +2248,26 @@ mod tests {
         data: Vec<u8>,
     }
 
+    #[derive(Clone)]
+    struct RequestFailure {
+        request_id: RequestId,
+        error: crate::handle::RequestError,
+    }
+
+    #[derive(Clone)]
+    struct RespondResult {
+        request_id: RequestId,
+        success: bool,
+    }
+
     #[derive(Default)]
     struct TestServiceState {
         requests: Vec<ReceivedRequest>,
         responses: Vec<ReceivedResponse>,
         raw_messages: Vec<ReceivedRaw>,
+        request_failures: Vec<RequestFailure>,
+        respond_results: Vec<RespondResult>,
+        destinations_changed_count: usize,
     }
 
     struct TestService {
@@ -2306,13 +2343,37 @@ mod tests {
             request_id: RequestId,
             result: Result<(Address, Vec<u8>), crate::handle::RequestError>,
         ) {
-            if let Ok((from, data)) = result {
-                self.state.borrow_mut().responses.push(ReceivedResponse {
-                    request_id,
-                    from,
-                    data,
-                });
+            match result {
+                Ok((from, data)) => {
+                    self.state.borrow_mut().responses.push(ReceivedResponse {
+                        request_id,
+                        from,
+                        data,
+                    });
+                }
+                Err(error) => {
+                    self.state
+                        .borrow_mut()
+                        .request_failures
+                        .push(RequestFailure { request_id, error });
+                }
             }
+        }
+
+        fn on_respond_result(
+            &mut self,
+            _handle: &mut NodeHandle,
+            request_id: RequestId,
+            result: Result<(), crate::handle::RespondError>,
+        ) {
+            self.state.borrow_mut().respond_results.push(RespondResult {
+                request_id,
+                success: result.is_ok(),
+            });
+        }
+
+        fn on_destinations_changed(&mut self, _handle: &mut NodeHandle) {
+            self.state.borrow_mut().destinations_changed_count += 1;
         }
     }
 
@@ -3308,6 +3369,408 @@ mod tests {
         assert!(
             !a.has_destination(&addr_b),
             "A should not learn about B with mismatched IFAC"
+        );
+    }
+
+    #[test]
+    fn on_destinations_changed_called_for_new_destination() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = svc("client");
+        let state_a = svc_a.state();
+        let _addr_a = a.add_service(svc_a);
+        let addr_b = b.add_service(svc("server"));
+        let now = Instant::now();
+
+        assert_eq!(state_a.borrow().destinations_changed_count, 0);
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        assert_eq!(
+            state_a.borrow().destinations_changed_count,
+            1,
+            "on_destinations_changed should be called when new destination discovered"
+        );
+
+        // Re-announce should not trigger again (not a new destination)
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        assert_eq!(
+            state_a.borrow().destinations_changed_count,
+            1,
+            "on_destinations_changed should not be called for re-announce"
+        );
+    }
+
+    #[test]
+    fn on_request_called_when_request_received() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let addr_a = a.add_service(svc("client"));
+        let svc_b = svc("server").with_paths(&["test.path"]);
+        let state_b = svc_b.state();
+        let addr_b = b.add_service(svc_b);
+        let now = Instant::now();
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(addr_b, None, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        assert!(a.is_link_established(&link_id));
+        assert_eq!(state_b.borrow().requests.len(), 0);
+
+        a.send_request(addr_a, addr_b, "test.path", b"hello".to_vec(), now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        assert_eq!(
+            state_b.borrow().requests.len(),
+            1,
+            "on_request should be called when request received"
+        );
+        assert_eq!(state_b.borrow().requests[0].path, "test.path");
+        assert_eq!(state_b.borrow().requests[0].data, b"hello");
+    }
+
+    #[test]
+    fn on_request_result_called_on_response() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = svc("client");
+        let state_a = svc_a.state();
+        let addr_a = a.add_service(svc_a);
+        let addr_b = b.add_service(
+            svc("server")
+                .with_paths(&["test.path"])
+                .with_auto_response(b"response".to_vec()),
+        );
+        let now = Instant::now();
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(addr_b, None, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        assert!(a.is_link_established(&link_id));
+
+        let request_id = a.send_request(addr_a, addr_b, "test.path", b"hello".to_vec(), now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        assert_eq!(
+            state_a.borrow().responses.len(),
+            1,
+            "on_request_result should be called with Ok when response received"
+        );
+        assert_eq!(state_a.borrow().responses[0].request_id, request_id);
+        assert_eq!(state_a.borrow().responses[0].data, b"response");
+    }
+
+    #[test]
+    fn on_request_result_called_on_link_failure() {
+        use std::time::Duration;
+
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = svc("client");
+        let state_a = svc_a.state();
+        let addr_a = a.add_service(svc_a);
+        let addr_b = b.add_service(svc("server"));
+        let now = Instant::now();
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        // Queue request while link is pending (don't complete handshake)
+        let _link_id = a.link(addr_b, None, now).unwrap();
+        a.poll(now);
+
+        let request_id = a.send_request(addr_a, addr_b, "test.path", b"hello".to_vec(), now);
+        a.poll(now);
+
+        // Time out the link
+        let timeout = now + Duration::from_secs(10);
+        a.poll(timeout);
+
+        assert_eq!(
+            state_a.borrow().request_failures.len(),
+            1,
+            "on_request_result should be called with Err when link fails"
+        );
+        assert_eq!(state_a.borrow().request_failures[0].request_id, request_id);
+        assert_eq!(
+            state_a.borrow().request_failures[0].error,
+            crate::handle::RequestError::LinkFailed
+        );
+    }
+
+    #[test]
+    fn on_respond_result_called_on_small_response() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let addr_a = a.add_service(svc("client"));
+        let svc_b = svc("server")
+            .with_paths(&["test.path"])
+            .with_auto_response(b"small".to_vec());
+        let state_b = svc_b.state();
+        let addr_b = b.add_service(svc_b);
+        let now = Instant::now();
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(addr_b, None, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        assert!(a.is_link_established(&link_id));
+
+        a.send_request(addr_a, addr_b, "test.path", b"hello".to_vec(), now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        assert_eq!(
+            state_b.borrow().respond_results.len(),
+            1,
+            "on_respond_result should be called for small response"
+        );
+        assert!(
+            state_b.borrow().respond_results[0].success,
+            "on_respond_result should report success"
+        );
+    }
+
+    #[test]
+    fn on_raw_called_when_link_data_received() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let _addr_a = a.add_service(svc("client"));
+        let svc_b = svc("server");
+        let state_b = svc_b.state();
+        let addr_b = b.add_service(svc_b);
+        let now = Instant::now();
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(addr_b, None, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        assert!(a.is_link_established(&link_id));
+        assert_eq!(state_b.borrow().raw_messages.len(), 0);
+
+        a.send_link_packet(link_id, LinkContext::None, b"raw data", now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        assert_eq!(
+            state_b.borrow().raw_messages.len(),
+            1,
+            "on_raw should be called when link data received"
+        );
+        assert_eq!(state_b.borrow().raw_messages[0].data, b"raw data");
+    }
+
+    #[test]
+    fn two_sequential_requests_both_get_responses() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = svc("client");
+        let state_a = svc_a.state();
+        let addr_a = a.add_service(svc_a);
+        let addr_b = b.add_service(
+            svc("server")
+                .with_paths(&["echo"])
+                .with_auto_response(b"response".to_vec()),
+        );
+        let now = Instant::now();
+
+        // Setup: announce and establish link
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(addr_b, None, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        assert!(a.is_link_established(&link_id));
+
+        // First request
+        let request_id_1 = a.send_request(addr_a, addr_b, "echo", b"first".to_vec(), now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        assert_eq!(
+            state_a.borrow().responses.len(),
+            1,
+            "first request should get response"
+        );
+        assert_eq!(state_a.borrow().responses[0].request_id, request_id_1);
+
+        // Second request
+        let request_id_2 = a.send_request(addr_a, addr_b, "echo", b"second".to_vec(), now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        assert_eq!(
+            state_a.borrow().responses.len(),
+            2,
+            "second request should also get response"
+        );
+        assert_eq!(state_a.borrow().responses[1].request_id, request_id_2);
+    }
+
+    #[test]
+    fn request_via_callback_then_second_request() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        // Client that sends request when it discovers server
+        let svc_a = svc("client");
+        let state_a = svc_a.state();
+        let addr_a = a.add_service(svc_a);
+
+        let addr_b = b.add_service(
+            svc("server")
+                .with_paths(&["echo"])
+                .with_auto_response(b"response".to_vec()),
+        );
+        let now = Instant::now();
+
+        // B announces
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        // A should know about B now
+        assert!(a.has_destination(&addr_b));
+        assert_eq!(state_a.borrow().destinations_changed_count, 1);
+
+        // Establish link and send first request
+        let link_id = a.link(addr_b, None, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        assert!(a.is_link_established(&link_id));
+
+        // First request
+        a.send_request(addr_a, addr_b, "echo", b"first".to_vec(), now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        assert_eq!(
+            state_a.borrow().responses.len(),
+            1,
+            "first request should get response"
+        );
+
+        // Second request on same link
+        a.send_request(addr_a, addr_b, "echo", b"second".to_vec(), now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        assert_eq!(
+            state_a.borrow().responses.len(),
+            2,
+            "second request should also get response"
+        );
+
+        // Third request for good measure
+        a.send_request(addr_a, addr_b, "echo", b"third".to_vec(), now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        assert_eq!(
+            state_a.borrow().responses.len(),
+            3,
+            "third request should also get response"
         );
     }
 }
