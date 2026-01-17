@@ -8,11 +8,41 @@ use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 use crate::announce::{AnnounceBuilder, AnnounceData};
 use crate::crypto::{EphemeralKeyPair, sha256};
+use crate::handle::{Destination, NodeHandle, PendingAction, Service};
+
+const LINK_MDU: usize = 431;
+
+enum ServiceNotification {
+    Request {
+        service_idx: usize,
+        link_id: LinkId,
+        request_id: RequestId,
+        from: Address,
+        path: String,
+        data: Vec<u8>,
+    },
+    Response {
+        service_idx: usize,
+        request_id: RequestId,
+        from: Address,
+        data: Vec<u8>,
+    },
+    Data {
+        service_idx: usize,
+        from: Address,
+        data: Vec<u8>,
+    },
+    Raw {
+        service_idx: usize,
+        from: Address,
+        data: Vec<u8>,
+    },
+}
 use crate::link::{EstablishedLink, LinkId, LinkProof, LinkRequest, LinkState, PendingLink};
 use crate::packet::{Address, DataContext, DataDestination, LinkContext, Packet};
 use crate::packet_hashlist::PacketHashlist;
 use crate::path_request::PathRequest;
-use crate::request::{Request, Response};
+use crate::request::{PathHash, Request, RequestId, Response};
 use crate::{Interface, Transport};
 use ed25519_dalek::Signature;
 
@@ -24,101 +54,6 @@ const DEFAULT_RETRY_DELAY_MS: u64 = 4000;
 const LOCAL_REBROADCASTS_MAX: u8 = 2;
 const PATHFINDER_RW_MS: u64 = 500;
 
-#[derive(Debug)]
-pub enum InboundMessage {
-    LinkEstablished {
-        link_id: LinkId,
-    },
-    LinkClosed {
-        link_id: LinkId,
-    },
-    LinkData {
-        link_id: LinkId,
-        data: Vec<u8>,
-    },
-    SingleData {
-        data: Vec<u8>,
-    },
-    Request {
-        link_id: LinkId,
-        request_id: crate::RequestId,
-        path_hash: crate::PathHash,
-        data: Vec<u8>,
-    },
-    Response {
-        request_id: crate::RequestId,
-        data: Vec<u8>,
-    },
-    ResourceAdvertised {
-        link_id: LinkId,
-        hash: [u8; 32],
-        size: usize,
-        metadata: Option<Vec<u8>>,
-    },
-    ResourceProgress {
-        link_id: LinkId,
-        hash: [u8; 32],
-        progress: f32,
-    },
-    ResourceComplete {
-        link_id: LinkId,
-        hash: [u8; 32],
-        data: Vec<u8>,
-        metadata: Option<Vec<u8>>,
-    },
-    ResourceFailed {
-        link_id: LinkId,
-        hash: [u8; 32],
-    },
-}
-
-pub enum OutboundMessage {
-    Link {
-        destination: Address,
-    },
-    CloseLink {
-        link_id: LinkId,
-    },
-    LinkData {
-        link_id: LinkId,
-        data: Vec<u8>,
-    },
-    SingleData {
-        destination: Address,
-        data: Vec<u8>,
-    },
-    Request {
-        link_id: LinkId,
-        path: String,
-        data: Vec<u8>,
-    },
-    Response {
-        link_id: LinkId,
-        request_id: crate::RequestId,
-        data: Vec<u8>,
-    },
-    ResourceSend {
-        link_id: LinkId,
-        data: Vec<u8>,
-        metadata: Option<Vec<u8>>,
-        compress: bool,
-    },
-    ResourceAccept {
-        link_id: LinkId,
-        hash: [u8; 32],
-    },
-    ResourceReject {
-        link_id: LinkId,
-        hash: [u8; 32],
-    },
-}
-
-pub trait Service: Send {
-    fn name(&self) -> &str;
-    fn inbound(&mut self, msg: InboundMessage);
-    fn outbound(&mut self) -> Option<OutboundMessage>;
-}
-
 pub(crate) struct ServiceEntry<S> {
     service: S,
     address: Address,
@@ -126,6 +61,7 @@ pub(crate) struct ServiceEntry<S> {
     encryption_secret: StaticSecret,
     encryption_public: X25519Public,
     signing_key: SigningKey,
+    registered_paths: HashMap<PathHash, String>,
 }
 
 struct Receipt {
@@ -141,6 +77,7 @@ struct PathEntry {
     encryption_key: X25519Public,
     signing_key: VerifyingKey,
     ratchet_key: Option<X25519Public>,
+    app_data: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -189,6 +126,9 @@ pub struct Node<T, S, R = ThreadRng> {
     outbound_resources: HashMap<[u8; 32], (LinkId, Address, crate::resource::OutboundResource)>,
     inbound_resources: HashMap<[u8; 32], (LinkId, crate::resource::InboundResource)>,
     pending_resource_adverts: HashMap<[u8; 32], (LinkId, crate::resource::ResourceAdvertisement)>,
+    inbound_request_links: HashMap<RequestId, LinkId>,
+    destination_links: HashMap<Address, LinkId>,
+    pending_outbound_requests: HashMap<Address, Vec<(Address, String, Vec<u8>)>>,
 }
 
 impl<T: Transport, S: Service> Node<T, S, ThreadRng> {
@@ -221,6 +161,9 @@ impl<T: Transport, S: Service> Node<T, S, ThreadRng> {
             outbound_resources: HashMap::new(),
             inbound_resources: HashMap::new(),
             pending_resource_adverts: HashMap::new(),
+            inbound_request_links: HashMap::new(),
+            destination_links: HashMap::new(),
+            pending_outbound_requests: HashMap::new(),
         }
     }
 }
@@ -254,6 +197,9 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             outbound_resources: HashMap::new(),
             inbound_resources: HashMap::new(),
             pending_resource_adverts: HashMap::new(),
+            inbound_request_links: HashMap::new(),
+            destination_links: HashMap::new(),
+            pending_outbound_requests: HashMap::new(),
         }
     }
 
@@ -261,6 +207,256 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         let id = self.interfaces.len();
         self.interfaces.push(interface);
         id
+    }
+
+    pub fn register_path(&mut self, service_address: Address, path: &str) {
+        let path_hash = crate::request::path_hash(path);
+        if let Some(entry) = self
+            .services
+            .iter_mut()
+            .find(|s| s.address == service_address)
+        {
+            entry.registered_paths.insert(path_hash, path.to_string());
+        }
+    }
+
+    fn build_destinations(&self) -> Vec<Destination> {
+        self.path_table
+            .iter()
+            .map(|(addr, entry)| Destination {
+                address: *addr,
+                app_data: entry.app_data.clone(),
+                hops: entry.hops,
+                last_seen: entry.timestamp,
+            })
+            .collect()
+    }
+
+    fn dispatch_to_service<F>(&mut self, service_idx: usize, now: Instant, f: F)
+    where
+        F: FnOnce(&mut S, &mut NodeHandle),
+    {
+        let destinations = self.build_destinations();
+        let pending = {
+            let Node { services, .. } = self;
+            let entry = &mut services[service_idx];
+            let mut handle = NodeHandle {
+                service_address: entry.address,
+                destinations: &destinations,
+                pending: Vec::new(),
+            };
+            f(&mut entry.service, &mut handle);
+            handle.pending
+        };
+        self.process_pending_actions(service_idx, pending, now);
+    }
+
+    fn process_pending_actions(
+        &mut self,
+        service_idx: usize,
+        actions: Vec<PendingAction>,
+        now: Instant,
+    ) {
+        let service_addr = self.services[service_idx].address;
+
+        for action in actions {
+            match action {
+                PendingAction::SendRaw { destination, data } => {
+                    self.send_single_data(destination, &data, now);
+                }
+                PendingAction::Request {
+                    destination,
+                    path,
+                    data,
+                } => {
+                    self.send_request(service_addr, destination, &path, data, now);
+                }
+                PendingAction::Respond { request_id, data } => {
+                    self.send_response(request_id, data, now);
+                }
+                PendingAction::Announce { app_data } => {
+                    if let Some(data) = app_data {
+                        self.announce_with_app_data(service_addr, Some(data), now);
+                    } else {
+                        self.announce(service_addr, now);
+                    }
+                }
+                PendingAction::RequestPath { destination } => {
+                    self.request_path(destination, now);
+                }
+            }
+        }
+    }
+
+    fn send_single_data(&mut self, destination: Address, data: &[u8], now: Instant) {
+        use crate::crypto::SingleDestEncryption;
+
+        if let Some(entry) = self.path_table.get(&destination) {
+            let (ephemeral_pub, ciphertext) =
+                SingleDestEncryption::encrypt(&mut self.rng, &entry.encryption_key, data);
+            let mut payload = ephemeral_pub.as_bytes().to_vec();
+            payload.extend(ciphertext);
+
+            let dest = if entry.hops > 1 {
+                DataDestination::Transport {
+                    transport_id: entry.next_hop,
+                    destination,
+                }
+            } else {
+                DataDestination::Single(destination)
+            };
+            let packet = Packet::Data {
+                hops: 0,
+                destination: dest,
+                context: DataContext::None,
+                data: payload,
+            };
+            let target = entry.receiving_interface;
+            if let Some(iface) = self.interfaces.get_mut(target) {
+                iface.send(packet, 0, now);
+            }
+        }
+    }
+
+    pub(crate) fn send_request(
+        &mut self,
+        service_addr: Address,
+        destination: Address,
+        path: &str,
+        data: Vec<u8>,
+        now: Instant,
+    ) {
+        use crate::packet::LinkDataDestination;
+
+        let link_id = self.destination_links.get(&destination).copied();
+
+        if let Some(link_id) = link_id {
+            if let Some(link) = self.established_links.get_mut(&link_id) {
+                let req = Request::new(path, data);
+                let encoded = req.encode();
+                let ciphertext = link.encrypt(&mut self.rng, &encoded);
+
+                let packet = Packet::LinkData {
+                    hops: 0,
+                    destination: LinkDataDestination::Direct(link_id),
+                    context: LinkContext::Request,
+                    data: ciphertext,
+                };
+                let request_id: RequestId = packet.packet_hash()[..16].try_into().unwrap();
+                link.pending_requests.insert(request_id, service_addr);
+
+                for iface in &mut self.interfaces {
+                    iface.send(packet.clone(), 0, now);
+                }
+            }
+        } else {
+            self.pending_outbound_requests
+                .entry(destination)
+                .or_default()
+                .push((service_addr, path.to_string(), data));
+
+            self.link(destination, Some(service_addr), now);
+        }
+    }
+
+    fn send_response(&mut self, request_id: RequestId, data: Vec<u8>, now: Instant) {
+        use crate::packet::LinkDataDestination;
+
+        if let Some(link_id) = self.inbound_request_links.remove(&request_id) {
+            if let Some(link) = self.established_links.get(&link_id) {
+                if data.len() <= LINK_MDU {
+                    let resp = Response::new(request_id, data);
+                    let ciphertext = link.encrypt(&mut self.rng, &resp.encode());
+
+                    let packet = Packet::LinkData {
+                        hops: 0,
+                        destination: LinkDataDestination::Direct(link_id),
+                        context: LinkContext::Response,
+                        data: ciphertext,
+                    };
+                    for iface in &mut self.interfaces {
+                        iface.send(packet.clone(), 0, now);
+                    }
+                } else {
+                    let mut resource = crate::resource::OutboundResource::new(
+                        &mut self.rng,
+                        link,
+                        data,
+                        None,
+                        true,
+                        true,
+                        Some(request_id.to_vec()),
+                    );
+                    let adv = resource.advertisement(91);
+                    let adv_data = adv.encode();
+                    let hash = resource.hash;
+
+                    let ciphertext = link.encrypt(&mut self.rng, &adv_data);
+                    let packet = Packet::LinkData {
+                        hops: 0,
+                        destination: LinkDataDestination::Direct(link_id),
+                        context: LinkContext::ResourceAdv,
+                        data: ciphertext,
+                    };
+
+                    self.outbound_resources
+                        .insert(hash, (link_id, link.destination, resource));
+
+                    for iface in &mut self.interfaces {
+                        iface.send(packet.clone(), 0, now);
+                    }
+                }
+            }
+        }
+    }
+
+    fn dispatch_notifications(&mut self, notifications: Vec<ServiceNotification>, now: Instant) {
+        for notification in notifications {
+            match notification {
+                ServiceNotification::Request {
+                    service_idx,
+                    link_id,
+                    request_id,
+                    from,
+                    path,
+                    data,
+                } => {
+                    self.inbound_request_links.insert(request_id, link_id);
+                    self.dispatch_to_service(service_idx, now, |service, handle| {
+                        service.on_request(handle, request_id, from, &path, &data);
+                    });
+                }
+                ServiceNotification::Response {
+                    service_idx,
+                    request_id,
+                    from,
+                    data,
+                } => {
+                    self.dispatch_to_service(service_idx, now, |service, handle| {
+                        service.on_response(handle, from, &data);
+                    });
+                    let _ = request_id; // TODO: could pass to callback if needed
+                }
+                ServiceNotification::Data {
+                    service_idx,
+                    from,
+                    data,
+                } => {
+                    self.dispatch_to_service(service_idx, now, |service, handle| {
+                        service.on_raw(handle, from, &data);
+                    });
+                }
+                ServiceNotification::Raw {
+                    service_idx,
+                    from,
+                    data,
+                } => {
+                    self.dispatch_to_service(service_idx, now, |service, handle| {
+                        service.on_raw(handle, from, &data);
+                    });
+                }
+            }
+        }
     }
 
     pub fn has_destination(&self, dest: &Address) -> bool {
@@ -290,19 +486,18 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
         self.send_link_packet(link_id, LinkContext::LinkClose, &ciphertext, now);
 
-        let destination = if let Some(link) = self.established_links.get_mut(&link_id) {
-            link.state = LinkState::Closed;
-            Some(link.destination)
-        } else {
-            None
-        };
+        let (destination, service_idx) =
+            if let Some(link) = self.established_links.get_mut(&link_id) {
+                link.state = LinkState::Closed;
+                let dest = link.destination;
+                let idx = self.services.iter().position(|s| s.address == dest);
+                (Some(dest), idx)
+            } else {
+                (None, None)
+            };
 
-        if let Some(dest) = destination
-            && let Some(service_idx) = self.services.iter().position(|s| s.address == dest)
-        {
-            self.services[service_idx]
-                .service
-                .inbound(InboundMessage::LinkClosed { link_id });
+        if let Some(dest) = destination {
+            self.destination_links.remove(&dest);
         }
 
         log::debug!("Closed link <{}>", hex::encode(link_id));
@@ -346,6 +541,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             encryption_secret,
             encryption_public,
             signing_key,
+            registered_paths: HashMap::new(),
         });
 
         address
@@ -522,6 +718,8 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         interface_index: usize,
         now: Instant,
     ) -> Option<(Packet, bool, bool)> {
+        let mut notifications: Vec<ServiceNotification> = Vec::new();
+
         let mut packet = match Packet::from_bytes(raw) {
             Ok(p) => p,
             Err(e) => {
@@ -821,6 +1019,11 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     };
 
                     // Update path table
+                    let app_data = if announce.app_data.is_empty() {
+                        None
+                    } else {
+                        Some(announce.app_data.clone())
+                    };
                     self.path_table.insert(
                         destination_hash,
                         PathEntry {
@@ -831,6 +1034,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                             encryption_key: announce.encryption_public_key(),
                             signing_key,
                             ratchet_key: announce.ratchet.map(X25519Public::from),
+                            app_data,
                         },
                     );
 
@@ -901,18 +1105,12 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 let proof_packet = self.make_link_proof_packet(new_link_id, proof.to_bytes());
 
                 self.established_links.insert(new_link_id, link);
+                self.destination_links.insert(destination_hash, new_link_id);
 
                 log::debug!("Sending LinkProof for link <{}>", hex::encode(new_link_id));
                 if let Some(iface) = self.interfaces.get_mut(interface_index) {
                     iface.send(proof_packet, 0, now);
                 }
-
-                // Notify service of link establishment
-                self.services[service_idx]
-                    .service
-                    .inbound(InboundMessage::LinkEstablished {
-                        link_id: new_link_id,
-                    });
 
                 log::debug!(
                     "Established link <{}> as responder for service <{}>",
@@ -936,18 +1134,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             } else if *context == LinkContext::LinkClose {
                 // Verify the close packet contains the link_id
                 if plaintext.as_slice() == link_id {
+                    let dest = link.destination;
                     link.state = LinkState::Closed;
+                    self.destination_links.remove(&dest);
                     log::debug!("Link <{}> closed by remote", hex::encode(link_id));
-                    // Notify service
-                    if let Some(service_idx) = self
-                        .services
-                        .iter()
-                        .position(|s| s.address == link.destination)
-                    {
-                        self.services[service_idx]
-                            .service
-                            .inbound(InboundMessage::LinkClosed { link_id });
-                    }
                 }
             } else if matches!(
                 context,
@@ -966,41 +1156,54 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     && let Some(service_idx) =
                         self.services.iter().position(|s| s.address == service_addr)
                 {
-                    let msg = InboundMessage::Response {
+                    let from = link.destination;
+                    notifications.push(ServiceNotification::Response {
+                        service_idx,
                         request_id: resp.request_id,
+                        from,
                         data: resp.data,
-                    };
-                    self.services[service_idx].service.inbound(msg);
+                    });
                 }
             } else if let Some(service_idx) = self
                 .services
                 .iter()
                 .position(|s| s.address == link.destination)
             {
-                let msg = match context {
+                let from = link.destination;
+                match context {
                     LinkContext::Request => {
                         if let Some(req) = Request::decode(&plaintext) {
-                            let request_id: crate::RequestId =
+                            let request_id: RequestId =
                                 packet.packet_hash()[..16].try_into().unwrap();
-                            InboundMessage::Request {
+                            let path = self.services[service_idx]
+                                .registered_paths
+                                .get(&req.path_hash)
+                                .cloned()
+                                .unwrap_or_default();
+                            notifications.push(ServiceNotification::Request {
+                                service_idx,
                                 link_id,
                                 request_id,
-                                path_hash: req.path_hash,
+                                from,
+                                path,
                                 data: req.data,
-                            }
+                            });
                         } else {
-                            InboundMessage::LinkData {
-                                link_id,
+                            notifications.push(ServiceNotification::Data {
+                                service_idx,
+                                from,
                                 data: plaintext,
-                            }
+                            });
                         }
                     }
-                    _ => InboundMessage::LinkData {
-                        link_id,
-                        data: plaintext,
-                    },
+                    _ => {
+                        notifications.push(ServiceNotification::Data {
+                            service_idx,
+                            from,
+                            data: plaintext,
+                        });
+                    }
                 };
-                self.services[service_idx].service.inbound(msg);
             }
         }
 
@@ -1026,8 +1229,12 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     &ephemeral_public,
                     ciphertext,
                 ) {
-                    let msg = InboundMessage::SingleData { data: plaintext };
-                    self.services[service_idx].service.inbound(msg);
+                    // Note: SingleData doesn't have sender info, using [0;16] as placeholder
+                    notifications.push(ServiceNotification::Raw {
+                        service_idx,
+                        from: [0u8; 16],
+                        data: plaintext,
+                    });
                 }
             }
         }
@@ -1086,11 +1293,12 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 }
 
                 // Establish the link using the responder's public key from the proof
-                let initiating_service = pending.initiating_service;
+                let dest = pending.destination;
                 let link = EstablishedLink::from_initiator(pending, &proof.encryption_public, now);
                 let rtt_secs = link.rtt_seconds();
 
                 self.established_links.insert(destination_hash, link);
+                self.destination_links.insert(dest, destination_hash);
 
                 // Send LRRTT packet to inform responder of the measured RTT
                 if let Some(rtt) = rtt_secs {
@@ -1098,24 +1306,18 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     self.send_link_packet(destination_hash, LinkContext::LinkRtt, &rtt_data, now);
                 }
 
-                // Notify initiating service
-                if let Some(service_addr) = initiating_service {
-                    if let Some(service_idx) =
-                        self.services.iter().position(|s| s.address == service_addr)
-                    {
-                        self.services[service_idx].service.inbound(
-                            InboundMessage::LinkEstablished {
-                                link_id: destination_hash,
-                            },
-                        );
-                    }
-                }
-
                 log::debug!(
                     "Link <{}> established as initiator, RTT: {:?}ms",
                     hex::encode(destination_hash),
                     rtt_secs.map(|r| (r * 1000.0) as u64)
                 );
+
+                // Send any pending requests that were waiting for this link
+                if let Some(pending_requests) = self.pending_outbound_requests.remove(&dest) {
+                    for (service_addr, path, data) in pending_requests {
+                        self.send_request(service_addr, dest, &path, data, now);
+                    }
+                }
             }
         }
 
@@ -1169,6 +1371,8 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 });
             }
         }
+
+        self.dispatch_notifications(notifications, now);
 
         Some((packet, for_local_service, for_local_link))
     }
@@ -1355,7 +1559,6 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             self.outbound(packet, Some(source), now);
         }
 
-        self.drain_service_outbound(now);
         self.maintain_links(now);
 
         for iface in &mut self.interfaces {
@@ -1480,26 +1683,36 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         plaintext: &[u8],
         now: Instant,
     ) {
-        use crate::resource::{MAPHASH_LEN, ResourceAdvertisement};
+        use crate::resource::MAPHASH_LEN;
 
         match context {
             LinkContext::ResourceAdv => {
+                use crate::resource::ResourceAdvertisement;
+
                 if let Some(adv) = ResourceAdvertisement::decode(plaintext) {
-                    let hash = adv.hash;
-                    if let Some(service_idx) = self.established_links.get(&link_id).and_then(|l| {
-                        self.services
-                            .iter()
-                            .position(|s| s.address == l.destination)
-                    }) {
-                        self.pending_resource_adverts
-                            .insert(hash, (link_id, adv.clone()));
-                        let msg = InboundMessage::ResourceAdvertised {
-                            link_id,
-                            hash,
-                            size: adv.transfer_size,
-                            metadata: adv.metadata,
-                        };
-                        self.services[service_idx].service.inbound(msg);
+                    // Auto-accept if this is a response to a pending request
+                    if adv.is_response {
+                        if let Some(ref req_id_bytes) = adv.request_id {
+                            if let Some(link) = self.established_links.get(&link_id) {
+                                // Check if we have a pending request with this ID
+                                let req_id: Option<RequestId> =
+                                    req_id_bytes.get(..16).and_then(|b| b.try_into().ok());
+
+                                if let Some(request_id) = req_id {
+                                    if link.pending_requests.contains_key(&request_id) {
+                                        // Auto-accept the resource
+                                        let hash = adv.hash;
+                                        let mut resource =
+                                            crate::resource::InboundResource::from_advertisement(
+                                                &adv,
+                                            );
+                                        resource.mark_transferring();
+                                        self.inbound_resources.insert(hash, (link_id, resource));
+                                        self.send_resource_request(link_id, hash, now);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1563,27 +1776,8 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 let mut completed = None;
                 for (hash, (res_link_id, resource)) in &mut self.inbound_resources {
                     if *res_link_id == link_id {
-                        let old_progress = resource.progress();
-                        if resource.receive_part(plaintext.to_vec()) {
-                            let new_progress = resource.progress();
-                            if ((new_progress - old_progress) >= 0.05 || new_progress >= 1.0)
-                                && let Some(service_idx) =
-                                    self.established_links.get(&link_id).and_then(|l| {
-                                        self.services
-                                            .iter()
-                                            .position(|s| s.address == l.destination)
-                                    })
-                            {
-                                let msg = InboundMessage::ResourceProgress {
-                                    link_id,
-                                    hash: *hash,
-                                    progress: new_progress,
-                                };
-                                self.services[service_idx].service.inbound(msg);
-                            }
-                            if resource.is_complete() {
-                                completed = Some(*hash);
-                            }
+                        if resource.receive_part(plaintext.to_vec()) && resource.is_complete() {
+                            completed = Some(*hash);
                         }
                         break;
                     }
@@ -1609,24 +1803,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 }
                 let hash: [u8; 32] = plaintext[..32].try_into().unwrap();
                 let proof: [u8; 32] = plaintext[32..64].try_into().unwrap();
-                if let Some((res_link_id, service_addr, resource)) =
-                    self.outbound_resources.get_mut(&hash)
+                if let Some((_, _, resource)) = self.outbound_resources.get_mut(&hash)
                     && resource.verify_proof(&proof)
                 {
                     resource.mark_complete();
-                    if let Some(service_idx) = self
-                        .services
-                        .iter()
-                        .position(|s| s.address == *service_addr)
-                    {
-                        let msg = InboundMessage::ResourceComplete {
-                            link_id: *res_link_id,
-                            hash,
-                            data: Vec::new(),
-                            metadata: resource.metadata.clone(),
-                        };
-                        self.services[service_idx].service.inbound(msg);
-                    }
                 }
             }
             LinkContext::ResourceIcl | LinkContext::ResourceRcl => {
@@ -1637,15 +1817,6 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 self.inbound_resources.remove(&hash);
                 self.outbound_resources.remove(&hash);
                 self.pending_resource_adverts.remove(&hash);
-
-                if let Some(service_idx) = self.established_links.get(&link_id).and_then(|l| {
-                    self.services
-                        .iter()
-                        .position(|s| s.address == l.destination)
-                }) {
-                    let msg = InboundMessage::ResourceFailed { link_id, hash };
-                    self.services[service_idx].service.inbound(msg);
-                }
             }
             _ => {}
         }
@@ -1658,6 +1829,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             && let Some(link) = self.established_links.get(&link_id)
         {
             if let Some(data) = resource.assemble(link) {
+                // Send proof
                 let proof = resource.generate_proof();
                 let mut payload = hash.to_vec();
                 payload.extend(&proof);
@@ -1672,26 +1844,40 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     iface.send(packet.clone(), 0, now);
                 }
 
-                if let Some(service_idx) = self
-                    .services
-                    .iter()
-                    .position(|s| s.address == link.destination)
-                {
-                    let msg = InboundMessage::ResourceComplete {
-                        link_id,
-                        hash,
-                        data,
-                        metadata: resource.metadata.clone(),
-                    };
-                    self.services[service_idx].service.inbound(msg);
+                // If this was a response to a pending request, deliver via on_response
+                if resource.is_response {
+                    if let Some(ref req_id_bytes) = resource.request_id {
+                        let req_id: Option<RequestId> =
+                            req_id_bytes.get(..16).and_then(|b| b.try_into().ok());
+
+                        if let Some(request_id) = req_id {
+                            // Look up the service that made the request
+                            let service_info = self
+                                .established_links
+                                .get_mut(&link_id)
+                                .and_then(|l| l.pending_requests.remove(&request_id))
+                                .and_then(|service_addr| {
+                                    self.services.iter().position(|s| s.address == service_addr)
+                                });
+
+                            if let Some(service_idx) = service_info {
+                                let from = self
+                                    .established_links
+                                    .get(&link_id)
+                                    .map(|l| l.destination)
+                                    .unwrap_or([0u8; 16]);
+
+                                let notification = ServiceNotification::Response {
+                                    service_idx,
+                                    request_id,
+                                    from,
+                                    data,
+                                };
+                                self.dispatch_notifications(vec![notification], now);
+                            }
+                        }
+                    }
                 }
-            } else if let Some(service_idx) = self
-                .services
-                .iter()
-                .position(|s| s.address == link.destination)
-            {
-                let msg = InboundMessage::ResourceFailed { link_id, hash };
-                self.services[service_idx].service.inbound(msg);
             }
         }
     }
@@ -1700,14 +1886,19 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         use crate::packet::LinkDataDestination;
 
         if let Some((_, resource)) = self.inbound_resources.get_mut(&hash) {
-            let needed = resource.needed_hashes();
+            let (needed, exhausted) = resource.needed_hashes();
             if needed.is_empty() && resource.is_complete() {
                 return;
             }
 
-            let exhausted = resource.is_hashmap_exhausted();
+            use crate::resource::{HASHMAP_IS_EXHAUSTED, HASHMAP_IS_NOT_EXHAUSTED};
+
             let mut payload = Vec::new();
-            payload.push(if exhausted { 1u8 } else { 0u8 });
+            payload.push(if exhausted {
+                HASHMAP_IS_EXHAUSTED
+            } else {
+                HASHMAP_IS_NOT_EXHAUSTED
+            });
             if exhausted && let Some(last_hash) = resource.last_hashmap_hash() {
                 payload.extend(&last_hash);
             }
@@ -1726,178 +1917,6 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 };
                 for iface in &mut self.interfaces {
                     iface.send(packet.clone(), 0, now);
-                }
-            }
-        }
-    }
-
-    fn drain_service_outbound(&mut self, now: Instant) {
-        use crate::crypto::SingleDestEncryption;
-        use crate::packet::LinkDataDestination;
-
-        let mut messages = Vec::new();
-        for entry in &mut self.services {
-            while let Some(msg) = entry.service.outbound() {
-                messages.push((entry.address, msg));
-            }
-        }
-
-        for (service_addr, msg) in messages {
-            match msg {
-                OutboundMessage::Link { destination } => {
-                    self.link(destination, Some(service_addr), now);
-                }
-                OutboundMessage::CloseLink { link_id } => {
-                    self.close_link(link_id, now);
-                }
-                OutboundMessage::LinkData { link_id, data } => {
-                    if let Some(link) = self.established_links.get(&link_id) {
-                        let ciphertext = link.encrypt(&mut self.rng, &data);
-                        let packet = Packet::LinkData {
-                            hops: 0,
-                            destination: LinkDataDestination::Direct(link_id),
-                            context: LinkContext::None,
-                            data: ciphertext,
-                        };
-                        for iface in &mut self.interfaces {
-                            iface.send(packet.clone(), 0, now);
-                        }
-                    }
-                }
-                OutboundMessage::SingleData { destination, data } => {
-                    if let Some(entry) = self.path_table.get(&destination) {
-                        let (ephemeral_pub, ciphertext) = SingleDestEncryption::encrypt(
-                            &mut self.rng,
-                            &entry.encryption_key,
-                            &data,
-                        );
-                        let mut payload = ephemeral_pub.as_bytes().to_vec();
-                        payload.extend(ciphertext);
-
-                        let dest = if entry.hops > 1 {
-                            DataDestination::Transport {
-                                transport_id: entry.next_hop,
-                                destination,
-                            }
-                        } else {
-                            DataDestination::Single(destination)
-                        };
-                        let packet = Packet::Data {
-                            hops: 0,
-                            destination: dest,
-                            context: DataContext::None,
-                            data: payload,
-                        };
-                        let target = entry.receiving_interface;
-                        if let Some(iface) = self.interfaces.get_mut(target) {
-                            iface.send(packet, 0, now);
-                        }
-                    }
-                }
-                OutboundMessage::Request {
-                    link_id,
-                    path,
-                    data,
-                } => {
-                    if let Some(link) = self.established_links.get_mut(&link_id) {
-                        let req = Request::new(&path, data);
-                        let encoded = req.encode();
-                        let ciphertext = link.encrypt(&mut self.rng, &encoded);
-
-                        let packet = Packet::LinkData {
-                            hops: 0,
-                            destination: LinkDataDestination::Direct(link_id),
-                            context: LinkContext::Request,
-                            data: ciphertext,
-                        };
-                        let request_id: crate::RequestId =
-                            packet.packet_hash()[..16].try_into().unwrap();
-                        link.pending_requests.insert(request_id, service_addr);
-
-                        for iface in &mut self.interfaces {
-                            iface.send(packet.clone(), 0, now);
-                        }
-                    }
-                }
-                OutboundMessage::Response {
-                    link_id,
-                    request_id,
-                    data,
-                } => {
-                    if let Some(link) = self.established_links.get(&link_id) {
-                        let resp = Response::new(request_id, data);
-                        let ciphertext = link.encrypt(&mut self.rng, &resp.encode());
-
-                        let packet = Packet::LinkData {
-                            hops: 0,
-                            destination: LinkDataDestination::Direct(link_id),
-                            context: LinkContext::Response,
-                            data: ciphertext,
-                        };
-                        for iface in &mut self.interfaces {
-                            iface.send(packet.clone(), 0, now);
-                        }
-                    }
-                }
-                OutboundMessage::ResourceSend {
-                    link_id,
-                    data,
-                    metadata,
-                    compress,
-                } => {
-                    if let Some(link) = self.established_links.get(&link_id) {
-                        let mut resource = crate::resource::OutboundResource::new(
-                            &mut self.rng,
-                            link,
-                            data,
-                            metadata,
-                            compress,
-                        );
-                        let adv = resource.advertisement(100);
-                        let adv_data = adv.encode();
-                        let hash = resource.hash;
-
-                        let ciphertext = link.encrypt(&mut self.rng, &adv_data);
-                        let packet = Packet::LinkData {
-                            hops: 0,
-                            destination: LinkDataDestination::Direct(link_id),
-                            context: LinkContext::ResourceAdv,
-                            data: ciphertext,
-                        };
-
-                        self.outbound_resources
-                            .insert(hash, (link_id, service_addr, resource));
-
-                        for iface in &mut self.interfaces {
-                            iface.send(packet.clone(), 0, now);
-                        }
-                    }
-                }
-                OutboundMessage::ResourceAccept { link_id, hash } => {
-                    if let Some((_, adv)) = self.pending_resource_adverts.remove(&hash) {
-                        let mut resource =
-                            crate::resource::InboundResource::from_advertisement(&adv);
-                        resource.mark_transferring();
-                        self.inbound_resources.insert(hash, (link_id, resource));
-                        self.send_resource_request(link_id, hash, now);
-                    }
-                }
-                OutboundMessage::ResourceReject { link_id, hash } => {
-                    self.pending_resource_adverts.remove(&hash);
-                    if let Some(link) = self.established_links.get(&link_id) {
-                        let mut payload = vec![0u8]; // flags
-                        payload.extend(&hash);
-                        let ciphertext = link.encrypt(&mut self.rng, &payload);
-                        let packet = Packet::LinkData {
-                            hops: 0,
-                            destination: LinkDataDestination::Direct(link_id),
-                            context: LinkContext::ResourceRcl,
-                            data: ciphertext,
-                        };
-                        for iface in &mut self.interfaces {
-                            iface.send(packet.clone(), 0, now);
-                        }
-                    }
                 }
             }
         }
@@ -1961,18 +1980,20 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use crate::handle::NodeHandle;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     struct MockTransport {
-        outbox: VecDeque<Vec<u8>>,
-        inbox: VecDeque<Vec<u8>>,
+        outbox: std::collections::VecDeque<Vec<u8>>,
+        inbox: std::collections::VecDeque<Vec<u8>>,
     }
 
     impl MockTransport {
         fn new() -> Self {
             Self {
-                outbox: VecDeque::new(),
-                inbox: VecDeque::new(),
+                outbox: std::collections::VecDeque::new(),
+                inbox: std::collections::VecDeque::new(),
             }
         }
     }
@@ -2001,31 +2022,99 @@ mod tests {
         Interface::new(MockTransport::new())
     }
 
+    #[derive(Clone)]
+    struct ReceivedRequest {
+        request_id: RequestId,
+        from: Address,
+        path: String,
+        data: Vec<u8>,
+    }
+
+    #[derive(Clone)]
+    struct ReceivedResponse {
+        from: Address,
+        data: Vec<u8>,
+    }
+
+    #[derive(Clone)]
+    struct ReceivedRaw {
+        from: Address,
+        data: Vec<u8>,
+    }
+
     #[derive(Default)]
+    struct TestServiceState {
+        requests: Vec<ReceivedRequest>,
+        responses: Vec<ReceivedResponse>,
+        raw_messages: Vec<ReceivedRaw>,
+    }
+
     struct TestService {
         name: String,
-        inbox: Vec<InboundMessage>,
-        outbox: VecDeque<OutboundMessage>,
+        state: Rc<RefCell<TestServiceState>>,
+        auto_response: Option<Vec<u8>>,
+    }
+
+    impl TestService {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.into(),
+                state: Rc::new(RefCell::new(TestServiceState::default())),
+                auto_response: None,
+            }
+        }
+
+        fn with_auto_response(mut self, response: Vec<u8>) -> Self {
+            self.auto_response = Some(response);
+            self
+        }
+
+        fn state(&self) -> Rc<RefCell<TestServiceState>> {
+            self.state.clone()
+        }
     }
 
     impl Service for TestService {
         fn name(&self) -> &str {
             &self.name
         }
-        fn inbound(&mut self, msg: InboundMessage) {
-            self.inbox.push(msg);
+
+        fn on_raw(&mut self, _handle: &mut NodeHandle, from: Address, data: &[u8]) {
+            self.state.borrow_mut().raw_messages.push(ReceivedRaw {
+                from,
+                data: data.to_vec(),
+            });
         }
-        fn outbound(&mut self) -> Option<OutboundMessage> {
-            self.outbox.pop_front()
+
+        fn on_request(
+            &mut self,
+            handle: &mut NodeHandle,
+            request_id: RequestId,
+            from: Address,
+            path: &str,
+            data: &[u8],
+        ) {
+            self.state.borrow_mut().requests.push(ReceivedRequest {
+                request_id,
+                from,
+                path: path.to_string(),
+                data: data.to_vec(),
+            });
+            if let Some(ref response) = self.auto_response {
+                handle.respond(request_id, response);
+            }
+        }
+
+        fn on_response(&mut self, _handle: &mut NodeHandle, from: Address, data: &[u8]) {
+            self.state.borrow_mut().responses.push(ReceivedResponse {
+                from,
+                data: data.to_vec(),
+            });
         }
     }
 
     fn svc(name: &str) -> TestService {
-        TestService {
-            name: name.into(),
-            inbox: Vec::new(),
-            outbox: VecDeque::new(),
-        }
+        TestService::new(name)
     }
 
     #[test]
@@ -2162,7 +2251,9 @@ mod tests {
         a.add_interface(test_interface());
         b.add_interface(test_interface());
 
-        let addr_b = b.add_service(svc("server"));
+        let svc_b = svc("server");
+        let state_b = svc_b.state();
+        let addr_b = b.add_service(svc_b);
         let now = Instant::now();
 
         b.announce(addr_b, now);
@@ -2182,16 +2273,10 @@ mod tests {
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
 
-        // B receives LinkEstablished + LinkData
-        assert_eq!(b.services[0].service.inbox.len(), 2);
-        assert!(matches!(
-            &b.services[0].service.inbox[0],
-            InboundMessage::LinkEstablished { .. }
-        ));
-        assert!(matches!(
-            &b.services[0].service.inbox[1],
-            InboundMessage::LinkData { .. }
-        ));
+        // B receives raw data via on_raw callback
+        let state = state_b.borrow();
+        assert_eq!(state.raw_messages.len(), 1);
+        assert_eq!(state.raw_messages[0].data, b"payload");
     }
 
     #[test]
@@ -2204,7 +2289,9 @@ mod tests {
         b.add_interface(test_interface());
         c.add_interface(test_interface());
 
-        let addr_c = c.add_service(svc("server"));
+        let svc_c = svc("server");
+        let state_c = svc_c.state();
+        let addr_c = c.add_service(svc_c);
         let now = Instant::now();
         let later = now + std::time::Duration::from_secs(1);
 
@@ -2234,89 +2321,10 @@ mod tests {
         transfer(&mut b, 1, &mut c, 0);
         c.poll(later);
 
-        // C receives LinkEstablished + LinkData
-        assert_eq!(c.services[0].service.inbox.len(), 2);
-        assert!(matches!(
-            &c.services[0].service.inbox[0],
-            InboundMessage::LinkEstablished { .. }
-        ));
-    }
-
-    #[test]
-    fn single_data_two_nodes() {
-        let mut a: TestNode = Node::new(true);
-        let mut b: TestNode = Node::new(true);
-        a.add_interface(test_interface());
-        b.add_interface(test_interface());
-
-        a.add_service(svc("sender"));
-        let addr_b = b.add_service(svc("receiver"));
-        let now = Instant::now();
-
-        b.announce(addr_b, now);
-        b.poll(now);
-        transfer(&mut b, 0, &mut a, 0);
-        a.poll(now);
-
-        a.services[0]
-            .service
-            .outbox
-            .push_back(OutboundMessage::SingleData {
-                destination: addr_b,
-                data: b"hello".to_vec(),
-            });
-        a.poll(now);
-        transfer(&mut a, 0, &mut b, 0);
-        b.poll(now);
-
-        assert_eq!(b.services[0].service.inbox.len(), 1);
-        assert!(matches!(
-            &b.services[0].service.inbox[0],
-            InboundMessage::SingleData { data } if data == b"hello"
-        ));
-    }
-
-    #[test]
-    fn single_data_three_nodes() {
-        let mut a: TestNode = Node::new(true);
-        let mut b: TestNode = Node::new(true);
-        let mut c: TestNode = Node::new(true);
-        a.add_interface(test_interface());
-        b.add_interface(test_interface());
-        b.add_interface(test_interface());
-        c.add_interface(test_interface());
-
-        a.add_service(svc("sender"));
-        let addr_c = c.add_service(svc("receiver"));
-        let now = Instant::now();
-        let later = now + std::time::Duration::from_secs(1);
-
-        c.announce(addr_c, now);
-        c.poll(now);
-        transfer(&mut c, 0, &mut b, 1);
-        b.poll(now);
-        b.poll(later); // rebroadcast after delay
-        transfer(&mut b, 0, &mut a, 0);
-        a.poll(later);
-
-        a.services[0]
-            .service
-            .outbox
-            .push_back(OutboundMessage::SingleData {
-                destination: addr_c,
-                data: b"hello".to_vec(),
-            });
-        a.poll(later);
-        transfer(&mut a, 0, &mut b, 0);
-        b.poll(later);
-        transfer(&mut b, 1, &mut c, 0);
-        c.poll(later);
-
-        assert_eq!(c.services[0].service.inbox.len(), 1);
-        assert!(matches!(
-            &c.services[0].service.inbox[0],
-            InboundMessage::SingleData { data } if data == b"hello"
-        ));
+        // C receives raw data via on_raw callback
+        let state = state_c.borrow();
+        assert_eq!(state.raw_messages.len(), 1);
+        assert_eq!(state.raw_messages[0].data, b"payload");
     }
 
     #[test]
@@ -2326,14 +2334,23 @@ mod tests {
         a.add_interface(test_interface());
         b.add_interface(test_interface());
 
-        a.add_service(svc("client"));
-        let addr_b = b.add_service(svc("server"));
+        let svc_a = svc("client");
+        let state_a = svc_a.state();
+        let addr_a = a.add_service(svc_a);
+
+        let svc_b = svc("server").with_auto_response(b"response data".to_vec());
+        let state_b = svc_b.state();
+        let addr_b = b.add_service(svc_b);
+        b.register_path(addr_b, "test.path");
         let now = Instant::now();
 
         b.announce(addr_b, now);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
+
+        // A should know about B's destination
+        assert!(a.has_destination(&addr_b));
 
         let link_id = a.link(addr_b, None, now).unwrap();
         a.poll(now);
@@ -2342,55 +2359,34 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        a.services[0]
-            .service
-            .outbox
-            .push_back(OutboundMessage::Request {
-                link_id,
-                path: "test.path".into(),
-                data: b"request data".to_vec(),
-            });
+        // Link should be established on both sides
+        assert!(a.established_links.contains_key(&link_id));
+        assert!(b.established_links.values().any(|l| l.link_id == link_id));
+
+        // Send request from A to B
+        a.send_request(addr_a, addr_b, "test.path", b"request data".to_vec(), now);
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
 
-        // B receives LinkEstablished + Request
-        assert_eq!(b.services[0].service.inbox.len(), 2);
-        assert!(matches!(
-            &b.services[0].service.inbox[0],
-            InboundMessage::LinkEstablished { .. }
-        ));
-        let (req_link_id, req_id) = match &b.services[0].service.inbox[1] {
-            InboundMessage::Request {
-                link_id,
-                request_id,
-                data,
-                ..
-            } => {
-                assert_eq!(data, b"request data");
-                (*link_id, *request_id)
-            }
-            _ => panic!("expected Request"),
-        };
+        // B should have received the request via on_request callback
+        {
+            let state = state_b.borrow();
+            assert_eq!(state.requests.len(), 1);
+            assert_eq!(state.requests[0].path, "test.path");
+            assert_eq!(state.requests[0].data, b"request data");
+        }
 
-        b.services[0]
-            .service
-            .outbox
-            .push_back(OutboundMessage::Response {
-                link_id: req_link_id,
-                request_id: req_id,
-                data: b"response data".to_vec(),
-            });
-        b.poll(now);
+        // B's auto_response should have sent a response, transfer it back
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        // A only receives Response (no LinkEstablished since A initiated with None)
-        assert_eq!(a.services[0].service.inbox.len(), 1);
-        assert!(matches!(
-            &a.services[0].service.inbox[0],
-            InboundMessage::Response { data, .. } if data == b"response data"
-        ));
+        // A should have received the response via on_response callback
+        {
+            let state = state_a.borrow();
+            assert_eq!(state.responses.len(), 1);
+            assert_eq!(state.responses[0].data, b"response data");
+        }
     }
 
     #[test]
@@ -2403,8 +2399,14 @@ mod tests {
         b.add_interface(test_interface());
         c.add_interface(test_interface());
 
-        a.add_service(svc("client"));
-        let addr_c = c.add_service(svc("server"));
+        let svc_a = svc("client");
+        let state_a = svc_a.state();
+        let addr_a = a.add_service(svc_a);
+
+        let svc_c = svc("server").with_auto_response(b"response data".to_vec());
+        let state_c = svc_c.state();
+        let addr_c = c.add_service(svc_c);
+        c.register_path(addr_c, "test.path");
         let now = Instant::now();
         let later = now + std::time::Duration::from_secs(1);
 
@@ -2415,6 +2417,9 @@ mod tests {
         b.poll(later); // rebroadcast after delay
         transfer(&mut b, 0, &mut a, 0);
         a.poll(later);
+
+        // A should know about C's destination (via B as transport)
+        assert!(a.has_destination(&addr_c));
 
         let link_id = a.link(addr_c, None, later).unwrap();
         a.poll(later);
@@ -2427,69 +2432,57 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(later);
 
-        a.services[0]
-            .service
-            .outbox
-            .push_back(OutboundMessage::Request {
-                link_id,
-                path: "test.path".into(),
-                data: b"request data".to_vec(),
-            });
+        // Link should be established on both ends
+        assert!(a.established_links.contains_key(&link_id));
+        assert!(c.established_links.values().any(|l| l.link_id == link_id));
+
+        // Send request from A to C (via B)
+        a.send_request(addr_a, addr_c, "test.path", b"request data".to_vec(), later);
         a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(later);
         transfer(&mut b, 1, &mut c, 0);
         c.poll(later);
 
-        // C receives LinkEstablished + Request
-        assert_eq!(c.services[0].service.inbox.len(), 2);
-        assert!(matches!(
-            &c.services[0].service.inbox[0],
-            InboundMessage::LinkEstablished { .. }
-        ));
-        let (req_link_id, req_id) = match &c.services[0].service.inbox[1] {
-            InboundMessage::Request {
-                link_id,
-                request_id,
-                data,
-                ..
-            } => {
-                assert_eq!(data, b"request data");
-                (*link_id, *request_id)
-            }
-            _ => panic!("expected Request"),
-        };
+        // C should have received the request via on_request callback
+        {
+            let state = state_c.borrow();
+            assert_eq!(state.requests.len(), 1);
+            assert_eq!(state.requests[0].path, "test.path");
+            assert_eq!(state.requests[0].data, b"request data");
+        }
 
-        c.services[0]
-            .service
-            .outbox
-            .push_back(OutboundMessage::Response {
-                link_id: req_link_id,
-                request_id: req_id,
-                data: b"response data".to_vec(),
-            });
-        c.poll(later);
+        // C's auto_response should have sent a response, transfer it back
         transfer(&mut c, 0, &mut b, 1);
         b.poll(later);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(later);
 
-        assert_eq!(a.services[0].service.inbox.len(), 1);
-        assert!(matches!(
-            &a.services[0].service.inbox[0],
-            InboundMessage::Response { data, .. } if data == b"response data"
-        ));
+        // A should have received the response via on_response callback
+        {
+            let state = state_a.borrow();
+            assert_eq!(state.responses.len(), 1);
+            assert_eq!(state.responses[0].data, b"response data");
+        }
     }
 
     #[test]
-    fn resource_two_nodes() {
+    fn large_response_uses_resource() {
         let mut a: TestNode = Node::new(true);
         let mut b: TestNode = Node::new(true);
         a.add_interface(test_interface());
         b.add_interface(test_interface());
 
-        a.add_service(svc("sender"));
-        let addr_b = b.add_service(svc("receiver"));
+        // Create a large response (> LINK_MDU of 431 bytes) to trigger resource transfer
+        let large_response: Vec<u8> = (0..500).map(|i| (i % 256) as u8).collect();
+
+        let svc_a = svc("client");
+        let state_a = svc_a.state();
+        let addr_a = a.add_service(svc_a);
+
+        let svc_b = svc("server").with_auto_response(large_response.clone());
+        let state_b = svc_b.state();
+        let addr_b = b.add_service(svc_b);
         let now = Instant::now();
 
         b.announce(addr_b, now);
@@ -2504,70 +2497,55 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let test_data = b"Hello, this is a resource transfer test with some data!".to_vec();
-        a.services[0]
-            .service
-            .outbox
-            .push_back(OutboundMessage::ResourceSend {
-                link_id,
-                data: test_data.clone(),
-                metadata: Some(b"test-meta".to_vec()),
-                compress: false,
-            });
-        a.poll(now);
-        println!("a.outbound_resources: {}", a.outbound_resources.len());
-        println!(
-            "a.interfaces[0].transport.outbox: {}",
-            a.interfaces[0].transport.outbox.len()
-        );
-        transfer(&mut a, 0, &mut b, 0);
-        b.poll(now);
-        println!("b.inbox.len: {}", b.services[0].service.inbox.len());
-        println!(
-            "b.pending_resource_adverts: {}",
-            b.pending_resource_adverts.len()
-        );
+        // Link should be established
+        assert!(a.established_links.contains_key(&link_id));
+        assert!(b.established_links.values().any(|l| l.link_id == link_id));
 
-        // B receives LinkEstablished + ResourceAdvertised
-        assert!(b.services[0].service.inbox.iter().any(|m| matches!(
-            m,
-            InboundMessage::ResourceAdvertised { size, .. } if *size > 0
-        )));
-
-        let hash = match &b.services[0].service.inbox[1] {
-            InboundMessage::ResourceAdvertised { hash, .. } => *hash,
-            _ => panic!(
-                "expected ResourceAdvertised, got {:?}",
-                &b.services[0].service.inbox[1]
-            ),
-        };
-
-        b.services[0]
-            .service
-            .outbox
-            .push_back(OutboundMessage::ResourceAccept { link_id, hash });
-        b.poll(now);
-        transfer(&mut b, 0, &mut a, 0);
+        // Send request from A to B
+        a.send_request(addr_a, addr_b, "test.path", b"request".to_vec(), now);
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
+
+        // B should have received the request
+        assert_eq!(state_b.borrow().requests.len(), 1);
+
+        // B should have an outbound resource for the large response
+        assert_eq!(
+            b.outbound_resources.len(),
+            1,
+            "large response should create outbound resource"
+        );
+
+        // Transfer resource advertisement and complete the transfer
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let b_complete = b.services[0].service.inbox.iter().any(|m| {
-            matches!(
-                m,
-                InboundMessage::ResourceComplete { data, .. } if data == &test_data
-            )
-        });
-        assert!(b_complete, "receiver should have complete resource");
+        // A should have an inbound resource
+        assert_eq!(
+            a.inbound_resources.len(),
+            1,
+            "should auto-accept response resource"
+        );
 
-        let a_complete = a.services[0]
-            .service
-            .inbox
-            .iter()
-            .any(|m| matches!(m, InboundMessage::ResourceComplete { .. }));
-        assert!(a_complete, "sender should get completion notification");
+        // Transfer resource request back
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        // Transfer resource parts
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        // Transfer proof
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        // A should have received the large response via on_response callback
+        {
+            let state = state_a.borrow();
+            assert_eq!(state.responses.len(), 1);
+            assert_eq!(state.responses[0].data, large_response);
+        }
     }
 
     #[test]
@@ -2855,7 +2833,9 @@ mod tests {
         b.add_interface(make_ifac_interface(shared_ifac_identity, shared_ifac_key));
 
         let _addr_a = a.add_service(svc("client"));
-        let addr_b = b.add_service(svc("server"));
+        let svc_b = svc("server");
+        let state_b = svc_b.state();
+        let addr_b = b.add_service(svc_b);
         let now = Instant::now();
 
         // B announces
@@ -2875,74 +2855,31 @@ mod tests {
         // A establishes link to B
         let link_id = a.link(addr_b, None, now).expect("should create link");
         a.poll(now);
-        println!(
-            "A outbox after link request: {}",
-            a.interfaces[0].transport.outbox.len()
-        );
         transfer(&mut a, 0, &mut b, 0);
-        println!(
-            "B inbox after transfer: {}",
-            b.interfaces[0].transport.inbox.len()
-        );
         b.poll(now);
-        println!(
-            "B outbox after poll: {}",
-            b.interfaces[0].transport.outbox.len()
-        );
-        println!("B established_links: {}", b.established_links.len());
-        println!("B ifac_size: {}", b.interfaces[0].ifac_size);
-        println!(
-            "B ifac_identity: {}",
-            b.interfaces[0].ifac_identity.is_some()
-        );
-        println!("B ifac_key: {}", b.interfaces[0].ifac_key.is_some());
-        if let Some(raw) = b.interfaces[0].transport.outbox.front() {
-            println!(
-                "B outbox packet len: {}, first byte: 0x{:02x}",
-                raw.len(),
-                raw[0]
-            );
-        }
         transfer(&mut b, 0, &mut a, 0);
-        println!(
-            "A inbox after transfer: {}",
-            a.interfaces[0].transport.inbox.len()
-        );
-        if let Some(raw) = a.interfaces[0].transport.inbox.front() {
-            println!(
-                "Raw packet len: {}, first byte: 0x{:02x}",
-                raw.len(),
-                raw[0]
-            );
-        }
         a.poll(now);
-        println!("A established_links: {}", a.established_links.len());
-        println!(
-            "A pending_outbound_links: {}",
-            a.pending_outbound_links.len()
-        );
 
+        // Link should be established on both sides
         assert!(
             a.is_link_established(&link_id),
             "link should be established over IFAC"
         );
+        assert!(
+            b.established_links.values().any(|l| l.link_id == link_id),
+            "B should have established link"
+        );
 
         // Send data over the link
-        a.services[0]
-            .service
-            .outbox
-            .push_back(OutboundMessage::LinkData {
-                link_id,
-                data: b"hello over ifac".to_vec(),
-            });
+        a.send_link_packet(link_id, LinkContext::None, b"hello over ifac", now);
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
 
-        let received = b.services[0].service.inbox.iter().any(
-            |m| matches!(m, InboundMessage::LinkData { data, .. } if data == b"hello over ifac"),
-        );
-        assert!(received, "B should receive data over IFAC-protected link");
+        // B should receive data via on_raw callback
+        let state = state_b.borrow();
+        assert_eq!(state.raw_messages.len(), 1);
+        assert_eq!(state.raw_messages[0].data, b"hello over ifac");
     }
 
     #[test]
