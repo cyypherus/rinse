@@ -2,6 +2,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
@@ -9,6 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::handle::{RequestError, RespondError};
 use crate::packet::Address;
 use crate::request::RequestId;
+use crate::stats::StatsSnapshot;
 use crate::transports::tcp::{HDLC_FLAG, hdlc_escape, hdlc_unescape};
 use crate::{Identity, Interface, NodeHandle, Service, Transport};
 
@@ -211,10 +214,13 @@ enum Command {
     GetDestinations {
         reply: oneshot::Sender<Vec<Destination>>,
     },
+    GetStats {
+        reply: oneshot::Sender<StatsSnapshot>,
+    },
 }
 
 pub struct AsyncNode {
-    node: crate::Node<AsyncTransport, BridgeService>,
+    node: crate::Node<AsyncTransport, BridgeService, StdRng>,
     command_tx: mpsc::UnboundedSender<Command>,
     command_rx: mpsc::UnboundedReceiver<Command>,
     wake_tx: mpsc::Sender<()>,
@@ -225,9 +231,10 @@ impl AsyncNode {
     pub fn new(transport: bool) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (wake_tx, wake_rx) = mpsc::channel(16);
+        let rng = StdRng::from_entropy();
 
         Self {
-            node: crate::Node::new(transport),
+            node: crate::Node::with_rng(rng, transport),
             command_tx,
             command_rx,
             wake_tx,
@@ -303,18 +310,25 @@ impl AsyncNode {
     }
 
     pub async fn run(mut self) {
+        let mut tick_interval = tokio::time::interval(Duration::from_millis(10));
+        tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             let now = Instant::now();
-            let timeout = self.node.poll(now);
-            let sleep_duration = timeout.unwrap_or(Duration::from_secs(60));
+            self.node.poll(now);
 
             tokio::select! {
                 biased;
                 Some(cmd) = self.command_rx.recv() => {
-                    self.handle_command(cmd, now);
+                    self.handle_command(cmd, Instant::now());
                 }
-                _ = self.wake_rx.recv() => {}
-                _ = tokio::time::sleep(sleep_duration) => {}
+                _ = self.wake_rx.recv() => {
+                    // Drain any extra wakes to prevent backup
+                    while self.wake_rx.try_recv().is_ok() {}
+                }
+                _ = tick_interval.tick() => {
+                    // Periodic tick ensures we poll regularly even without events
+                }
             }
         }
     }
@@ -361,6 +375,9 @@ impl AsyncNode {
                     .collect();
                 let _ = reply.send(destinations);
             }
+            Command::GetStats { reply } => {
+                let _ = reply.send(self.node.stats());
+            }
         }
     }
 }
@@ -375,9 +392,52 @@ pub struct ServiceHandle {
     respond_waiters: RespondWaiters,
 }
 
+#[derive(Clone)]
+pub struct Requester {
+    address: Address,
+    command_tx: mpsc::UnboundedSender<Command>,
+    request_waiters: RequestWaiters,
+}
+
+impl Requester {
+    pub async fn request(
+        &self,
+        dest: Address,
+        path: &str,
+        data: &[u8],
+    ) -> Result<Vec<u8>, RequestError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::Request {
+            service_addr: self.address,
+            dest,
+            path: path.to_string(),
+            data: data.to_vec(),
+            reply: reply_tx,
+        });
+
+        let request_id = reply_rx.await.map_err(|_| RequestError::LinkFailed)?;
+
+        let (waiter_tx, waiter_rx) = oneshot::channel();
+        self.request_waiters
+            .lock()
+            .unwrap()
+            .insert(request_id, waiter_tx);
+
+        waiter_rx.await.unwrap_or(Err(RequestError::LinkFailed))
+    }
+}
+
 impl ServiceHandle {
     pub fn address(&self) -> Address {
         self.address
+    }
+
+    pub fn requester(&self) -> Requester {
+        Requester {
+            address: self.address,
+            command_tx: self.command_tx.clone(),
+            request_waiters: self.request_waiters.clone(),
+        }
     }
 
     pub fn announce(&self) {
@@ -446,6 +506,12 @@ impl ServiceHandle {
     pub async fn recv_destinations_changed(&mut self) -> Option<Vec<Destination>> {
         self.destinations_rx.recv().await
     }
+
+    pub async fn stats(&self) -> StatsSnapshot {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::GetStats { reply: reply_tx });
+        reply_rx.await.unwrap_or_default()
+    }
 }
 
 async fn tcp_io_task(
@@ -466,30 +532,48 @@ async fn tcp_io_task(
             match reader.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
+                    log::trace!("[TCP IN] {} bytes raw", n);
                     hdlc_buf.extend_from_slice(&buf[..n]);
 
                     while let Some(frame) = hdlc_extract_frame(&mut hdlc_buf) {
+                        log::debug!(
+                            "[TCP IN] frame {} bytes: {}",
+                            frame.len(),
+                            hex::encode(&frame[..frame.len().min(32)])
+                        );
                         inbox.lock().unwrap().push_back(frame);
-                        let _ = wake_tx.send(()).await;
                     }
+                    // Wake the node once after processing all frames (non-blocking)
+                    let _ = wake_tx.try_send(());
                 }
-                Err(_) => break,
+                Err(e) => {
+                    log::debug!("[TCP IN] read error: {}", e);
+                    break;
+                }
             }
         }
+        log::debug!("[TCP IN] read task ended");
     };
 
     let write_task = async {
         loop {
             let data = outbox_writer.lock().unwrap().pop_front();
             if let Some(data) = data {
+                log::debug!(
+                    "[TCP OUT] frame {} bytes: {}",
+                    data.len(),
+                    hex::encode(&data[..data.len().min(32)])
+                );
                 let framed = hdlc_frame(&data);
                 if writer.write_all(&framed).await.is_err() {
+                    log::debug!("[TCP OUT] write error");
                     break;
                 }
             } else {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }
+        log::debug!("[TCP OUT] write task ended");
     };
 
     tokio::select! {

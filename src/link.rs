@@ -47,6 +47,17 @@ impl LinkRequest {
     pub fn link_id(hashable_part: &[u8]) -> LinkId {
         sha256(hashable_part)[..16].try_into().unwrap()
     }
+
+    pub fn link_id_from_packet(hashable_part: &[u8], data_len: usize) -> LinkId {
+        const ECPUBSIZE: usize = 64;
+        let truncated = if data_len > ECPUBSIZE {
+            let diff = data_len - ECPUBSIZE;
+            &hashable_part[..hashable_part.len() - diff]
+        } else {
+            hashable_part
+        };
+        sha256(truncated)[..16].try_into().unwrap()
+    }
 }
 
 // Link Proof: 115 bytes on wire
@@ -185,6 +196,12 @@ impl EstablishedLink {
             .initiator_encryption_secret
             .diffie_hellman(responder_public)
             .to_bytes();
+        log::debug!(
+            "from_initiator: link_id={} shared_key={} responder_pub={}",
+            hex::encode(pending.link_id),
+            hex::encode(shared_key),
+            hex::encode(responder_public.as_bytes())
+        );
         let keys = LinkEncryption::derive_keys(&shared_key, &pending.link_id);
         let rtt_ms = now.duration_since(pending.request_time).as_millis() as u64;
         Self {
@@ -209,6 +226,12 @@ impl EstablishedLink {
         now: Instant,
     ) -> Self {
         let shared_key = responder_secret.diffie_hellman(initiator_public).to_bytes();
+        log::debug!(
+            "from_responder: link_id={} shared_key={} initiator_pub={}",
+            hex::encode(link_id),
+            hex::encode(shared_key),
+            hex::encode(initiator_public.as_bytes())
+        );
         let keys = LinkEncryption::derive_keys(&shared_key, &link_id);
         Self {
             destination,

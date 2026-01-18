@@ -35,8 +35,12 @@ pub enum LinkContext {
     ResourcePrf = 0x05,
     ResourceIcl = 0x06,
     ResourceRcl = 0x07,
+    CacheRequest = 0x08,
     Request = 0x09,
     Response = 0x0A,
+    PathResponse = 0x0B,
+    Command = 0x0C,
+    CommandStatus = 0x0D,
     Channel = 0x0E,
     Keepalive = 0xFA,
     LinkIdentify = 0xFB,
@@ -176,8 +180,12 @@ impl LinkContext {
             0x05 => Some(Self::ResourcePrf),
             0x06 => Some(Self::ResourceIcl),
             0x07 => Some(Self::ResourceRcl),
+            0x08 => Some(Self::CacheRequest),
             0x09 => Some(Self::Request),
             0x0A => Some(Self::Response),
+            0x0B => Some(Self::PathResponse),
+            0x0C => Some(Self::Command),
+            0x0D => Some(Self::CommandStatus),
             0x0E => Some(Self::Channel),
             0xFA => Some(Self::Keepalive),
             0xFB => Some(Self::LinkIdentify),
@@ -365,6 +373,14 @@ impl Packet {
             }
             PKT_PROOF => {
                 if context_byte == CTX_LRPROOF {
+                    log::debug!(
+                        "Parsing LinkProof: flags={:#04x} header_type={} is_type2={} transport_id={:?} dest_hash={}",
+                        flags,
+                        header_type,
+                        is_type2,
+                        transport_id.map(hex::encode),
+                        hex::encode(destination_hash)
+                    );
                     let destination = match transport_id {
                         None => LinkProofDestination::Direct(destination_hash),
                         Some(tid) => LinkProofDestination::Transport {

@@ -40,36 +40,40 @@ impl OutboundResource {
         is_response: bool,
         request_id: Option<Vec<u8>>,
     ) -> Self {
-        let mut random_hash = [0u8; 4];
-        rng.fill_bytes(&mut random_hash);
-
-        // hash = SHA256(original_data + random_hash) - always over uncompressed
-        let mut hash_input = data.clone();
-        hash_input.extend(&random_hash);
-        let hash: [u8; 32] = sha256(&hash_input);
-
-        // expected_proof = SHA256(original_data + hash) - always over uncompressed
-        let mut proof_input = data.clone();
-        proof_input.extend(&hash);
-        let expected_proof: [u8; 32] = sha256(&proof_input);
-
         // Compress for transmission if beneficial
         let (to_send, compressed) = if compress {
             if let Some(compressed_data) = bz2_compress(&data) {
                 (compressed_data, true)
             } else {
-                (data, false)
+                (data.clone(), false)
             }
         } else {
-            (data, false)
+            (data.clone(), false)
         };
 
-        let mut plaintext = random_hash.to_vec();
+        // First random hash: prepended to data before encryption (discarded on receive)
+        let mut encryption_padding = [0u8; 4];
+        rng.fill_bytes(&mut encryption_padding);
+
+        let mut plaintext = encryption_padding.to_vec();
         plaintext.extend(&to_send);
 
         let encrypted = link.encrypt(rng, &plaintext);
-
         let parts: Vec<Vec<u8>> = encrypted.chunks(SDU).map(|c| c.to_vec()).collect();
+
+        // Second random hash: used for hashmap and verification (goes in advertisement)
+        let mut random_hash = [0u8; 4];
+        rng.fill_bytes(&mut random_hash);
+
+        // hash = SHA256(original_data + random_hash) - always over uncompressed original
+        let mut hash_input = data.clone();
+        hash_input.extend(&random_hash);
+        let hash: [u8; 32] = sha256(&hash_input);
+
+        // expected_proof = SHA256(original_data + hash) - always over uncompressed original
+        let mut proof_input = data;
+        proof_input.extend(&hash);
+        let expected_proof: [u8; 32] = sha256(&proof_input);
 
         let hashmap: Vec<[u8; MAPHASH_LEN]> = parts
             .iter()
@@ -310,8 +314,21 @@ impl InboundResource {
         self.received_count == self.num_parts
     }
 
+    pub fn outstanding_parts(&self) -> usize {
+        self.outstanding_parts
+    }
+
+    pub fn received_count(&self) -> usize {
+        self.received_count
+    }
+
+    pub fn num_parts(&self) -> usize {
+        self.num_parts
+    }
+
     pub fn assemble(&self, link: &EstablishedLink) -> Option<(Vec<u8>, [u8; 32])> {
         if !self.is_complete() {
+            log::warn!("Resource assemble called but not complete");
             return None;
         }
 
@@ -322,20 +339,47 @@ impl InboundResource {
             .flat_map(|p| p.iter().copied())
             .collect();
 
-        let plaintext = link.decrypt(&encrypted)?;
+        log::debug!(
+            "Assembling resource: {} parts, {} encrypted bytes",
+            self.parts.len(),
+            encrypted.len()
+        );
 
+        let plaintext = match link.decrypt(&encrypted) {
+            Some(p) => p,
+            None => {
+                log::warn!(
+                    "Resource assemble: stream decryption failed ({} bytes)",
+                    encrypted.len()
+                );
+                return None;
+            }
+        };
+
+        log::debug!(
+            "Decrypted {} bytes, first 16: {:02x?}",
+            plaintext.len(),
+            &plaintext[..plaintext.len().min(16)]
+        );
+
+        // Strip off 4-byte random padding (not verified - just discarded like Python does)
         if plaintext.len() < 4 {
+            log::warn!(
+                "Resource assemble: plaintext too short ({})",
+                plaintext.len()
+            );
             return None;
         }
-        let random_hash: [u8; 4] = plaintext[..4].try_into().ok()?;
-        if random_hash != self.random_hash {
-            return None;
-        }
-
         let data = &plaintext[4..];
 
         let result = if self.compressed {
-            bz2_decompress(data)?
+            match bz2_decompress(data) {
+                Some(d) => d,
+                None => {
+                    log::warn!("Resource assemble: bz2 decompression failed");
+                    return None;
+                }
+            }
         } else {
             data.to_vec()
         };
@@ -345,6 +389,11 @@ impl InboundResource {
         hash_input.extend(&self.random_hash);
         let calculated_hash = sha256(&hash_input);
         if calculated_hash != self.hash {
+            log::warn!(
+                "Resource assemble: hash mismatch (calculated {} expected {})",
+                hex::encode(calculated_hash),
+                hex::encode(self.hash)
+            );
             return None;
         }
 
@@ -352,6 +401,12 @@ impl InboundResource {
         let mut proof_input = result.clone();
         proof_input.extend(&self.hash);
         let proof = sha256(&proof_input);
+
+        log::info!(
+            "Resource assembled successfully: {} bytes decompressed={}",
+            result.len(),
+            self.compressed
+        );
 
         Some((result, proof))
     }

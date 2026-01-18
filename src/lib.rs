@@ -13,6 +13,7 @@ mod packet_hashlist;
 mod path_request;
 mod request;
 mod resource;
+mod stats;
 pub mod transports;
 
 #[cfg(feature = "tokio")]
@@ -26,9 +27,10 @@ pub use node::Node;
 pub use packet::Address;
 pub use request::RequestId;
 pub(crate) use request::WireRequestId;
+pub use stats::StatsSnapshot;
 
 #[cfg(feature = "tokio")]
 pub use async_io::{
     AsyncNode, AsyncTransport, Destination as AsyncDestination, IncomingRaw, IncomingRequest,
-    ServiceHandle,
+    Requester, ServiceHandle,
 };

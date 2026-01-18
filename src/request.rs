@@ -20,8 +20,7 @@ pub(crate) fn path_hash(path: &str) -> PathHash {
 pub struct Request {
     pub timestamp: f64,
     pub path_hash: PathHash,
-    #[serde(with = "serde_bytes")]
-    pub data: Vec<u8>,
+    pub data: Option<Vec<u8>>,
 }
 
 impl Request {
@@ -32,7 +31,7 @@ impl Request {
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.0),
             path_hash: path_hash(path),
-            data,
+            data: if data.is_empty() { None } else { Some(data) },
         }
     }
 
@@ -40,13 +39,13 @@ impl Request {
         rmp_serde::to_vec(&(
             self.timestamp,
             ByteBuf::from(self.path_hash.to_vec()),
-            ByteBuf::from(self.data.clone()),
+            self.data.as_ref().map(|d| ByteBuf::from(d.clone())),
         ))
         .unwrap_or_default()
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let (timestamp, path_hash_buf, data_buf): (f64, ByteBuf, ByteBuf) =
+        let (timestamp, path_hash_buf, data_buf): (f64, ByteBuf, Option<ByteBuf>) =
             rmp_serde::from_slice(bytes).ok()?;
         if path_hash_buf.len() != 16 {
             return None;
@@ -56,7 +55,7 @@ impl Request {
         Some(Self {
             timestamp,
             path_hash,
-            data: data_buf.into_vec(),
+            data: data_buf.map(|b| b.into_vec()),
         })
     }
 }
@@ -103,7 +102,7 @@ mod tests {
         let encoded = req.encode();
         let decoded = Request::decode(&encoded).unwrap();
         assert_eq!(decoded.path_hash, req.path_hash);
-        assert_eq!(decoded.data, b"hello");
+        assert_eq!(decoded.data, Some(b"hello".to_vec()));
     }
 
     #[test]
@@ -141,7 +140,7 @@ mod tests {
             hex::encode(req.path_hash),
             "b04c3b75c4731c02f72d2ea9afcd7b66"
         );
-        assert_eq!(req.data, b"hello");
+        assert_eq!(req.data, Some(b"hello".to_vec()));
     }
 
     #[test]

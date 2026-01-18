@@ -206,6 +206,13 @@ pub(crate) struct LinkEncryption;
 impl LinkEncryption {
     pub fn derive_keys(shared_secret: &[u8; 32], link_id: &[u8; 16]) -> LinkKeys {
         let derived = derive_link_key(shared_secret, link_id);
+        log::debug!(
+            "derive_keys: shared={} link_id={} -> signing={} encryption={}",
+            hex::encode(shared_secret),
+            hex::encode(link_id),
+            hex::encode(&derived[..32]),
+            hex::encode(&derived[32..])
+        );
         let mut signing_key = [0u8; 32];
         let mut encryption_key = [0u8; 32];
         signing_key.copy_from_slice(&derived[..32]);
@@ -248,7 +255,13 @@ impl LinkEncryption {
 
         let expected_hmac = hmac_sha256(&keys.signing_key, signed_parts);
         if received_hmac != expected_hmac {
-            log::warn!("link decrypt: HMAC verification failed");
+            log::warn!(
+                "link decrypt: HMAC verification failed\n  signing_key={}\n  signed_parts[..32]={}\n  received_hmac={}\n  expected_hmac={}",
+                hex::encode(keys.signing_key),
+                hex::encode(&signed_parts[..signed_parts.len().min(32)]),
+                hex::encode(received_hmac),
+                hex::encode(expected_hmac)
+            );
             return None;
         }
 
@@ -483,5 +496,30 @@ mod tests {
         let ciphertext = LinkEncryption::encrypt(&mut rng, &keys, plaintext);
 
         assert!(LinkEncryption::decrypt(&wrong_keys, &ciphertext).is_none());
+    }
+
+    #[test]
+    fn hkdf_output_deterministic() {
+        // Test that HKDF produces consistent output
+        let shared_key =
+            hex::decode("19c245e0302f723aed3abfdefc08e962b70d6eb97c1f4f4ae63bc8374c44fe40")
+                .unwrap();
+        let link_id = hex::decode("33f7b2d6c4acb45786abf7a9bb503c45").unwrap();
+
+        let mut shared_arr = [0u8; 32];
+        let mut link_arr = [0u8; 16];
+        shared_arr.copy_from_slice(&shared_key);
+        link_arr.copy_from_slice(&link_id);
+
+        let keys = LinkEncryption::derive_keys(&shared_arr, &link_arr);
+
+        // These are the values we computed - just verify they're stable
+        println!("signing_key: {}", hex::encode(keys.signing_key));
+        println!("encryption_key: {}", hex::encode(keys.encryption_key));
+
+        // The output should be deterministic
+        let keys2 = LinkEncryption::derive_keys(&shared_arr, &link_arr);
+        assert_eq!(keys.signing_key, keys2.signing_key);
+        assert_eq!(keys.encryption_key, keys2.encryption_key);
     }
 }

@@ -1,24 +1,10 @@
 use crate::packet::Address;
 
-// "reticulum.path.request" hashed to 16 bytes
-const PATH_REQUEST_DEST: Address = compute_path_request_dest();
-
-const fn compute_path_request_dest() -> Address {
-    let hash = sha256_const(b"reticulum.path.request");
-    [
-        hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7], hash[8], hash[9],
-        hash[10], hash[11], hash[12], hash[13], hash[14], hash[15],
-    ]
-}
-
-const fn sha256_const(_input: &[u8]) -> [u8; 32] {
-    // Precomputed: sha256("reticulum.path.request")
-    [
-        0xa5, 0x7e, 0x16, 0xc3, 0xea, 0xbc, 0x17, 0xb9, 0xe7, 0xa9, 0x70, 0x33, 0x68, 0x9f, 0x0f,
-        0x85, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00,
-    ]
-}
+// Path request destination for PLAIN destination "rnstransport.path.request"
+// Computed as: sha256(sha256("rnstransport.path.request")[:10])[:16]
+const PATH_REQUEST_DEST: Address = [
+    0x6b, 0x9f, 0x66, 0x01, 0x4d, 0x98, 0x53, 0xfa, 0xab, 0x22, 0x0f, 0xba, 0x47, 0xd0, 0x27, 0x61,
+];
 
 // Path Request: 51 bytes on wire
 // Addressed to well-known "reticulum.path.request" destination
@@ -43,6 +29,18 @@ impl PathRequest {
         out
     }
 
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < 32 {
+            return None;
+        }
+        let destination_hash: Address = data[..16].try_into().ok()?;
+        let tag: Address = data[16..32].try_into().ok()?;
+        Some(Self {
+            destination_hash,
+            tag,
+        })
+    }
+
     pub fn destination() -> Address {
         PATH_REQUEST_DEST
     }
@@ -54,7 +52,12 @@ mod tests {
 
     #[test]
     fn path_request_destination_hash() {
-        let expected = crate::crypto::sha256(b"reticulum.path.request");
-        assert_eq!(&PATH_REQUEST_DEST, &expected[..16]);
+        // PLAIN destination hash algorithm:
+        // 1. name_hash = sha256("rnstransport.path.request")[:10]
+        // 2. address = sha256(name_hash)[:16]
+        let name_hash = crate::crypto::sha256(b"rnstransport.path.request");
+        let addr = crate::crypto::sha256(&name_hash[..10]);
+        println!("Correct address: {}", hex::encode(&addr[..16]));
+        assert_eq!(&PATH_REQUEST_DEST, &addr[..16]);
     }
 }
