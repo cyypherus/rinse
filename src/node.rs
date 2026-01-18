@@ -602,16 +602,15 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
     }
 
     pub fn close_link(&mut self, link_id: LinkId, now: Instant) {
-        let ciphertext = if let Some(link) = self.established_links.get(&link_id) {
+        if let Some(link) = self.established_links.get(&link_id) {
             if link.state == LinkState::Closed {
                 return;
             }
-            link.encrypt(&mut self.rng, &link_id)
         } else {
             return;
-        };
+        }
 
-        self.send_link_packet(link_id, LinkContext::LinkClose, &ciphertext, now);
+        self.send_link_packet(link_id, LinkContext::LinkClose, &link_id, now);
 
         let (destination, pending_requests) =
             if let Some(link) = self.established_links.get_mut(&link_id) {
@@ -1494,6 +1493,17 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     return None;
                 }
 
+                // CacheRequest packets are not encrypted - just a packet hash
+                if context == LinkContext::CacheRequest {
+                    // TODO: handle cache request - look up packet in cache and resend
+                    log::debug!(
+                        "Received CacheRequest on link {} ({} bytes)",
+                        hex::encode(link_id),
+                        data.len()
+                    );
+                    return None;
+                }
+
                 // All other LinkData packets use Token encryption
                 let plaintext = match link.decrypt(&data) {
                     Some(p) => p,
@@ -1519,10 +1529,21 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     // Verify the close packet contains the link_id
                     if plaintext.as_slice() == link_id {
                         let dest = link.destination;
-                        link.state = LinkState::Closed;
+                        log::info!(
+                            "Link <{}> closed by remote (dest=<{}>)",
+                            hex::encode(link_id),
+                            hex::encode(dest)
+                        );
                         self.destination_links.remove(&dest);
-                        log::debug!("Link <{}> closed by remote", hex::encode(link_id));
+                        self.established_links.remove(&link_id);
+                    } else {
+                        log::warn!(
+                            "Received LinkClose with mismatched link_id: expected {}, got {}",
+                            hex::encode(link_id),
+                            hex::encode(&plaintext)
+                        );
                     }
+                    return None;
                 } else if matches!(
                     context,
                     LinkContext::ResourceAdv
@@ -2189,6 +2210,11 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
         for link_id in to_keepalive {
             if let Some(link) = self.established_links.get_mut(&link_id) {
+                log::debug!(
+                    "Sending keepalive request on link {} (no inbound for {}s)",
+                    hex::encode(link_id),
+                    now.duration_since(link.last_inbound).as_secs()
+                );
                 link.last_keepalive_sent = Some(now);
             }
             self.send_link_packet(
@@ -2204,6 +2230,12 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 && link.state != LinkState::Closed
             {
                 use crate::packet::LinkDataDestination;
+                log::info!(
+                    "Closing stale link <{}> to <{}> (state={:?})",
+                    hex::encode(link_id),
+                    hex::encode(link.destination),
+                    link.state
+                );
                 let close_data = link.encrypt(&mut self.rng, &link_id);
                 let packet = Packet::LinkData {
                     hops: 0,
@@ -2231,6 +2263,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
         if let Some(link) = self.established_links.get_mut(&link_id) {
             if plaintext[0] == KEEPALIVE_REQUEST && !link.is_initiator {
+                log::debug!(
+                    "Received keepalive request on link {}, sending response",
+                    hex::encode(link_id)
+                );
                 // Responder: reply to keepalive request
                 let response = link.encrypt(&mut self.rng, &[KEEPALIVE_RESPONSE]);
                 let packet = Packet::LinkData {
@@ -2246,9 +2282,21 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 // Initiator: received keepalive response, update RTT
                 if let Some(sent_at) = link.last_keepalive_sent {
                     let rtt_ms = now.duration_since(sent_at).as_millis() as u64;
+                    log::debug!(
+                        "Received keepalive response on link {}, RTT={}ms",
+                        hex::encode(link_id),
+                        rtt_ms
+                    );
                     link.set_rtt(rtt_ms);
                     link.last_keepalive_sent = None;
                 }
+            } else {
+                log::warn!(
+                    "Unexpected keepalive byte 0x{:02x} on link {} (is_initiator={})",
+                    plaintext[0],
+                    hex::encode(link_id),
+                    link.is_initiator
+                );
             }
         }
     }
@@ -2283,18 +2331,22 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
                 if let Some(adv) = ResourceAdvertisement::decode(plaintext) {
                     log::debug!(
-                        "ResourceAdv: hash={} random_hash={} num_parts={} transfer_size={} compressed={} is_response={}",
+                        "ResourceAdv: hash={} random_hash={} num_parts={} transfer_size={} compressed={} is_response={} request_id={:?}",
                         hex::encode(adv.hash),
                         hex::encode(adv.random_hash),
                         adv.num_parts,
                         adv.transfer_size,
                         adv.compressed,
-                        adv.is_response
+                        adv.is_response,
+                        adv.request_id.as_ref().map(hex::encode)
                     );
 
                     // Auto-accept if this is a response to a pending request
-                    if adv.is_response
-                        && let Some(ref req_id_bytes) = adv.request_id
+                    if !adv.is_response {
+                        log::debug!("ResourceAdv not a response, ignoring");
+                    } else if adv.request_id.is_none() {
+                        log::warn!("ResourceAdv is_response=true but no request_id");
+                    } else if let Some(ref req_id_bytes) = adv.request_id
                         && let Some(link) = self.established_links.get(&link_id)
                     {
                         // Check if we have a pending request with this wire ID
@@ -2303,18 +2355,38 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                             .and_then(|b| <[u8; 16]>::try_from(b).ok())
                             .map(WireRequestId);
 
-                        if let Some(wire_request_id) = wire_req_id
-                            && link.pending_requests.contains_key(&wire_request_id)
-                        {
-                            // Auto-accept the resource
-                            let hash = adv.hash;
-                            let mut resource =
-                                crate::resource::InboundResource::from_advertisement(&adv);
-                            resource.mark_transferring();
-                            self.inbound_resources.insert(hash, (link_id, resource));
-                            self.send_resource_request(link_id, hash, now);
+                        if let Some(wire_request_id) = wire_req_id {
+                            if link.pending_requests.contains_key(&wire_request_id) {
+                                log::info!(
+                                    "ResourceAdv matched pending request {}",
+                                    hex::encode(wire_request_id.0)
+                                );
+                                // Auto-accept the resource
+                                let hash = adv.hash;
+                                let mut resource =
+                                    crate::resource::InboundResource::from_advertisement(&adv);
+                                resource.mark_transferring();
+                                self.inbound_resources.insert(hash, (link_id, resource));
+                                self.send_resource_request(link_id, hash, now);
+                            } else {
+                                log::warn!(
+                                    "ResourceAdv request_id {} not found in pending_requests (have: {:?})",
+                                    hex::encode(wire_request_id.0),
+                                    link.pending_requests
+                                        .keys()
+                                        .map(|k| hex::encode(k.0))
+                                        .collect::<Vec<_>>()
+                                );
+                            }
+                        } else {
+                            log::warn!(
+                                "ResourceAdv request_id too short: {} bytes",
+                                req_id_bytes.len()
+                            );
                         }
                     }
+                } else {
+                    log::warn!("Failed to decode ResourceAdv ({} bytes)", plaintext.len());
                 }
             }
             LinkContext::ResourceReq => {
@@ -2392,7 +2464,12 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                         );
                         if accepted && resource.is_complete() {
                             completed = Some(*hash);
-                        } else if accepted && resource.outstanding_parts() == 0 {
+                        } else if accepted {
+                            // Pipeline: request more parts as soon as we have room
+                            // Don't wait for all outstanding parts to arrive
+                            if resource.batch_complete() {
+                                resource.complete_batch(now);
+                            }
                             need_more = Some(*hash);
                         }
                         break;
@@ -2401,7 +2478,6 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 if let Some(hash) = completed {
                     self.complete_resource(link_id, hash, now);
                 } else if let Some(hash) = need_more {
-                    log::debug!("Requesting more parts for resource {}", hex::encode(hash));
                     self.send_resource_request(link_id, hash, now);
                 }
             }
@@ -2606,8 +2682,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
     fn send_resource_request(&mut self, link_id: LinkId, hash: [u8; 32], now: Instant) {
         use crate::packet::LinkDataDestination;
+        use crate::resource::{HASHMAP_IS_EXHAUSTED, HASHMAP_IS_NOT_EXHAUSTED};
 
-        if let Some((_, resource)) = self.inbound_resources.get_mut(&hash) {
+        // First pass: get needed hashes and build payload
+        let payload = if let Some((_, resource)) = self.inbound_resources.get_mut(&hash) {
             let (needed, exhausted) = resource.needed_hashes();
 
             log::debug!(
@@ -2631,8 +2709,6 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 );
             }
 
-            use crate::resource::{HASHMAP_IS_EXHAUSTED, HASHMAP_IS_NOT_EXHAUSTED};
-
             let mut payload = Vec::new();
             payload.push(if exhausted {
                 HASHMAP_IS_EXHAUSTED
@@ -2646,23 +2722,34 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             for h in &needed {
                 payload.extend(h);
             }
+            Some((payload, needed.len(), exhausted))
+        } else {
+            None
+        };
 
-            if let Some(link) = self.established_links.get(&link_id) {
-                log::debug!(
-                    "Sending ResourceReq: {} hashes requested, exhausted={}",
-                    needed.len(),
-                    exhausted
-                );
-                let ciphertext = link.encrypt(&mut self.rng, &payload);
-                let packet = Packet::LinkData {
-                    hops: 0,
-                    destination: LinkDataDestination::Direct(link_id),
-                    context: LinkContext::ResourceReq,
-                    data: ciphertext,
-                };
-                for iface in &mut self.interfaces {
-                    iface.send(packet.clone(), 0, now);
-                }
+        // Second pass: encrypt and send
+        if let Some((payload, needed_len, exhausted)) = payload
+            && let Some(link) = self.established_links.get(&link_id)
+        {
+            log::debug!(
+                "Sending ResourceReq: {} hashes requested, exhausted={}",
+                needed_len,
+                exhausted
+            );
+            let ciphertext = link.encrypt(&mut self.rng, &payload);
+            let packet = Packet::LinkData {
+                hops: 0,
+                destination: LinkDataDestination::Direct(link_id),
+                context: LinkContext::ResourceReq,
+                data: ciphertext,
+            };
+            for iface in &mut self.interfaces {
+                iface.send(packet.clone(), 0, now);
+            }
+
+            // Mark request sent for rate tracking
+            if let Some((_, resource)) = self.inbound_resources.get_mut(&hash) {
+                resource.mark_req_sent(now);
             }
         }
     }
@@ -3770,6 +3857,56 @@ mod tests {
     }
 
     #[test]
+    fn link_removed_on_remote_close() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let addr_b = b.add_service(svc("server"), &id(1));
+        let now = Instant::now();
+
+        // Establish link
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(addr_b, None, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        assert!(a.established_links.contains_key(&link_id));
+        assert!(b.established_links.contains_key(&link_id));
+
+        // B closes the link
+        b.close_link(link_id, now);
+        b.poll(now);
+
+        // B should have removed the link
+        assert!(
+            !b.established_links.contains_key(&link_id),
+            "B should remove link after closing"
+        );
+
+        // Transfer close packet to A
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        // A should remove the link immediately upon receiving LinkClose
+        assert!(
+            !a.established_links.contains_key(&link_id),
+            "A should remove link immediately on receiving LinkClose"
+        );
+    }
+
+    #[test]
     fn keepalive_request_response() {
         use std::time::Duration;
 
@@ -4751,6 +4888,423 @@ mod tests {
         assert!(
             !net.node(a).pending_path_requests.contains_key(&addr_c),
             "A's pending path request should be cleared"
+        );
+    }
+
+    // Rate adaptation tests - these verify the window management behavior
+    // based on measured transfer rates.
+    //
+    // Objectives:
+    // 1. Measure bytes_received / rtt when each batch completes
+    // 2. If rate > 50 Kbps for 4 consecutive batches → window_max = 75
+    // 3. If rate < 2 Kbps for 2 consecutive batches (and never fast) → window_max = 4
+    // 4. window_min trails window to prevent over-shrinking
+
+    #[test]
+    fn resource_window_max_increases_after_sustained_fast_rate() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        // After 4 consecutive batches with rate > 50 Kbps, window_max should increase to 75
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        // Large incompressible response for many batches (use hash chain for randomness)
+        let mut large_response = vec![0u8; 50_000];
+        let mut seed = [0u8; 32];
+        for chunk in large_response.chunks_mut(32) {
+            seed = crate::crypto::sha256(&seed);
+            chunk.copy_from_slice(&seed[..chunk.len()]);
+        }
+
+        let svc_a = svc("client");
+        let state_a = svc_a.state();
+        let addr_a = a.add_service(svc_a, &id(1));
+
+        let svc_b = svc("server")
+            .with_paths(&["test"])
+            .with_auto_response(large_response.clone());
+        let addr_b = b.add_service(svc_b, &id(2));
+
+        // Use short RTT to simulate fast link (high bytes/rtt ratio)
+        let now = Instant::now();
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        a.link(addr_b, None, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        a.request(addr_a, addr_b, "test", b"", now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        // Simulate fast transfer with small time increments (high rate)
+        let mut t = now;
+        let mut max_window_seen = 0;
+        for _ in 0..500 {
+            t += std::time::Duration::from_millis(1); // Fast: ~470KB/s per part
+            transfer(&mut b, 0, &mut a, 0);
+            a.poll(t);
+            transfer(&mut a, 0, &mut b, 0);
+            b.poll(t);
+
+            if let Some((_, resource)) = a.inbound_resources.values().next() {
+                max_window_seen = max_window_seen.max(resource.window);
+            }
+
+            if state_a.borrow().responses.len() == 1 {
+                break;
+            }
+        }
+
+        // After sustained fast rate, window should be allowed to grow beyond 10
+        assert!(
+            max_window_seen > 10,
+            "window_max should increase to 75 after sustained fast rate, but max was {}",
+            max_window_seen
+        );
+    }
+
+    #[test]
+    fn resource_window_max_decreases_on_very_slow_rate() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        // After 2 consecutive batches with rate < 2 Kbps, window_max should decrease to 4
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        // Incompressible data
+        let mut large_response = vec![0u8; 50_000];
+        let mut seed = [0u8; 32];
+        for chunk in large_response.chunks_mut(32) {
+            seed = crate::crypto::sha256(&seed);
+            chunk.copy_from_slice(&seed[..chunk.len()]);
+        }
+
+        let svc_a = svc("client");
+        let state_a = svc_a.state();
+        let addr_a = a.add_service(svc_a, &id(1));
+
+        let svc_b = svc("server")
+            .with_paths(&["test"])
+            .with_auto_response(large_response.clone());
+        let addr_b = b.add_service(svc_b, &id(2));
+
+        let now = Instant::now();
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        a.link(addr_b, None, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        a.request(addr_a, addr_b, "test", b"", now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        // Simulate very slow transfer with large time increments
+        let mut t = now;
+        let mut final_window_max = 10; // Default
+        for _ in 0..500 {
+            t += std::time::Duration::from_secs(10); // Very slow: ~47 bytes/s per part
+            transfer(&mut b, 0, &mut a, 0);
+            a.poll(t);
+            transfer(&mut a, 0, &mut b, 0);
+            b.poll(t);
+
+            if let Some((_, resource)) = a.inbound_resources.values().next() {
+                final_window_max = resource.window_max;
+            }
+
+            if state_a.borrow().responses.len() == 1 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            final_window_max, 4,
+            "window_max should decrease to 4 after sustained very slow rate"
+        );
+    }
+
+    #[test]
+    fn resource_window_max_stays_high_if_ever_fast() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        // Once window_max reaches 75, it should not decrease even if rate becomes slow
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        // Incompressible data
+        let mut large_response = vec![0u8; 200_000];
+        let mut seed = [0u8; 32];
+        for chunk in large_response.chunks_mut(32) {
+            seed = crate::crypto::sha256(&seed);
+            chunk.copy_from_slice(&seed[..chunk.len()]);
+        }
+
+        let svc_a = svc("client");
+        let state_a = svc_a.state();
+        let addr_a = a.add_service(svc_a, &id(1));
+
+        let svc_b = svc("server")
+            .with_paths(&["test"])
+            .with_auto_response(large_response.clone());
+        let addr_b = b.add_service(svc_b, &id(2));
+
+        let now = Instant::now();
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        a.link(addr_b, None, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        a.request(addr_a, addr_b, "test", b"", now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        let mut t = now;
+        let mut reached_fast = false;
+        let mut final_window_max = 10;
+
+        for i in 0..1000 {
+            // First half: fast rate
+            // Second half: slow rate
+            if i < 200 {
+                t += std::time::Duration::from_millis(1);
+            } else {
+                t += std::time::Duration::from_secs(10);
+            }
+
+            transfer(&mut b, 0, &mut a, 0);
+            a.poll(t);
+            transfer(&mut a, 0, &mut b, 0);
+            b.poll(t);
+
+            if let Some((_, resource)) = a.inbound_resources.values().next() {
+                if resource.window_max == 75 {
+                    reached_fast = true;
+                }
+                final_window_max = resource.window_max;
+            }
+
+            if state_a.borrow().responses.len() == 1 {
+                break;
+            }
+        }
+
+        assert!(reached_fast, "Should have reached fast window_max");
+        assert_eq!(
+            final_window_max, 75,
+            "window_max should stay at 75 even after rate becomes slow"
+        );
+    }
+
+    #[test]
+    fn resource_window_min_trails_window() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        // window_min should trail window by at most WINDOW_FLEXIBILITY (4)
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        // Incompressible data
+        let mut large_response = vec![0u8; 100_000];
+        let mut seed = [0u8; 32];
+        for chunk in large_response.chunks_mut(32) {
+            seed = crate::crypto::sha256(&seed);
+            chunk.copy_from_slice(&seed[..chunk.len()]);
+        }
+
+        let svc_a = svc("client");
+        let state_a = svc_a.state();
+        let addr_a = a.add_service(svc_a, &id(1));
+
+        let svc_b = svc("server")
+            .with_paths(&["test"])
+            .with_auto_response(large_response.clone());
+        let addr_b = b.add_service(svc_b, &id(2));
+
+        let now = Instant::now();
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        a.link(addr_b, None, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        a.request(addr_a, addr_b, "test", b"", now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        let mut t = now;
+        let mut max_gap = 0;
+        let mut max_window = 0;
+
+        for _ in 0..500 {
+            t += std::time::Duration::from_millis(1);
+            transfer(&mut b, 0, &mut a, 0);
+            a.poll(t);
+            transfer(&mut a, 0, &mut b, 0);
+            b.poll(t);
+
+            if let Some((_, resource)) = a.inbound_resources.values().next() {
+                let gap = resource.window.saturating_sub(resource.window_min);
+                max_gap = max_gap.max(gap);
+                max_window = max_window.max(resource.window);
+            }
+
+            if state_a.borrow().responses.len() == 1 {
+                break;
+            }
+        }
+
+        assert!(
+            max_window > 4,
+            "window should grow beyond initial 4, but max was {}",
+            max_window
+        );
+        assert!(
+            max_gap <= 4,
+            "window_min should trail window by at most 4, but gap was {} (max_window={})",
+            max_gap,
+            max_window
+        );
+    }
+
+    #[test]
+    fn resource_requests_pipeline_without_waiting_for_full_batch() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        // After receiving each part, we should request more to keep window full
+        // NOT wait for all outstanding parts to arrive
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        // Incompressible data - need many parts
+        let mut large_response = vec![0u8; 10_000];
+        let mut seed = [0u8; 32];
+        for chunk in large_response.chunks_mut(32) {
+            seed = crate::crypto::sha256(&seed);
+            chunk.copy_from_slice(&seed[..chunk.len()]);
+        }
+
+        let svc_a = svc("client");
+        let state_a = svc_a.state();
+        let addr_a = a.add_service(svc_a, &id(1));
+
+        let svc_b = svc("server")
+            .with_paths(&["test"])
+            .with_auto_response(large_response);
+        let addr_b = b.add_service(svc_b, &id(2));
+
+        let now = Instant::now();
+
+        // Setup link
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        a.link(addr_b, None, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        // Send request
+        a.request(addr_a, addr_b, "test", b"", now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        // Server sends ResourceAdv, we accept and send first request
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        // Count how many ResourceReq packets are sent
+        let initial_reqs = a.interfaces[0].transport.outbox.len();
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        // Now transfer ONE part at a time and check if we send a new request
+        let mut requests_after_single_part = 0;
+        let mut parts_received_before_request = Vec::new();
+        let mut parts_in_current_batch = 0;
+
+        for i in 0..50 {
+            // Transfer just one packet from server to client
+            if let Some(pkt) = b.interfaces[0].transport.outbox.pop_front() {
+                a.interfaces[0].transport.inbox.push_back(pkt);
+            } else {
+                break;
+            }
+
+            let t = now + std::time::Duration::from_millis(i as u64 * 100);
+            a.poll(t);
+            parts_in_current_batch += 1;
+
+            // Check if we sent a request after receiving this part
+            if !a.interfaces[0].transport.outbox.is_empty() {
+                requests_after_single_part += 1;
+                parts_received_before_request.push(parts_in_current_batch);
+                parts_in_current_batch = 0;
+                // Transfer request to server
+                transfer(&mut a, 0, &mut b, 0);
+                b.poll(t);
+            }
+
+            if state_a.borrow().responses.len() == 1 {
+                break;
+            }
+        }
+
+        eprintln!(
+            "Parts received before each request: {:?}",
+            parts_received_before_request
+        );
+
+        // We should NOT wait for full window (4 parts) before requesting more
+        // Ideally we request more after receiving each part
+        let max_parts_before_request = parts_received_before_request
+            .iter()
+            .max()
+            .copied()
+            .unwrap_or(0);
+        assert!(
+            max_parts_before_request < 4,
+            "Should pipeline requests - max parts before request was {} (should be < 4)",
+            max_parts_before_request
         );
     }
 }

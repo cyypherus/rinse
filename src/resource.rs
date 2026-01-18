@@ -1,12 +1,25 @@
 use crate::crypto::sha256;
 use crate::link::EstablishedLink;
 use rand::RngCore;
+use std::time::Instant;
 
 pub(crate) const MAPHASH_LEN: usize = 4;
 pub(crate) const HASHMAP_IS_NOT_EXHAUSTED: u8 = 0x00;
 pub(crate) const HASHMAP_IS_EXHAUSTED: u8 = 0xFF;
+
+const WINDOW_DEFAULT: usize = 4;
 const WINDOW_MIN: usize = 2;
+pub(crate) const WINDOW_MAX_SLOW: usize = 10;
+const WINDOW_MAX_VERY_SLOW: usize = 4;
 const WINDOW_MAX_FAST: usize = 75;
+
+const FAST_RATE_THRESHOLD: usize = 4; // WINDOW_MAX_SLOW - WINDOW - 2 = 10 - 4 - 2 = 4
+const VERY_SLOW_RATE_THRESHOLD: usize = 2;
+const WINDOW_FLEXIBILITY: usize = 4;
+
+const RATE_FAST: f64 = 6250.0; // (50*1000) / 8 bytes/sec
+const RATE_VERY_SLOW: f64 = 250.0; // (2*1000) / 8 bytes/sec
+
 const SDU: usize = 470;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,11 +184,21 @@ pub(crate) struct InboundResource {
     hashmap: Vec<[u8; MAPHASH_LEN]>,
     hashmap_height: usize,
     parts: Vec<Option<Vec<u8>>>,
+    requested: Vec<bool>,
     received_count: usize,
     outstanding_parts: usize,
-    window: usize,
+    last_batch_received_count: usize,
+    batch_window: usize,
+    pub(crate) window: usize,
+    pub(crate) window_max: usize,
+    pub(crate) window_min: usize,
     waiting_for_hmu: bool,
     consecutive_completed_height: i32,
+    bytes_received: usize,
+    bytes_at_req_sent: usize,
+    fast_rate_rounds: usize,
+    very_slow_rate_rounds: usize,
+    req_sent: Option<Instant>,
 }
 
 impl InboundResource {
@@ -206,11 +229,21 @@ impl InboundResource {
             hashmap,
             hashmap_height,
             parts: vec![None; adv.num_parts],
+            requested: vec![false; adv.num_parts],
             received_count: 0,
             outstanding_parts: 0,
-            window: WINDOW_MIN,
+            last_batch_received_count: 0,
+            batch_window: WINDOW_DEFAULT,
+            window: WINDOW_DEFAULT,
+            window_max: WINDOW_MAX_SLOW,
+            window_min: WINDOW_MIN,
             waiting_for_hmu: false,
             consecutive_completed_height: -1,
+            bytes_received: 0,
+            bytes_at_req_sent: 0,
+            fast_rate_rounds: 0,
+            very_slow_rate_rounds: 0,
+            req_sent: None,
         }
     }
 
@@ -233,6 +266,7 @@ impl InboundResource {
 
         for i in search_start..search_end {
             if i < self.hashmap.len() && self.hashmap[i] == part_hash && self.parts[i].is_none() {
+                self.bytes_received += data.len();
                 self.parts[i] = Some(data);
                 self.received_count += 1;
                 self.outstanding_parts = self.outstanding_parts.saturating_sub(1);
@@ -249,7 +283,6 @@ impl InboundResource {
                     cp += 1;
                 }
 
-                self.window = (self.window + 1).min(WINDOW_MAX_FAST);
                 return true;
             }
         }
@@ -273,7 +306,6 @@ impl InboundResource {
     }
 
     pub fn needed_hashes(&mut self) -> (Vec<[u8; MAPHASH_LEN]>, bool) {
-        self.outstanding_parts = 0;
         let mut needed = Vec::new();
         let mut hashmap_exhausted = false;
 
@@ -281,15 +313,20 @@ impl InboundResource {
         let search_end = (search_start + self.window).min(self.parts.len());
 
         for i in search_start..search_end {
-            if self.parts[i].is_none() {
-                if i < self.hashmap_height {
-                    needed.push(self.hashmap[i]);
-                    self.outstanding_parts += 1;
-                } else {
-                    hashmap_exhausted = true;
-                    break;
-                }
+            // Skip parts we've already received or requested
+            if self.parts[i].is_some() || self.requested[i] {
+                continue;
             }
+
+            if i < self.hashmap_height {
+                needed.push(self.hashmap[i]);
+                self.requested[i] = true;
+                self.outstanding_parts += 1;
+            } else {
+                hashmap_exhausted = true;
+                break;
+            }
+
             if self.outstanding_parts >= self.window {
                 break;
             }
@@ -316,6 +353,11 @@ impl InboundResource {
 
     pub fn outstanding_parts(&self) -> usize {
         self.outstanding_parts
+    }
+
+    pub fn batch_complete(&self) -> bool {
+        // A batch is complete when we've received batch_window parts since last batch
+        self.received_count - self.last_batch_received_count >= self.batch_window
     }
 
     pub fn received_count(&self) -> usize {
@@ -413,6 +455,73 @@ impl InboundResource {
 
     pub fn mark_transferring(&mut self) {
         self.status = ResourceStatus::Transferring;
+    }
+
+    pub fn mark_req_sent(&mut self, now: Instant) {
+        // Only mark if this is the start of a new batch (req_sent is None)
+        // With pipelining, we send requests frequently but only measure rate per batch
+        if self.req_sent.is_none() {
+            self.bytes_at_req_sent = self.bytes_received;
+            self.req_sent = Some(now);
+        }
+    }
+
+    pub fn complete_batch(&mut self, now: Instant) {
+        // Mark batch as complete, record current window for next batch BEFORE growth
+        self.last_batch_received_count = self.received_count;
+        self.batch_window = self.window;
+
+        // Grow window (after recording batch_window)
+        if self.window < self.window_max {
+            self.window += 1;
+            // window_min trails window by at most WINDOW_FLEXIBILITY-1
+            if (self.window - self.window_min) > (WINDOW_FLEXIBILITY - 1) {
+                self.window_min += 1;
+            }
+        }
+
+        // Calculate rate if we have a request timestamp
+        if let Some(req_sent) = self.req_sent {
+            let rtt = now.duration_since(req_sent);
+            let rtt_secs = rtt.as_secs_f64();
+            let bytes_this_batch = self.bytes_received - self.bytes_at_req_sent;
+            let rate = if rtt_secs > 0.0 {
+                bytes_this_batch as f64 / rtt_secs
+            } else {
+                0.0
+            };
+
+            log::debug!(
+                "complete_batch: rtt={:.4}s bytes={} rate={:.0} B/s fast_rounds={} window_max={}",
+                rtt_secs,
+                bytes_this_batch,
+                rate,
+                self.fast_rate_rounds,
+                self.window_max
+            );
+
+            if rate > RATE_FAST && self.fast_rate_rounds < FAST_RATE_THRESHOLD {
+                self.fast_rate_rounds += 1;
+                log::debug!("Fast rate detected, fast_rate_rounds={}", self.fast_rate_rounds);
+                if self.fast_rate_rounds == FAST_RATE_THRESHOLD {
+                    self.window_max = WINDOW_MAX_FAST;
+                    log::debug!("Reached fast threshold, window_max={}", self.window_max);
+                }
+            }
+
+            if self.fast_rate_rounds == 0
+                && rate < RATE_VERY_SLOW
+                && self.very_slow_rate_rounds < VERY_SLOW_RATE_THRESHOLD
+            {
+                self.very_slow_rate_rounds += 1;
+                if self.very_slow_rate_rounds == VERY_SLOW_RATE_THRESHOLD {
+                    self.window_max = WINDOW_MAX_VERY_SLOW;
+                }
+            }
+
+            // Reset for next batch
+            self.req_sent = None;
+        }
     }
 }
 
