@@ -47,6 +47,7 @@ pub enum LinkContext {
 pub enum ProofContext {
     None = 0x00,
     Resource = 0x01,
+    ResourcePrf = 0x05,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,6 +190,7 @@ impl ProofContext {
         match b {
             0x00 => Some(Self::None),
             0x01 => Some(Self::Resource),
+            0x05 => Some(Self::ResourcePrf),
             _ => None,
         }
     }

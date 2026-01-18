@@ -1785,57 +1785,89 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     }
                 }
             }
-            Packet::Proof { data, .. } => {
-                // Regular proof - check reverse table for transport
-                if let Some(reverse_entry) = self.reverse_table.remove(&destination_hash)
-                    && let Some(iface) = self.interfaces.get_mut(reverse_entry.receiving_interface)
-                {
-                    self.stats.packets_relayed += 1;
-                    self.stats.bytes_relayed += raw.len() as u64;
-                    self.stats.proofs_relayed += 1;
-                    iface.send(packet.clone(), 0, now);
-                }
+            Packet::Proof { data, context, .. } => {
+                use crate::packet::ProofContext;
 
-                // Check local receipts - validate proof against outstanding receipts
-                // Proof format: explicit = hash (32) + signature (64), implicit = signature (64)
-                let (proof_hash, signature_bytes) = if data.len() == 96 {
-                    // Explicit proof
-                    (Some(<[u8; 32]>::try_from(&data[..32]).ok()), &data[32..96])
-                } else if data.len() == 64 {
-                    // Implicit proof
-                    (None, &data[..64])
-                } else {
-                    (None, &[] as &[u8])
-                };
+                // Handle resource proofs specially
+                if context == ProofContext::ResourcePrf {
+                    // Resource proof format: resource_hash (32) + proof (32) = 64 bytes
+                    if data.len() == 64 {
+                        let resource_hash: [u8; 32] = data[..32].try_into().unwrap();
+                        let proof: &[u8] = &data[32..64];
 
-                if !signature_bytes.is_empty()
-                    && let Ok(signature) = Signature::from_slice(signature_bytes)
-                {
-                    self.receipts.retain(|receipt| {
-                        // For explicit proofs, check hash matches
-                        if let Some(Some(ph)) = proof_hash
-                            && ph != receipt.packet_hash
+                        // Find matching outbound resource and validate proof
+                        if let Some((_, _, _, _, outbound)) =
+                            self.outbound_resources.get(&resource_hash)
                         {
-                            return true; // Keep - not for this receipt
+                            if outbound.verify_proof(proof) {
+                                log::debug!(
+                                    "Resource proof validated for {}",
+                                    hex::encode(resource_hash)
+                                );
+                                self.outbound_resources.remove(&resource_hash);
+                            } else {
+                                log::warn!(
+                                    "Resource proof invalid for {}",
+                                    hex::encode(resource_hash)
+                                );
+                            }
                         }
+                    }
+                    // Don't process ResourcePrf as regular proof
+                } else {
+                    // Regular proof - check reverse table for transport
+                    if let Some(reverse_entry) = self.reverse_table.remove(&destination_hash)
+                        && let Some(iface) =
+                            self.interfaces.get_mut(reverse_entry.receiving_interface)
+                    {
+                        self.stats.packets_relayed += 1;
+                        self.stats.bytes_relayed += raw.len() as u64;
+                        self.stats.proofs_relayed += 1;
+                        iface.send(packet.clone(), 0, now);
+                    }
 
-                        // Get destination's signing key to verify
-                        let signing_key = match self.path_table.get(&receipt.destination) {
-                            Some(entry) => &entry.signing_key,
-                            None => return true, // Keep - can't verify without key
-                        };
+                    // Check local receipts - validate proof against outstanding receipts
+                    // Proof format: explicit = hash (32) + signature (64), implicit = signature (64)
+                    let (proof_hash, signature_bytes) = if data.len() == 96 {
+                        // Explicit proof
+                        (Some(<[u8; 32]>::try_from(&data[..32]).ok()), &data[32..96])
+                    } else if data.len() == 64 {
+                        // Implicit proof
+                        (None, &data[..64])
+                    } else {
+                        (None, &[] as &[u8])
+                    };
 
-                        // Validate signature over packet hash
-                        if crate::crypto::verify(signing_key, &receipt.packet_hash, &signature) {
-                            log::debug!(
-                                "Proof validated for packet <{}>",
-                                hex::encode(receipt.packet_hash)
-                            );
-                            false // Remove - proved
-                        } else {
-                            true // Keep - signature invalid
-                        }
-                    });
+                    if !signature_bytes.is_empty()
+                        && let Ok(signature) = Signature::from_slice(signature_bytes)
+                    {
+                        self.receipts.retain(|receipt| {
+                            // For explicit proofs, check hash matches
+                            if let Some(Some(ph)) = proof_hash
+                                && ph != receipt.packet_hash
+                            {
+                                return true; // Keep - not for this receipt
+                            }
+
+                            // Get destination's signing key to verify
+                            let signing_key = match self.path_table.get(&receipt.destination) {
+                                Some(entry) => &entry.signing_key,
+                                None => return true, // Keep - can't verify without key
+                            };
+
+                            // Validate signature over packet hash
+                            if crate::crypto::verify(signing_key, &receipt.packet_hash, &signature)
+                            {
+                                log::debug!(
+                                    "Proof validated for packet <{}>",
+                                    hex::encode(receipt.packet_hash)
+                                );
+                                false // Remove - proved
+                            } else {
+                                true // Keep - signature invalid
+                            }
+                        });
+                    }
                 }
             }
         }
@@ -2544,7 +2576,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
     }
 
     fn complete_resource(&mut self, link_id: LinkId, hash: [u8; 32], now: Instant) {
-        use crate::packet::LinkDataDestination;
+        use crate::packet::{ProofContext, ProofDestination};
 
         log::debug!(
             "complete_resource called: link={} hash={}",
@@ -2589,15 +2621,14 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             resource.is_response
         );
 
-        // Send proof
+        // Send proof (NOT encrypted - resource proofs are sent in plaintext per Python RNS)
         let mut payload = hash.to_vec();
         payload.extend(&proof);
-        let ciphertext = link.encrypt(&mut self.rng, &payload);
-        let packet = Packet::LinkData {
+        let packet = Packet::Proof {
             hops: 0,
-            destination: LinkDataDestination::Direct(link_id),
-            context: LinkContext::ResourcePrf,
-            data: ciphertext,
+            destination: ProofDestination::Link(link_id),
+            context: ProofContext::ResourcePrf,
+            data: payload,
         };
         for iface in &mut self.interfaces {
             iface.send(packet.clone(), 0, now);
@@ -3034,10 +3065,10 @@ mod tests {
         ) {
             match result {
                 Ok((_from, data)) => {
-                    self.state.borrow_mut().responses.push(ReceivedResponse {
-                        request_id,
-                        data,
-                    });
+                    self.state
+                        .borrow_mut()
+                        .responses
+                        .push(ReceivedResponse { request_id, data });
                 }
                 Err(error) => {
                     self.state
@@ -5390,6 +5421,214 @@ mod tests {
             max_parts_before_request < 4,
             "Should pipeline requests - max parts before request was {} (should be < 4)",
             max_parts_before_request
+        );
+    }
+
+    #[test]
+    fn resource_proof_packet_roundtrip() {
+        use crate::packet::{Packet, ProofContext, ProofDestination};
+
+        let link_id = [0x42u8; 16];
+        let resource_hash = [0xAAu8; 32];
+        let proof = [0xBBu8; 32];
+
+        let mut data = resource_hash.to_vec();
+        data.extend(&proof);
+
+        let packet = Packet::Proof {
+            hops: 0,
+            destination: ProofDestination::Link(link_id),
+            context: ProofContext::ResourcePrf,
+            data,
+        };
+
+        let bytes = packet.to_bytes();
+        let parsed = Packet::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed, packet);
+
+        if let Packet::Proof {
+            context,
+            data,
+            destination,
+            ..
+        } = parsed
+        {
+            assert_eq!(context, ProofContext::ResourcePrf);
+            assert_eq!(destination, ProofDestination::Link(link_id));
+            assert_eq!(&data[..32], &resource_hash);
+            assert_eq!(&data[32..64], &proof);
+        } else {
+            panic!("Expected Proof packet");
+        }
+    }
+
+    #[test]
+    fn resource_proof_validates_and_cleans_up() {
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let large_response: Vec<u8> = (0..600).map(|i| (i % 256) as u8).collect();
+
+        let svc_a = svc("client");
+        let addr_a = a.add_service(svc_a, &id(1));
+
+        let svc_b = svc("server").with_auto_response(large_response.clone());
+        let addr_b = b.add_service(svc_b, &id(1));
+        let now = Instant::now();
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        a.link(addr_b, None, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        a.request(addr_a, addr_b, "test.path", b"req", now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        assert_eq!(
+            b.outbound_resources.len(),
+            1,
+            "B should have outbound resource"
+        );
+
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        assert_eq!(
+            a.inbound_resources.len(),
+            0,
+            "A's inbound resource should be complete"
+        );
+        assert_eq!(b.outbound_resources.len(), 1, "B still waiting for proof");
+
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        assert_eq!(
+            b.outbound_resources.len(),
+            0,
+            "B should clean up after receiving valid proof"
+        );
+    }
+
+    #[test]
+    fn last_inbound_updated_on_received_packets() {
+        use std::time::Duration;
+
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = svc("client");
+        let addr_a = a.add_service(svc_a, &id(1));
+
+        let svc_b = svc("server").with_auto_response(b"response".to_vec());
+        let addr_b = b.add_service(svc_b, &id(1));
+        let now = Instant::now();
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(addr_b, None, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        assert!(a.established_links.contains_key(&link_id));
+
+        let initial_inbound = a.established_links.get(&link_id).unwrap().last_inbound;
+
+        // Advance time by 3 seconds
+        let later = now + Duration::from_secs(3);
+
+        // Send a request - this will trigger a response from B
+        a.request(addr_a, addr_b, "test.path", b"req", later);
+        a.poll(later);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(later);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(later);
+
+        // After receiving the response, last_inbound should be updated
+        let updated_inbound = a.established_links.get(&link_id).unwrap().last_inbound;
+
+        assert!(
+            updated_inbound > initial_inbound,
+            "last_inbound should be updated after receiving response (was {:?}, now {:?})",
+            initial_inbound,
+            updated_inbound
+        );
+    }
+
+    #[test]
+    fn link_stays_active_with_traffic() {
+        use std::time::Duration;
+
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = svc("client");
+        let addr_a = a.add_service(svc_a, &id(1));
+
+        let svc_b = svc("server").with_auto_response(b"ok".to_vec());
+        let addr_b = b.add_service(svc_b, &id(1));
+        let now = Instant::now();
+
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(addr_b, None, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        // With 0ms RTT, stale_time is 10s (2 * 5s keepalive interval)
+        // Send requests every 4s - link should stay active
+        for i in 1..=5 {
+            let t = now + Duration::from_secs(i * 4);
+            a.request(addr_a, addr_b, "test.path", b"ping", t);
+            a.poll(t);
+            transfer(&mut a, 0, &mut b, 0);
+            b.poll(t);
+            transfer(&mut b, 0, &mut a, 0);
+            a.poll(t);
+
+            assert!(
+                a.established_links.contains_key(&link_id),
+                "Link should stay active at t={}s with regular traffic",
+                i * 4
+            );
+        }
+
+        // At t=20s, link should still be active (last traffic at t=20s)
+        assert!(
+            a.established_links.contains_key(&link_id),
+            "Link should still be active at t=20s"
         );
     }
 }

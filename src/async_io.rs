@@ -26,26 +26,30 @@ fn hdlc_frame(data: &[u8]) -> Vec<u8> {
 }
 
 fn hdlc_extract_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
-    let start = buf.iter().position(|&b| b == HDLC_FLAG)?;
-    let end = buf[start + 1..]
-        .iter()
-        .position(|&b| b == HDLC_FLAG)
-        .map(|p| p + start + 1)?;
+    loop {
+        let start = buf.iter().position(|&b| b == HDLC_FLAG)?;
+        let end = buf[start + 1..]
+            .iter()
+            .position(|&b| b == HDLC_FLAG)
+            .map(|p| p + start + 1)?;
 
-    let frame_data = &buf[start + 1..end];
-    let result = if !frame_data.is_empty() {
+        let frame_data = &buf[start + 1..end];
+
+        // Handle consecutive FLAG bytes (empty frame) - skip and keep looking
+        if frame_data.is_empty() {
+            *buf = buf[start + 1..].to_vec();
+            continue;
+        }
+
         let unescaped = hdlc_unescape(frame_data);
         if unescaped.len() >= 2 {
-            Some(unescaped)
-        } else {
-            None
+            *buf = buf[end..].to_vec();
+            return Some(unescaped);
         }
-    } else {
-        None
-    };
 
-    *buf = buf[end..].to_vec();
-    result
+        // Invalid frame (too short), skip and keep looking
+        *buf = buf[end..].to_vec();
+    }
 }
 
 type Inbox = Arc<Mutex<VecDeque<Vec<u8>>>>;
@@ -75,11 +79,25 @@ impl AsyncTransport {
 
 impl Transport for AsyncTransport {
     fn send(&mut self, data: &[u8]) {
+        let len = data.len();
         self.outbox.lock().unwrap().push_back(data.to_vec());
+        log::trace!(
+            "[TRANSPORT] send queued {} bytes, outbox len={}",
+            len,
+            self.outbox.lock().unwrap().len()
+        );
     }
 
     fn recv(&mut self) -> Option<Vec<u8>> {
-        self.inbox.lock().unwrap().pop_front()
+        let result = self.inbox.lock().unwrap().pop_front();
+        if let Some(ref data) = result {
+            log::trace!(
+                "[TRANSPORT] recv {} bytes, inbox len={}",
+                data.len(),
+                self.inbox.lock().unwrap().len()
+            );
+        }
+        result
     }
 
     fn bandwidth_available(&self) -> bool {
@@ -300,12 +318,16 @@ impl AsyncNode {
     }
 
     pub fn add_tcp_stream(&mut self, stream: TcpStream) {
+        log::info!("[ASYNC] adding TCP stream");
         if let Err(e) = stream.set_nodelay(true) {
             log::warn!("Failed to set TCP_NODELAY: {}", e);
+        } else {
+            log::debug!("[ASYNC] TCP_NODELAY set successfully");
         }
         let (transport, inbox, outbox, connected) = AsyncTransport::new_pair();
         self.node.add_interface(Interface::new(transport));
         let wake_tx = self.wake_tx.clone();
+        log::info!("[ASYNC] spawning tcp_io_task");
         tokio::spawn(tcp_io_task(stream, inbox, outbox, connected, wake_tx));
     }
 
@@ -318,22 +340,51 @@ impl AsyncNode {
     pub async fn run(mut self) {
         let mut tick_interval = tokio::time::interval(Duration::from_millis(10));
         tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_poll = Instant::now();
+        let mut poll_count = 0u64;
+        let run_start = Instant::now();
+        log::info!("[ASYNC] node.run() starting");
 
         loop {
             let now = Instant::now();
+            let since_last = now.duration_since(last_poll);
+            if since_last > Duration::from_secs(1) {
+                log::warn!(
+                    "[ASYNC] poll gap: {:?} - something blocked the event loop",
+                    since_last
+                );
+            }
+            last_poll = now;
+            poll_count += 1;
+
+            if poll_count.is_multiple_of(1000) {
+                log::debug!(
+                    "[ASYNC] poll #{}, uptime {:?}",
+                    poll_count,
+                    run_start.elapsed()
+                );
+            }
+
+            let poll_start = Instant::now();
             self.node.poll(now);
+            let poll_duration = poll_start.elapsed();
+            if poll_duration > Duration::from_millis(100) {
+                log::warn!("[ASYNC] poll() took {:?}", poll_duration);
+            }
 
             tokio::select! {
                 biased;
                 Some(cmd) = self.command_rx.recv() => {
+                    log::trace!("[ASYNC] select: command received");
                     self.handle_command(cmd, Instant::now());
                 }
                 _ = self.wake_rx.recv() => {
+                    log::trace!("[ASYNC] select: wake received");
                     // Drain any extra wakes to prevent backup
                     while self.wake_rx.try_recv().is_ok() {}
                 }
                 _ = tick_interval.tick() => {
-                    // Periodic tick ensures we poll regularly even without events
+                    // log::trace!("[ASYNC] select: tick");
                 }
             }
         }
@@ -528,21 +579,35 @@ async fn tcp_io_task(
     connected: Arc<Mutex<bool>>,
     wake_tx: mpsc::Sender<()>,
 ) {
+    log::info!("[TCP] io task starting");
     let (mut reader, mut writer) = stream.into_split();
     let outbox_writer = outbox.clone();
 
     let read_task = async {
+        log::info!("[TCP IN] read task starting");
         let mut buf = [0u8; 65536];
         let mut hdlc_buf = Vec::new();
+        let mut read_count = 0u64;
 
         loop {
             match reader.read(&mut buf).await {
-                Ok(0) => break,
+                Ok(0) => {
+                    log::info!("[TCP IN] connection closed (read 0)");
+                    break;
+                }
                 Ok(n) => {
-                    log::trace!("[TCP IN] {} bytes raw", n);
+                    read_count += 1;
+                    log::trace!(
+                        "[TCP IN] #{} {} bytes raw, hdlc_buf now {} bytes",
+                        read_count,
+                        n,
+                        hdlc_buf.len() + n
+                    );
                     hdlc_buf.extend_from_slice(&buf[..n]);
 
+                    let mut frame_count = 0;
                     while let Some(frame) = hdlc_extract_frame(&mut hdlc_buf) {
+                        frame_count += 1;
                         log::debug!(
                             "[TCP IN] frame {} bytes: {}",
                             frame.len(),
@@ -550,44 +615,263 @@ async fn tcp_io_task(
                         );
                         inbox.lock().unwrap().push_back(frame);
                     }
+                    if frame_count > 0 {
+                        log::trace!(
+                            "[TCP IN] extracted {} frames, {} bytes remaining in hdlc_buf",
+                            frame_count,
+                            hdlc_buf.len()
+                        );
+                    } else if !hdlc_buf.is_empty() {
+                        // No frames extracted but buffer has data - log for debugging
+                        let flag_positions: Vec<usize> = hdlc_buf
+                            .iter()
+                            .enumerate()
+                            .filter(|&(_, b)| *b == HDLC_FLAG)
+                            .map(|(i, _)| i)
+                            .collect();
+                        log::debug!(
+                            "[TCP IN] no frames extracted, buf {} bytes, FLAG positions: {:?}, first 16: {}",
+                            hdlc_buf.len(),
+                            &flag_positions[..flag_positions.len().min(10)],
+                            hex::encode(&hdlc_buf[..hdlc_buf.len().min(16)])
+                        );
+                    }
                     // Wake the node once after processing all frames (non-blocking)
-                    let _ = wake_tx.try_send(());
+                    match wake_tx.try_send(()) {
+                        Ok(()) => log::trace!("[TCP IN] wake sent"),
+                        Err(_) => log::trace!("[TCP IN] wake channel full"),
+                    }
                 }
                 Err(e) => {
-                    log::debug!("[TCP IN] read error: {}", e);
+                    log::info!("[TCP IN] read error: {}", e);
                     break;
                 }
             }
         }
-        log::debug!("[TCP IN] read task ended");
+        log::info!("[TCP IN] read task ended after {} reads", read_count);
     };
 
     let write_task = async {
+        log::info!("[TCP OUT] write task starting");
+        let mut write_count = 0u64;
+        let mut idle_count = 0u64;
+
         loop {
             let data = outbox_writer.lock().unwrap().pop_front();
             if let Some(data) = data {
+                write_count += 1;
+                let framed = hdlc_frame(&data);
                 log::debug!(
-                    "[TCP OUT] frame {} bytes: {}",
+                    "[TCP OUT] #{} frame {} bytes (framed {}): {}",
+                    write_count,
                     data.len(),
+                    framed.len(),
                     hex::encode(&data[..data.len().min(32)])
                 );
-                let framed = hdlc_frame(&data);
+                let write_start = Instant::now();
                 if writer.write_all(&framed).await.is_err() {
-                    log::debug!("[TCP OUT] write error");
+                    log::info!("[TCP OUT] write error");
                     break;
                 }
+                if writer.flush().await.is_err() {
+                    log::info!("[TCP OUT] flush error");
+                    break;
+                }
+                let write_duration = write_start.elapsed();
+                if write_duration > Duration::from_millis(100) {
+                    log::warn!("[TCP OUT] write+flush took {:?}", write_duration);
+                }
+                idle_count = 0;
             } else {
+                idle_count += 1;
+                if idle_count == 1000 {
+                    log::trace!("[TCP OUT] idle for 1s (1000 iterations)");
+                    idle_count = 0;
+                }
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }
-        log::debug!("[TCP OUT] write task ended");
+        log::info!("[TCP OUT] write task ended after {} writes", write_count);
     };
 
     tokio::select! {
-        _ = read_task => {}
-        _ = write_task => {}
+        _ = read_task => {
+            log::info!("[TCP] read task finished first");
+        }
+        _ = write_task => {
+            log::info!("[TCP] write task finished first");
+        }
     }
 
     *connected.lock().unwrap() = false;
     let _ = wake_tx.send(()).await;
+    log::info!("[TCP] io task ended");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transports::tcp::HDLC_ESC;
+
+    #[test]
+    fn hdlc_single_frame() {
+        let data = vec![0x01, 0x02, 0x03];
+        let framed = hdlc_frame(&data);
+
+        let mut buf = framed;
+        let extracted = hdlc_extract_frame(&mut buf);
+
+        assert_eq!(extracted, Some(data));
+        assert_eq!(buf, vec![HDLC_FLAG]); // ending FLAG remains
+    }
+
+    #[test]
+    fn hdlc_two_frames_shared_flag() {
+        // Two frames where ending FLAG of first = starting FLAG of second
+        let d1 = vec![0x01, 0x02];
+        let d2 = vec![0x03, 0x04];
+
+        let mut buf = Vec::new();
+        buf.push(HDLC_FLAG);
+        buf.extend(hdlc_escape(&d1));
+        buf.push(HDLC_FLAG); // shared
+        buf.extend(hdlc_escape(&d2));
+        buf.push(HDLC_FLAG);
+
+        let f1 = hdlc_extract_frame(&mut buf);
+        assert_eq!(f1, Some(d1));
+
+        let f2 = hdlc_extract_frame(&mut buf);
+        assert_eq!(f2, Some(d2));
+
+        // Only trailing FLAG remains
+        assert_eq!(buf, vec![HDLC_FLAG]);
+    }
+
+    #[test]
+    fn hdlc_consecutive_flags_extracts_in_single_call() {
+        // FLAG FLAG data FLAG - single call should extract data
+        // This tests the real-world usage where we have a while loop:
+        //   while let Some(frame) = hdlc_extract_frame(&mut buf) { ... }
+        // If consecutive FLAGs cause None to be returned, the loop exits
+        // without extracting the valid frame that follows.
+        let data = vec![0x01, 0x02];
+
+        let mut buf = vec![HDLC_FLAG, HDLC_FLAG];
+        buf.extend(hdlc_escape(&data));
+        buf.push(HDLC_FLAG);
+
+        // Single call must extract the frame, not return None
+        let result = hdlc_extract_frame(&mut buf);
+        assert_eq!(result, Some(data));
+        assert_eq!(buf, vec![HDLC_FLAG]); // only trailing FLAG remains
+    }
+
+    #[test]
+    fn hdlc_partial_frame_not_consumed() {
+        // Incomplete frame - should return None and NOT modify buffer
+        let mut buf = vec![HDLC_FLAG, 0x01, 0x02, 0x03];
+        let original = buf.clone();
+
+        let result = hdlc_extract_frame(&mut buf);
+
+        assert_eq!(result, None);
+        assert_eq!(buf, original); // buffer unchanged
+    }
+
+    #[test]
+    fn hdlc_garbage_before_frame() {
+        let data = vec![0x01, 0x02];
+
+        let mut buf = vec![0xFF, 0xAA, 0xBB]; // garbage
+        buf.push(HDLC_FLAG);
+        buf.extend(hdlc_escape(&data));
+        buf.push(HDLC_FLAG);
+
+        let result = hdlc_extract_frame(&mut buf);
+        assert_eq!(result, Some(data));
+    }
+
+    #[test]
+    fn hdlc_escaped_flag_in_data() {
+        // Data contains FLAG byte - must be escaped
+        let data = vec![0x01, HDLC_FLAG, 0x02];
+        let framed = hdlc_frame(&data);
+
+        let mut buf = framed;
+        let extracted = hdlc_extract_frame(&mut buf);
+
+        assert_eq!(extracted, Some(data));
+    }
+
+    #[test]
+    fn hdlc_escaped_esc_in_data() {
+        // Data contains ESC byte - must be escaped
+        let data = vec![0x01, HDLC_ESC, 0x02];
+        let framed = hdlc_frame(&data);
+
+        let mut buf = framed;
+        let extracted = hdlc_extract_frame(&mut buf);
+
+        assert_eq!(extracted, Some(data));
+    }
+
+    #[test]
+    fn hdlc_roundtrip_many_frames() {
+        let frames: Vec<Vec<u8>> = vec![
+            vec![0x00, 0x01],
+            vec![HDLC_FLAG, HDLC_ESC, 0xFF],
+            vec![0x10, 0x20, 0x30, 0x40],
+        ];
+
+        // Build buffer with all frames (shared FLAGs)
+        let mut buf = Vec::new();
+        for (i, data) in frames.iter().enumerate() {
+            if i == 0 {
+                buf.push(HDLC_FLAG);
+            }
+            buf.extend(hdlc_escape(data));
+            buf.push(HDLC_FLAG);
+        }
+
+        // Extract all
+        for expected in &frames {
+            let extracted = hdlc_extract_frame(&mut buf);
+            assert_eq!(extracted.as_ref(), Some(expected));
+        }
+
+        // Nothing left but trailing FLAG
+        assert_eq!(buf, vec![HDLC_FLAG]);
+        assert_eq!(hdlc_extract_frame(&mut buf), None);
+    }
+
+    #[test]
+    fn hdlc_frame_too_short_rejected() {
+        // Frame with only 1 byte of content (< 2) should be rejected
+        let mut buf = vec![HDLC_FLAG, 0x01, HDLC_FLAG];
+
+        let result = hdlc_extract_frame(&mut buf);
+        assert_eq!(result, None);
+        // Buffer should advance past the invalid frame
+        assert_eq!(buf, vec![HDLC_FLAG]);
+    }
+
+    #[test]
+    fn hdlc_incremental_receive() {
+        // Simulate receiving a frame in chunks
+        let data = vec![0x01, 0x02, 0x03];
+        let framed = hdlc_frame(&data);
+
+        let mut buf = Vec::new();
+
+        // Receive first half
+        buf.extend_from_slice(&framed[..framed.len() / 2]);
+        assert_eq!(hdlc_extract_frame(&mut buf), None);
+
+        // Receive second half
+        buf.extend_from_slice(&framed[framed.len() / 2..]);
+        let extracted = hdlc_extract_frame(&mut buf);
+
+        assert_eq!(extracted, Some(data));
+    }
 }

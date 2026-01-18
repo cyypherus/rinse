@@ -9,100 +9,153 @@ async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <directory> [listen_addr]", args[0]);
-        eprintln!("  directory    - Directory to serve files from");
-        eprintln!("  listen_addr  - Address to listen on (default: 0.0.0.0:4242)");
-        std::process::exit(1);
+
+    let mut name = "Rinse File Server".to_string();
+    let mut dir_arg = None;
+    let mut connect_addr = None;
+    let mut listen_addr = "0.0.0.0:4242".to_string();
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--name" => {
+                name = args.get(i + 1).expect("--name requires a value").clone();
+                i += 2;
+            }
+            "--connect" => {
+                connect_addr = Some(
+                    args.get(i + 1)
+                        .expect("--connect requires an address")
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--listen" => {
+                listen_addr = args
+                    .get(i + 1)
+                    .expect("--listen requires an address")
+                    .clone();
+                i += 2;
+            }
+            arg if !arg.starts_with('-') && dir_arg.is_none() => {
+                dir_arg = Some(arg.to_string());
+                i += 1;
+            }
+            _ => {
+                eprintln!("Unknown argument: {}", args[i]);
+                std::process::exit(1);
+            }
+        }
     }
 
-    let dir = PathBuf::from(&args[1]);
+    let dir_str = dir_arg.unwrap_or_else(|| {
+        eprintln!("Usage: {} <directory> [options]", args[0]);
+        eprintln!("  --name <name>      - Display name (default: Rinse File Server)");
+        eprintln!("  --connect <addr>   - Connect to an existing node");
+        eprintln!("  --listen <addr>    - Listen address (default: 0.0.0.0:4242)");
+        std::process::exit(1);
+    });
+
+    let dir = PathBuf::from(&dir_str);
     if !dir.is_dir() {
-        eprintln!("Error: '{}' is not a directory", args[1]);
+        eprintln!("Error: '{}' is not a directory", dir_str);
         std::process::exit(1);
     }
     let dir = Arc::new(dir.canonicalize().expect("failed to canonicalize path"));
 
-    let listen_addr = args.get(2).map(|s| s.as_str()).unwrap_or("0.0.0.0:4242");
-
     let mut node = AsyncNode::new(false);
     let identity = Identity::generate(&mut rand::thread_rng());
 
-    let mut service = node.add_service("fileserver", &["file"], &identity);
+    let mut service = node.add_service("nomadnetwork.node", &["/page/*"], &identity);
     let addr = service.address();
-    log::info!("Service address: {}", hex::encode(addr));
+    log::info!("Node: {} ({})", name, hex::encode(addr));
 
-    service.announce();
+    if let Some(addr) = connect_addr {
+        log::info!("Connecting to {}", addr);
+        node.connect(&addr).await.expect("failed to connect");
+    } else {
+        let listener = TcpListener::bind(&listen_addr)
+            .await
+            .expect("failed to bind");
+        log::info!("Listening on {} (waiting for connection...)", listen_addr);
 
-    let listener = TcpListener::bind(listen_addr)
-        .await
-        .expect("failed to bind");
-    log::info!("Listening on {}", listen_addr);
+        let (stream, peer) = listener.accept().await.expect("failed to accept");
+        log::info!("Accepted connection from {}", peer);
+        node.add_tcp_stream(stream);
+    }
+
     log::info!("Serving files from {}", dir.display());
+    let name_bytes = name.into_bytes();
 
-    let dir_clone = dir.clone();
     tokio::spawn(async move {
-        serve_requests(&mut service, &dir_clone).await;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    service.announce_with_app_data(&name_bytes);
+                    log::debug!("Announced service");
+                }
+                req = service.recv_request() => {
+                    let Some(req) = req else { break };
+                    handle_request(&mut service, &dir, req).await;
+                }
+            }
+        }
     });
 
-    let accept_task = async {
-        loop {
-            match listener.accept().await {
-                Ok((stream, peer)) => {
-                    log::info!("Accepted connection from {}", peer);
-                    node.add_tcp_stream(stream);
-                }
-                Err(e) => {
-                    log::warn!("Accept error: {}", e);
-                }
-            }
-        }
-    };
-
-    tokio::select! {
-        _ = accept_task => {}
-        _ = node.run() => {}
-    }
+    node.run().await;
 }
 
-async fn serve_requests(service: &mut ServiceHandle, dir: &PathBuf) {
-    loop {
-        let Some(req) = service.recv_request().await else {
-            break;
+async fn handle_request(
+    service: &mut ServiceHandle,
+    dir: &std::path::Path,
+    req: rinse::IncomingRequest,
+) {
+    log::info!(
+        "Request from {} path='{}' data_len={}",
+        hex::encode(&req.from[..4]),
+        req.path,
+        req.data.len()
+    );
+
+    let response = if req.path.is_empty()
+        || req.path == "/"
+        || req.path == "/page"
+        || req.path.starts_with("/page/")
+    {
+        let filename = req
+            .path
+            .strip_prefix("/page")
+            .unwrap_or(&req.path)
+            .trim_start_matches('/');
+        let filename = if filename.is_empty() {
+            "index.mu"
+        } else {
+            filename
         };
+        let file_path = dir.join(filename);
 
-        log::info!(
-            "Request from {} path='{}' data_len={}",
-            hex::encode(&req.from[..4]),
-            req.path,
-            req.data.len()
-        );
-
-        let response = if req.path == "file" {
-            let filename = String::from_utf8_lossy(&req.data);
-            let file_path = dir.join(filename.as_ref());
-
-            if !file_path.starts_with(dir) {
-                log::warn!("Path traversal attempt: {}", filename);
-                b"error: invalid path".to_vec()
-            } else {
-                match tokio::fs::read(&file_path).await {
-                    Ok(data) => {
-                        log::info!("Serving {} ({} bytes)", file_path.display(), data.len());
-                        data
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to read {}: {}", file_path.display(), e);
-                        format!("error: {}", e).into_bytes()
-                    }
+        if !file_path.starts_with(dir) {
+            log::warn!("Path traversal attempt: {}", filename);
+            b"error: invalid path".to_vec()
+        } else {
+            match tokio::fs::read(&file_path).await {
+                Ok(data) => {
+                    log::info!("Serving {} ({} bytes)", file_path.display(), data.len());
+                    data
+                }
+                Err(e) => {
+                    log::warn!("Failed to read {}: {}", file_path.display(), e);
+                    format!("error: {}", e).into_bytes()
                 }
             }
-        } else {
-            b"error: unknown path".to_vec()
-        };
-
-        if let Err(e) = service.respond(req.request_id, &response).await {
-            log::warn!("Failed to respond: {:?}", e);
         }
+    } else {
+        log::warn!("Unknown path: {}", req.path);
+        b"error: unknown path".to_vec()
+    };
+
+    if let Err(e) = service.respond(req.request_id, &response).await {
+        log::warn!("Failed to respond: {:?}", e);
     }
 }
