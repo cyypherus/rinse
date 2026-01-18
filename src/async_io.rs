@@ -8,6 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::aspect::AspectHash;
 use crate::handle::{RequestError, RespondError};
 use crate::packet::Address;
 use crate::request::RequestId;
@@ -106,6 +107,7 @@ pub struct Destination {
     pub address: Address,
     pub app_data: Option<Vec<u8>>,
     pub hops: u8,
+    pub aspect: AspectHash,
 }
 
 type RequestWaiters =
@@ -185,6 +187,7 @@ impl Service for BridgeService {
                 address: d.address,
                 app_data: d.app_data.clone(),
                 hops: d.hops,
+                aspect: d.aspect,
             })
             .collect();
         let _ = self.destinations_tx.send(destinations);
@@ -297,6 +300,9 @@ impl AsyncNode {
     }
 
     pub fn add_tcp_stream(&mut self, stream: TcpStream) {
+        if let Err(e) = stream.set_nodelay(true) {
+            log::warn!("Failed to set TCP_NODELAY: {}", e);
+        }
         let (transport, inbox, outbox, connected) = AsyncTransport::new_pair();
         self.node.add_interface(Interface::new(transport));
         let wake_tx = self.wake_tx.clone();
@@ -366,11 +372,12 @@ impl AsyncNode {
                 let destinations: Vec<Destination> = self
                     .node
                     .known_destinations()
-                    .iter()
-                    .map(|addr| Destination {
-                        address: *addr,
-                        app_data: None,
-                        hops: 0,
+                    .into_iter()
+                    .map(|d| Destination {
+                        address: d.address,
+                        app_data: d.app_data,
+                        hops: d.hops,
+                        aspect: d.aspect,
                     })
                     .collect();
                 let _ = reply.send(destinations);

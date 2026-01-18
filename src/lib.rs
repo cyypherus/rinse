@@ -2,6 +2,7 @@
 #![allow(clippy::too_many_arguments)]
 
 mod announce;
+mod aspect;
 mod crypto;
 mod handle;
 mod identity;
@@ -10,7 +11,6 @@ mod link;
 mod node;
 mod packet;
 mod packet_hashlist;
-mod path_request;
 mod request;
 mod resource;
 mod stats;
@@ -19,6 +19,7 @@ pub mod transports;
 #[cfg(feature = "tokio")]
 mod async_io;
 
+pub use aspect::AspectHash;
 pub use handle::{Destination, NodeHandle, RequestError, RespondError, Service};
 pub use identity::Identity;
 pub use interface::{Interface, Transport};

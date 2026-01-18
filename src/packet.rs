@@ -12,17 +12,11 @@ const PKT_LINKREQUEST: u8 = 0b10;
 const PKT_PROOF: u8 = 0b11;
 
 const CTX_LRPROOF: u8 = 0xFF;
+const CTX_PATH_RESPONSE: u8 = 0x0B;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum DataContext {
-    None = 0x00,
-    CacheRequest = 0x08,
-    PathResponse = 0x0B,
-    Command = 0x0C,
-    CommandStatus = 0x0D,
-    Channel = 0x0E,
-}
+pub(crate) const PATH_REQUEST_DEST: Address = [
+    0x6b, 0x9f, 0x66, 0x01, 0x4d, 0x98, 0x53, 0xfa, 0xab, 0x22, 0x0f, 0xba, 0x47, 0xd0, 0x27, 0x61,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -38,7 +32,6 @@ pub enum LinkContext {
     CacheRequest = 0x08,
     Request = 0x09,
     Response = 0x0A,
-    PathResponse = 0x0B,
     Command = 0x0C,
     CommandStatus = 0x0D,
     Channel = 0x0E,
@@ -58,16 +51,11 @@ pub enum ProofContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Packet {
-    Data {
-        hops: u8,
-        destination: DataDestination,
-        context: DataContext,
-        data: Vec<u8>,
-    },
     Announce {
         hops: u8,
         destination: AnnounceDestination,
         has_ratchet: bool,
+        is_path_response: bool,
         data: Vec<u8>,
     },
     Proof {
@@ -91,6 +79,22 @@ pub enum Packet {
         hops: u8,
         destination: LinkProofDestination,
         data: Vec<u8>,
+    },
+    PathRequest {
+        hops: u8,
+        query_destination: Address,
+        requesting_transport: Option<Address>,
+        tag: Address,
+    },
+    SingleData {
+        hops: u8,
+        destination: SingleDestination,
+        ciphertext: Vec<u8>,
+    },
+    GroupData {
+        hops: u8,
+        destination: Address,
+        ciphertext: Vec<u8>,
     },
 }
 
@@ -128,10 +132,8 @@ pub enum LinkDataDestination {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DataDestination {
-    Single(Address),
-    Group(Address),
-    Plain(Address),
+pub enum SingleDestination {
+    Direct(Address),
     Transport {
         transport_id: Address,
         destination: Address,
@@ -155,20 +157,6 @@ pub enum ParseError {
     InvalidPacketType,
 }
 
-impl DataContext {
-    fn from_byte(b: u8) -> Option<Self> {
-        match b {
-            0x00 => Some(Self::None),
-            0x08 => Some(Self::CacheRequest),
-            0x0B => Some(Self::PathResponse),
-            0x0C => Some(Self::Command),
-            0x0D => Some(Self::CommandStatus),
-            0x0E => Some(Self::Channel),
-            _ => None,
-        }
-    }
-}
-
 impl LinkContext {
     fn from_byte(b: u8) -> Option<Self> {
         match b {
@@ -183,7 +171,6 @@ impl LinkContext {
             0x08 => Some(Self::CacheRequest),
             0x09 => Some(Self::Request),
             0x0A => Some(Self::Response),
-            0x0B => Some(Self::PathResponse),
             0x0C => Some(Self::Command),
             0x0D => Some(Self::CommandStatus),
             0x0E => Some(Self::Channel),
@@ -218,7 +205,30 @@ impl Packet {
         }
         out.extend_from_slice(&self.destination_hash());
         out.push(self.context_byte());
-        out.extend_from_slice(self.data());
+
+        match self {
+            Packet::Announce { data, .. }
+            | Packet::Proof { data, .. }
+            | Packet::LinkData { data, .. }
+            | Packet::LinkRequest { data, .. }
+            | Packet::LinkProof { data, .. } => out.extend_from_slice(data),
+            Packet::PathRequest {
+                query_destination,
+                requesting_transport,
+                tag,
+                ..
+            } => {
+                out.extend_from_slice(query_destination);
+                if let Some(transport) = requesting_transport {
+                    out.extend_from_slice(transport);
+                }
+                out.extend_from_slice(tag);
+            }
+            Packet::SingleData { ciphertext, .. } | Packet::GroupData { ciphertext, .. } => {
+                out.extend_from_slice(ciphertext)
+            }
+        }
+
         out
     }
 
@@ -228,31 +238,74 @@ impl Packet {
             .transport_id()
             .map(|t| format!(" via <{}>", hex::encode(t)))
             .unwrap_or_default();
-        let data_len = self.data().len();
         match self {
-            Packet::Data { hops, context, .. } => {
-                format!("Data to <{dest}>{transport} hops={hops} ctx={context:?} len={data_len}")
-            }
             Packet::Announce {
-                hops, has_ratchet, ..
+                hops,
+                has_ratchet,
+                data,
+                ..
             } => {
                 format!(
-                    "Announce <{dest}>{transport} hops={hops} ratchet={has_ratchet} len={data_len}"
+                    "Announce <{dest}>{transport} hops={hops} ratchet={has_ratchet} len={}",
+                    data.len()
                 )
             }
-            Packet::Proof { hops, context, .. } => {
-                format!("Proof to <{dest}> hops={hops} ctx={context:?} len={data_len}")
-            }
-            Packet::LinkData { hops, context, .. } => {
+            Packet::Proof {
+                hops,
+                context,
+                data,
+                ..
+            } => {
                 format!(
-                    "LinkData to <{dest}>{transport} hops={hops} ctx={context:?} len={data_len}"
+                    "Proof to <{dest}> hops={hops} ctx={context:?} len={}",
+                    data.len()
                 )
             }
-            Packet::LinkRequest { hops, .. } => {
-                format!("LinkRequest to <{dest}>{transport} hops={hops} len={data_len}")
+            Packet::LinkData {
+                hops,
+                context,
+                data,
+                ..
+            } => {
+                format!(
+                    "LinkData to <{dest}>{transport} hops={hops} ctx={context:?} len={}",
+                    data.len()
+                )
             }
-            Packet::LinkProof { hops, .. } => {
-                format!("LinkProof for <{dest}>{transport} hops={hops} len={data_len}")
+            Packet::LinkRequest { hops, data, .. } => {
+                format!(
+                    "LinkRequest to <{dest}>{transport} hops={hops} len={}",
+                    data.len()
+                )
+            }
+            Packet::LinkProof { hops, data, .. } => {
+                format!(
+                    "LinkProof for <{dest}>{transport} hops={hops} len={}",
+                    data.len()
+                )
+            }
+            Packet::PathRequest {
+                hops,
+                query_destination,
+                ..
+            } => {
+                format!(
+                    "PathRequest for <{}> hops={hops}",
+                    hex::encode(query_destination)
+                )
+            }
+            Packet::SingleData {
+                hops, ciphertext, ..
+            } => {
+                format!(
+                    "SingleData to <{dest}>{transport} hops={hops} len={}",
+                    ciphertext.len()
+                )
+            }
+            Packet::GroupData {
+                hops, ciphertext, ..
+            } => {
+                format!("GroupData to <{dest}> hops={hops} len={}", ciphertext.len())
             }
         }
     }
@@ -314,25 +367,54 @@ impl Packet {
                         context,
                         data,
                     })
-                } else {
-                    let context =
-                        DataContext::from_byte(context_byte).ok_or(ParseError::InvalidContext)?;
-                    let destination = match (destination_type, transport_id, is_transport) {
-                        (DEST_SINGLE, None, false) => DataDestination::Single(destination_hash),
-                        (DEST_GROUP, None, false) => DataDestination::Group(destination_hash),
-                        (DEST_PLAIN, None, false) => DataDestination::Plain(destination_hash),
-                        (DEST_SINGLE, Some(tid), true) => DataDestination::Transport {
+                } else if destination_type == DEST_PLAIN {
+                    if destination_hash == PATH_REQUEST_DEST {
+                        if data.len() < 32 {
+                            return Err(ParseError::TooShort);
+                        }
+                        let query_destination: Address = data[..16].try_into().unwrap();
+                        let (requesting_transport, tag) = if data.len() >= 48 {
+                            let transport: Address = data[16..32].try_into().unwrap();
+                            let tag: Address = data[32..48].try_into().unwrap();
+                            (Some(transport), tag)
+                        } else {
+                            let tag: Address = data[16..32].try_into().unwrap();
+                            (None, tag)
+                        };
+                        Ok(Packet::PathRequest {
+                            hops,
+                            query_destination,
+                            requesting_transport,
+                            tag,
+                        })
+                    } else {
+                        Err(ParseError::InvalidDestinationType)
+                    }
+                } else if destination_type == DEST_SINGLE {
+                    let destination = match (transport_id, is_transport) {
+                        (None, false) => SingleDestination::Direct(destination_hash),
+                        (Some(tid), true) => SingleDestination::Transport {
                             transport_id: tid,
                             destination: destination_hash,
                         },
                         _ => return Err(ParseError::InvalidDestinationType),
                     };
-                    Ok(Packet::Data {
+                    Ok(Packet::SingleData {
                         hops,
                         destination,
-                        context,
-                        data,
+                        ciphertext: data,
                     })
+                } else if destination_type == DEST_GROUP {
+                    if transport_id.is_some() {
+                        return Err(ParseError::InvalidDestinationType);
+                    }
+                    Ok(Packet::GroupData {
+                        hops,
+                        destination: destination_hash,
+                        ciphertext: data,
+                    })
+                } else {
+                    Err(ParseError::InvalidDestinationType)
                 }
             }
             PKT_ANNOUNCE => {
@@ -340,6 +422,7 @@ impl Packet {
                     return Err(ParseError::InvalidDestinationType);
                 }
                 let has_ratchet = context_flag == 1;
+                let is_path_response = context_byte == CTX_PATH_RESPONSE;
                 let destination = match transport_id {
                     None => AnnounceDestination::Single(destination_hash),
                     Some(tid) => AnnounceDestination::Transport {
@@ -351,6 +434,7 @@ impl Packet {
                     hops,
                     destination,
                     has_ratchet,
+                    is_path_response,
                     data,
                 })
             }
@@ -418,46 +502,33 @@ impl Packet {
 
     pub fn hops(&self) -> u8 {
         match self {
-            Packet::Data { hops, .. } => *hops,
             Packet::Announce { hops, .. } => *hops,
             Packet::Proof { hops, .. } => *hops,
             Packet::LinkData { hops, .. } => *hops,
             Packet::LinkRequest { hops, .. } => *hops,
             Packet::LinkProof { hops, .. } => *hops,
+            Packet::PathRequest { hops, .. } => *hops,
+            Packet::SingleData { hops, .. } => *hops,
+            Packet::GroupData { hops, .. } => *hops,
         }
     }
 
     pub fn increment_hops(&mut self) {
         let hops = match self {
-            Packet::Data { hops, .. } => hops,
             Packet::Announce { hops, .. } => hops,
             Packet::Proof { hops, .. } => hops,
             Packet::LinkData { hops, .. } => hops,
             Packet::LinkRequest { hops, .. } => hops,
             Packet::LinkProof { hops, .. } => hops,
+            Packet::PathRequest { hops, .. } => hops,
+            Packet::SingleData { hops, .. } => hops,
+            Packet::GroupData { hops, .. } => hops,
         };
         *hops = hops.saturating_add(1);
     }
 
-    pub fn data(&self) -> &[u8] {
-        match self {
-            Packet::Data { data, .. } => data,
-            Packet::Announce { data, .. } => data,
-            Packet::Proof { data, .. } => data,
-            Packet::LinkData { data, .. } => data,
-            Packet::LinkRequest { data, .. } => data,
-            Packet::LinkProof { data, .. } => data,
-        }
-    }
-
     pub fn destination_hash(&self) -> Address {
         match self {
-            Packet::Data { destination, .. } => match destination {
-                DataDestination::Single(a) => *a,
-                DataDestination::Group(a) => *a,
-                DataDestination::Plain(a) => *a,
-                DataDestination::Transport { destination, .. } => *destination,
-            },
             Packet::Announce { destination, .. } => match destination {
                 AnnounceDestination::Single(a) => *a,
                 AnnounceDestination::Transport { destination, .. } => *destination,
@@ -478,15 +549,17 @@ impl Packet {
                 LinkProofDestination::Direct(a) => *a,
                 LinkProofDestination::Transport { link_id, .. } => *link_id,
             },
+            Packet::PathRequest { .. } => PATH_REQUEST_DEST,
+            Packet::SingleData { destination, .. } => match destination {
+                SingleDestination::Direct(a) => *a,
+                SingleDestination::Transport { destination, .. } => *destination,
+            },
+            Packet::GroupData { destination, .. } => *destination,
         }
     }
 
     pub fn transport_id(&self) -> Option<Address> {
         match self {
-            Packet::Data { destination, .. } => match destination {
-                DataDestination::Transport { transport_id, .. } => Some(*transport_id),
-                _ => None,
-            },
             Packet::Announce { destination, .. } => match destination {
                 AnnounceDestination::Transport { transport_id, .. } => Some(*transport_id),
                 _ => None,
@@ -504,6 +577,12 @@ impl Packet {
                 LinkProofDestination::Transport { transport_id, .. } => Some(*transport_id),
                 _ => None,
             },
+            Packet::PathRequest { .. } => None,
+            Packet::SingleData { destination, .. } => match destination {
+                SingleDestination::Transport { transport_id, .. } => Some(*transport_id),
+                _ => None,
+            },
+            Packet::GroupData { .. } => None,
         }
     }
 
@@ -523,10 +602,6 @@ impl Packet {
         };
 
         let propagation_type: u8 = match self {
-            Packet::Data {
-                destination: DataDestination::Transport { .. },
-                ..
-            } => 1,
             Packet::Announce {
                 destination: AnnounceDestination::Transport { .. },
                 ..
@@ -543,15 +618,14 @@ impl Packet {
                 destination: LinkProofDestination::Transport { .. },
                 ..
             } => 1,
+            Packet::SingleData {
+                destination: SingleDestination::Transport { .. },
+                ..
+            } => 1,
             _ => 0,
         };
 
         let destination_type: u8 = match self {
-            Packet::Data { destination, .. } => match destination {
-                DataDestination::Single(_) | DataDestination::Transport { .. } => DEST_SINGLE,
-                DataDestination::Group(_) => DEST_GROUP,
-                DataDestination::Plain(_) => DEST_PLAIN,
-            },
             Packet::Announce { .. } => DEST_SINGLE,
             Packet::Proof { destination, .. } => match destination {
                 ProofDestination::Single(_) => DEST_SINGLE,
@@ -560,10 +634,16 @@ impl Packet {
             Packet::LinkData { .. } => DEST_LINK,
             Packet::LinkRequest { .. } => DEST_SINGLE,
             Packet::LinkProof { .. } => DEST_LINK,
+            Packet::PathRequest { .. } => DEST_PLAIN,
+            Packet::SingleData { .. } => DEST_SINGLE,
+            Packet::GroupData { .. } => DEST_GROUP,
         };
 
         let packet_type: u8 = match self {
-            Packet::Data { .. } | Packet::LinkData { .. } => PKT_DATA,
+            Packet::LinkData { .. }
+            | Packet::PathRequest { .. }
+            | Packet::SingleData { .. }
+            | Packet::GroupData { .. } => PKT_DATA,
             Packet::Announce { .. } => PKT_ANNOUNCE,
             Packet::LinkRequest { .. } => PKT_LINKREQUEST,
             Packet::Proof { .. } | Packet::LinkProof { .. } => PKT_PROOF,
@@ -578,12 +658,18 @@ impl Packet {
 
     fn context_byte(&self) -> u8 {
         match self {
-            Packet::Data { context, .. } => *context as u8,
+            Packet::Announce {
+                is_path_response: true,
+                ..
+            } => CTX_PATH_RESPONSE,
             Packet::Announce { .. } => 0x00,
             Packet::Proof { context, .. } => *context as u8,
             Packet::LinkData { context, .. } => *context as u8,
             Packet::LinkRequest { .. } => 0x00,
             Packet::LinkProof { .. } => CTX_LRPROOF,
+            Packet::PathRequest { .. } => 0x00,
+            Packet::SingleData { .. } => 0x00,
+            Packet::GroupData { .. } => 0x00,
         }
     }
 
@@ -607,11 +693,6 @@ impl Packet {
 
     pub fn set_transport_id(&mut self, new_id: Address) {
         match self {
-            Packet::Data { destination, .. } => {
-                if let DataDestination::Transport { transport_id, .. } = destination {
-                    *transport_id = new_id;
-                }
-            }
             Packet::Announce { destination, .. } => {
                 if let AnnounceDestination::Transport { transport_id, .. } = destination {
                     *transport_id = new_id;
@@ -633,19 +714,18 @@ impl Packet {
                     *transport_id = new_id;
                 }
             }
+            Packet::PathRequest { .. } => {}
+            Packet::SingleData { destination, .. } => {
+                if let SingleDestination::Transport { transport_id, .. } = destination {
+                    *transport_id = new_id;
+                }
+            }
+            Packet::GroupData { .. } => {}
         }
     }
 
     pub fn strip_transport(&mut self) {
         match self {
-            Packet::Data { destination, .. } => {
-                if let DataDestination::Transport {
-                    destination: dest, ..
-                } = *destination
-                {
-                    *destination = DataDestination::Single(dest);
-                }
-            }
             Packet::Announce { destination, .. } => {
                 if let AnnounceDestination::Transport {
                     destination: dest, ..
@@ -673,19 +753,21 @@ impl Packet {
                     *destination = LinkProofDestination::Direct(link_id);
                 }
             }
+            Packet::PathRequest { .. } => {}
+            Packet::SingleData { destination, .. } => {
+                if let SingleDestination::Transport {
+                    destination: dest, ..
+                } = *destination
+                {
+                    *destination = SingleDestination::Direct(dest);
+                }
+            }
+            Packet::GroupData { .. } => {}
         }
     }
 
     pub fn insert_transport(&mut self, next_hop: Address) {
         match self {
-            Packet::Data { destination, .. } => {
-                if let DataDestination::Single(dest) = *destination {
-                    *destination = DataDestination::Transport {
-                        transport_id: next_hop,
-                        destination: dest,
-                    };
-                }
-            }
             Packet::Announce { destination, .. } => {
                 if let AnnounceDestination::Single(dest) = *destination {
                     *destination = AnnounceDestination::Transport {
@@ -719,6 +801,16 @@ impl Packet {
                     };
                 }
             }
+            Packet::PathRequest { .. } => {}
+            Packet::SingleData { destination, .. } => {
+                if let SingleDestination::Direct(dest) = *destination {
+                    *destination = SingleDestination::Transport {
+                        transport_id: next_hop,
+                        destination: dest,
+                    };
+                }
+            }
+            Packet::GroupData { .. } => {}
         }
     }
 }
@@ -733,15 +825,14 @@ mod tests {
         // Hops=4
         let hash1 = [1u8; 16];
         let hash2 = [2u8; 16];
-        let data = vec![0xAB, 0xCD];
-        let packet = Packet::Data {
+        let ciphertext = vec![0xAB, 0xCD];
+        let packet = Packet::SingleData {
             hops: 4,
-            destination: DataDestination::Transport {
+            destination: SingleDestination::Transport {
                 transport_id: hash1,
                 destination: hash2,
             },
-            context: DataContext::None,
-            data: data.clone(),
+            ciphertext: ciphertext.clone(),
         };
 
         let bytes = packet.to_bytes();
@@ -750,7 +841,7 @@ mod tests {
         assert_eq!(&bytes[2..18], &hash1);
         assert_eq!(&bytes[18..34], &hash2);
         assert_eq!(bytes[34], 0x00);
-        assert_eq!(&bytes[35..], &data);
+        assert_eq!(&bytes[35..], &ciphertext);
 
         let parsed = Packet::from_bytes(&bytes).unwrap();
         assert_eq!(parsed, packet);
@@ -762,12 +853,11 @@ mod tests {
         // IFAC=0, HeaderType=0, ContextFlag=0, Propagation=0, Destination=00, PacketType=00
         // Hops=7
         let hash1 = [3u8; 16];
-        let data = vec![0xEF];
-        let packet = Packet::Data {
+        let ciphertext = vec![0xEF];
+        let packet = Packet::SingleData {
             hops: 7,
-            destination: DataDestination::Single(hash1),
-            context: DataContext::None,
-            data: data.clone(),
+            destination: SingleDestination::Direct(hash1),
+            ciphertext: ciphertext.clone(),
         };
 
         let bytes = packet.to_bytes();
@@ -775,7 +865,7 @@ mod tests {
         assert_eq!(bytes[1], 7);
         assert_eq!(&bytes[2..18], &hash1);
         assert_eq!(bytes[18], 0x00);
-        assert_eq!(&bytes[19..], &data);
+        assert_eq!(&bytes[19..], &ciphertext);
 
         let parsed = Packet::from_bytes(&bytes).unwrap();
         assert_eq!(parsed, packet);
@@ -798,12 +888,13 @@ mod tests {
 
     #[test]
     fn spec_size_path_request_51_bytes() {
-        let packet = Packet::Data {
+        let packet = Packet::PathRequest {
             hops: 0,
-            destination: DataDestination::Single([0u8; 16]),
-            context: DataContext::PathResponse,
-            data: vec![0u8; 32],
+            query_destination: [0u8; 16],
+            requesting_transport: None,
+            tag: [0u8; 16],
         };
+        // 2 (header) + 16 (dest) + 1 (context) + 32 (query_dest + tag) = 51
         assert_eq!(packet.to_bytes().len(), 51);
 
         let bytes = packet.to_bytes();
@@ -869,6 +960,7 @@ mod tests {
             hops: 0,
             destination: AnnounceDestination::Single([0u8; 16]),
             has_ratchet: false,
+            is_path_response: false,
             data: vec![0u8; 148],
         };
         assert_eq!(packet.to_bytes().len(), 167);
@@ -909,6 +1001,7 @@ mod tests {
             hops: 0,
             destination: AnnounceDestination::Single(dest_hash),
             has_ratchet: false,
+            is_path_response: false,
             data: announce.to_bytes(),
         };
 

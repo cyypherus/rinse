@@ -44,10 +44,6 @@ impl LinkRequest {
         })
     }
 
-    pub fn link_id(hashable_part: &[u8]) -> LinkId {
-        sha256(hashable_part)[..16].try_into().unwrap()
-    }
-
     pub fn link_id_from_packet(hashable_part: &[u8], data_len: usize) -> LinkId {
         const ECPUBSIZE: usize = 64;
         let truncated = if data_len > ECPUBSIZE {
@@ -402,6 +398,8 @@ mod tests {
 
     #[test]
     fn full_link_establishment_flow() {
+        use crate::packet::{LinkRequestDestination, Packet};
+
         let mut rng = test_rng();
         let now = Instant::now();
 
@@ -413,7 +411,13 @@ mod tests {
             initiator_enc.public,
             initiator_sig.verifying_key().to_bytes(),
         );
-        let link_id = LinkRequest::link_id(&request.to_bytes());
+        let request_data = request.to_bytes();
+        let packet = Packet::LinkRequest {
+            hops: 0,
+            destination: LinkRequestDestination::Direct(dest),
+            data: request_data.clone(),
+        };
+        let link_id = LinkRequest::link_id_from_packet(&packet.hashable_part(), request_data.len());
 
         let responder_enc = EphemeralKeyPair::generate(&mut rng);
         let responder_sig = SigningKey::generate(&mut rng);

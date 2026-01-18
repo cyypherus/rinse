@@ -7,6 +7,7 @@ use rand::{Rng, RngCore};
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 use crate::announce::{AnnounceBuilder, AnnounceData};
+use crate::aspect::AspectHash;
 use crate::crypto::{EphemeralKeyPair, sha256};
 use crate::handle::{Destination, NodeHandle, PendingAction, Service};
 use crate::stats::{Stats, StatsSnapshot};
@@ -46,9 +47,8 @@ enum ServiceNotification {
     DestinationsChanged,
 }
 use crate::link::{EstablishedLink, LinkId, LinkProof, LinkRequest, LinkState, PendingLink};
-use crate::packet::{Address, DataContext, DataDestination, LinkContext, Packet};
+use crate::packet::{Address, LinkContext, Packet, SingleDestination};
 use crate::packet_hashlist::PacketHashlist;
-use crate::path_request::PathRequest;
 use crate::request::{PathHash, Request, RequestId, Response, WireRequestId};
 use crate::{Interface, Transport};
 use ed25519_dalek::Signature;
@@ -79,6 +79,7 @@ struct Receipt {
     destination: Address,
 }
 
+#[derive(Clone)]
 struct PathEntry {
     timestamp: Instant,
     next_hop: Address,
@@ -89,6 +90,9 @@ struct PathEntry {
     #[allow(dead_code)]
     ratchet_key: Option<X25519Public>,
     app_data: Option<Vec<u8>>,
+    name_hash: [u8; 10],
+    has_ratchet: bool,
+    announce_data: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -126,7 +130,6 @@ pub struct Node<T, S, R = ThreadRng> {
     pending_announces: Vec<PendingAnnounce>,
     seen_packets: PacketHashlist,
     reverse_table: HashMap<Address, ReverseTableEntry>,
-    control_hashes: std::collections::HashSet<Address>,
     receipts: Vec<Receipt>,
     pub(crate) services: Vec<ServiceEntry<S>>,
     pub(crate) interfaces: Vec<Interface<T>>,
@@ -149,6 +152,7 @@ pub struct Node<T, S, R = ThreadRng> {
     destination_links: HashMap<Address, LinkId>,
     pending_outbound_requests: HashMap<Address, Vec<(Address, RequestId, String, Vec<u8>)>>,
     pending_path_requests: HashMap<Address, Instant>,
+    discovery_path_requests: HashMap<Address, usize>,
     stats: Stats,
 }
 
@@ -172,7 +176,6 @@ impl<T: Transport, S: Service> Node<T, S, ThreadRng> {
             pending_announces: Vec::new(),
             seen_packets: crate::packet_hashlist::PacketHashlist::new(1_000_000),
             reverse_table: HashMap::new(),
-            control_hashes: std::collections::HashSet::new(),
             receipts: Vec::new(),
             interfaces: Vec::new(),
             services: Vec::new(),
@@ -186,6 +189,7 @@ impl<T: Transport, S: Service> Node<T, S, ThreadRng> {
             destination_links: HashMap::new(),
             pending_outbound_requests: HashMap::new(),
             pending_path_requests: HashMap::new(),
+            discovery_path_requests: HashMap::new(),
             stats: Stats::new(),
         }
     }
@@ -210,7 +214,6 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             pending_announces: Vec::new(),
             seen_packets: PacketHashlist::new(1_000_000),
             reverse_table: HashMap::new(),
-            control_hashes: std::collections::HashSet::new(),
             receipts: Vec::new(),
             interfaces: Vec::new(),
             services: Vec::new(),
@@ -224,6 +227,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             destination_links: HashMap::new(),
             pending_outbound_requests: HashMap::new(),
             pending_path_requests: HashMap::new(),
+            discovery_path_requests: HashMap::new(),
             stats: Stats::new(),
         }
     }
@@ -245,6 +249,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 address: *addr,
                 app_data: entry.app_data.clone(),
                 hops: entry.hops,
+                aspect: AspectHash::from_bytes(entry.name_hash),
                 last_seen: entry.timestamp,
             })
             .collect()
@@ -312,18 +317,17 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             payload.extend(ciphertext);
 
             let dest = if entry.hops > 1 {
-                DataDestination::Transport {
+                SingleDestination::Transport {
                     transport_id: entry.next_hop,
                     destination,
                 }
             } else {
-                DataDestination::Single(destination)
+                SingleDestination::Direct(destination)
             };
-            let packet = Packet::Data {
+            let packet = Packet::SingleData {
                 hops: 0,
                 destination: dest,
-                context: DataContext::None,
-                data: payload,
+                ciphertext: payload,
             };
             let target = entry.receiving_interface;
             if let Some(iface) = self.interfaces.get_mut(target) {
@@ -586,8 +590,8 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         self.path_table.contains_key(dest)
     }
 
-    pub fn known_destinations(&self) -> Vec<Address> {
-        self.path_table.keys().copied().collect()
+    pub fn known_destinations(&self) -> Vec<Destination> {
+        self.build_destinations()
     }
 
     pub fn is_link_established(&self, link_id: &LinkId) -> bool {
@@ -743,7 +747,8 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         }
         let announce_data = builder.build(&address);
 
-        let packet = self.make_announce_packet(address, 0, false, announce_data.to_bytes(), None);
+        let packet =
+            self.make_announce_packet(address, 0, false, false, announce_data.to_bytes(), None);
         let packet_len = packet.to_bytes().len();
         let num_interfaces = self.interfaces.len();
         self.stats.packets_sent += num_interfaces as u64;
@@ -756,9 +761,8 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
     fn request_path(&mut self, destination: Address, now: Instant) {
         log::info!(
-            "Sending path request for <{}> to path request address <{}> on {} interface(s)",
+            "Sending path request for <{}> on {} interface(s)",
             hex::encode(destination),
-            hex::encode(PathRequest::destination()),
             self.interfaces.len()
         );
         self.pending_path_requests.insert(destination, now);
@@ -766,12 +770,11 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         let mut tag = [0u8; 16];
         self.rng.fill_bytes(&mut tag);
 
-        let request = PathRequest::new(destination, tag);
-        let packet = Packet::Data {
+        let packet = Packet::PathRequest {
             hops: 0,
-            destination: DataDestination::Plain(PathRequest::destination()),
-            context: DataContext::None,
-            data: request.to_bytes(),
+            query_destination: destination,
+            requesting_transport: None,
+            tag,
         };
 
         for (i, iface) in self.interfaces.iter_mut().enumerate() {
@@ -873,33 +876,26 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             return true;
         }
 
-        if let Packet::Data { context, .. } = packet
-            && matches!(context, DataContext::CacheRequest | DataContext::Channel)
-        {
-            return true;
-        }
-
         if let Packet::LinkData { context, .. } = packet
             && matches!(
                 context,
                 LinkContext::Resource
                     | LinkContext::ResourceReq
                     | LinkContext::ResourcePrf
+                    | LinkContext::CacheRequest
                     | LinkContext::Channel
             )
         {
             return true;
         }
 
-        // PLAIN/GROUP packets with hops > 1 are invalid
-        if let Packet::Data {
-            destination: DataDestination::Plain(_) | DataDestination::Group(_),
-            hops,
-            ..
-        } = packet
-            && *hops > 1
+        // PathRequest/GroupData packets with hops > 1 are invalid (no transport routing)
+        if matches!(packet, Packet::PathRequest { hops, .. } | Packet::GroupData { hops, .. } if *hops > 1)
         {
-            log::debug!("Dropped PLAIN/GROUP packet with hops {}", hops);
+            log::debug!(
+                "Dropped PathRequest/GroupData packet with hops {}",
+                packet.hops()
+            );
             return false;
         }
 
@@ -982,24 +978,87 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         let for_local_link = !matches!(packet, Packet::Announce { .. })
             && self.established_links.contains_key(&link_id);
 
-        // Plain broadcast packets are sent directly on all attached interfaces
-        // (no transport routing needed)
-        if !self.control_hashes.contains(&destination_hash)
-            && matches!(
-                packet,
-                Packet::Data {
-                    destination: DataDestination::Plain(_),
-                    ..
-                }
-            )
+        // PathRequest handling
+        if let Packet::PathRequest {
+            query_destination, ..
+        } = &packet
         {
-            // Send to all interfaces except the originator
-            let packet_len = raw.len();
-            for (i, iface) in self.interfaces.iter_mut().enumerate() {
-                if i != interface_index {
-                    self.stats.packets_relayed += 1;
-                    self.stats.bytes_relayed += packet_len as u64;
-                    iface.send(packet.clone(), 0, now);
+            let query_dest = *query_destination;
+
+            // Check if destination is local (one of our services)
+            let local_service = self.services.iter().find(|s| s.address == query_dest);
+            if let Some(entry) = local_service {
+                log::debug!(
+                    "Answering path request for <{}>, destination is local",
+                    hex::encode(query_dest)
+                );
+
+                // Create PATH_RESPONSE announce for the local service
+                let mut random_hash = [0u8; 10];
+                self.rng.fill_bytes(&mut random_hash);
+
+                let builder = AnnounceBuilder::new(
+                    *entry.encryption_public.as_bytes(),
+                    entry.signing_key.clone(),
+                    entry.name_hash,
+                    random_hash,
+                );
+                let announce_data = builder.build(&query_dest);
+
+                let response_packet = self.make_announce_packet(
+                    query_dest,
+                    0,
+                    false,
+                    true, // is_path_response
+                    announce_data.to_bytes(),
+                    Some(self.transport_id),
+                );
+
+                // Send only to the requesting interface
+                if let Some(iface) = self.interfaces.get_mut(interface_index) {
+                    iface.send(response_packet, 0, now);
+                }
+            } else if let Some(path_entry) = self.path_table.get(&query_dest).cloned() {
+                // We know the path - send PATH_RESPONSE announce
+                log::debug!(
+                    "Answering path request for <{}>, path is known ({} hops)",
+                    hex::encode(query_dest),
+                    path_entry.hops
+                );
+
+                let response_packet = self.make_announce_packet(
+                    query_dest,
+                    path_entry.hops,
+                    path_entry.has_ratchet,
+                    true, // is_path_response
+                    path_entry.announce_data.clone(),
+                    Some(self.transport_id),
+                );
+
+                // Send only to the requesting interface
+                if let Some(iface) = self.interfaces.get_mut(interface_index) {
+                    iface.send(response_packet, 0, now);
+                }
+            } else if self.transport {
+                // Unknown path, but we're a transport node - record and forward
+                let other_interfaces = self.interfaces.len().saturating_sub(1);
+                log::debug!(
+                    "Path request for unknown <{}> from interface {}, forwarding to {} other interface(s)",
+                    hex::encode(query_dest),
+                    interface_index,
+                    other_interfaces
+                );
+                self.discovery_path_requests
+                    .insert(query_dest, interface_index);
+
+                // Forward path request on all other interfaces
+                let packet_len = raw.len();
+                for (i, iface) in self.interfaces.iter_mut().enumerate() {
+                    if i != interface_index {
+                        self.stats.packets_relayed += 1;
+                        self.stats.bytes_relayed += packet_len as u64;
+                        iface.send(packet.clone(), 0, now);
+                    }
                 }
             }
         }
@@ -1120,7 +1179,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
         match packet.clone() {
             Packet::Announce {
-                has_ratchet, data, ..
+                has_ratchet,
+                is_path_response,
+                data,
+                ..
             } => {
                 let announce = match AnnounceData::parse(&data, has_ratchet) {
                     Ok(a) => a,
@@ -1261,22 +1323,28 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                                 signing_key,
                                 ratchet_key: announce.ratchet.map(X25519Public::from),
                                 app_data,
+                                name_hash: announce.name_hash,
+                                has_ratchet,
+                                announce_data: data.clone(),
                             },
                         );
 
                         // Schedule for rebroadcast with random delay
-                        let delay_ms = self.rng.gen_range(0..=PATHFINDER_RW_MS);
-                        let retry_at = now + std::time::Duration::from_millis(delay_ms);
-                        self.pending_announces.push(PendingAnnounce {
-                            destination: destination_hash,
-                            source_interface: interface_index,
-                            hops,
-                            has_ratchet,
-                            data: data.clone(),
-                            retries_remaining: self.retries,
-                            retry_at,
-                            local_rebroadcasts: 0,
-                        });
+                        // PATH_RESPONSE announces are not rebroadcast (they're one-shot responses)
+                        if !is_path_response {
+                            let delay_ms = self.rng.gen_range(0..=PATHFINDER_RW_MS);
+                            let retry_at = now + std::time::Duration::from_millis(delay_ms);
+                            self.pending_announces.push(PendingAnnounce {
+                                destination: destination_hash,
+                                source_interface: interface_index,
+                                hops,
+                                has_ratchet,
+                                data: data.clone(),
+                                retries_remaining: self.retries,
+                                retry_at,
+                                local_rebroadcasts: 0,
+                            });
+                        }
 
                         log::debug!(
                             "Destination <{}> is now {} hops away via <{}>",
@@ -1298,6 +1366,31 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                                 "Received announce for <{}> which we had a pending path request for",
                                 hex::encode(destination_hash)
                             );
+                        }
+
+                        // Check if we have a discovery path request waiting for this destination
+                        if let Some(requesting_interface) =
+                            self.discovery_path_requests.remove(&destination_hash)
+                        {
+                            log::debug!(
+                                "Got matching announce for discovery path request for <{}>, sending PATH_RESPONSE to interface {}",
+                                hex::encode(destination_hash),
+                                requesting_interface
+                            );
+
+                            // Send PATH_RESPONSE announce to the requesting interface
+                            let response_packet = self.make_announce_packet(
+                                destination_hash,
+                                hops,
+                                has_ratchet,
+                                true, // is_path_response
+                                data.clone(),
+                                Some(self.transport_id),
+                            );
+
+                            if let Some(iface) = self.interfaces.get_mut(requesting_interface) {
+                                iface.send(response_packet, 0, now);
+                            }
                         }
 
                         if self
@@ -1523,10 +1616,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     };
                 }
             }
-            Packet::Data { data, .. } => {
+            Packet::SingleData { ciphertext, .. } => {
                 // Data for a single destination - decrypt with service keys
                 // Packet data format: ephemeral_public (32) + ciphertext
-                if data.len() >= 32
+                if ciphertext.len() >= 32
                     && let Some(service_idx) = self
                         .services
                         .iter()
@@ -1535,15 +1628,14 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     let service = &self.services[service_idx];
 
                     let ephemeral_public =
-                        X25519Public::from(<[u8; 32]>::try_from(&data[..32]).unwrap());
-                    let ciphertext = &data[32..];
+                        X25519Public::from(<[u8; 32]>::try_from(&ciphertext[..32]).unwrap());
+                    let encrypted = &ciphertext[32..];
 
                     if let Some(plaintext) = crate::crypto::SingleDestEncryption::decrypt(
                         &service.encryption_secret,
                         &ephemeral_public,
-                        ciphertext,
+                        encrypted,
                     ) {
-                        // Note: SingleData doesn't have sender info, using [0;16] as placeholder
                         notifications.push(ServiceNotification::Raw {
                             service_idx,
                             from: [0u8; 16],
@@ -1551,6 +1643,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                         });
                     }
                 }
+            }
+            Packet::GroupData { .. } | Packet::PathRequest { .. } => {
+                // GroupData: would need group decryption (not implemented)
+                // PathRequest: handled by transport layer, not delivered to services
             }
             Packet::LinkProof { data, .. } => {
                 log::info!(
@@ -1763,13 +1859,9 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         let hops = packet.hops();
 
         // Check if we should generate a receipt for this packet
-        // Only for DATA packets to Single/Group destinations (not Plain)
         let generate_receipt = matches!(
             &packet,
-            Packet::Data {
-                destination: DataDestination::Single(_) | DataDestination::Group(_),
-                ..
-            }
+            Packet::SingleData { .. } | Packet::GroupData { .. }
         );
 
         // Check if we have a known path for the destination
@@ -1777,10 +1869,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         let use_path = !matches!(packet, Packet::Announce { .. })
             && matches!(
                 &packet,
-                Packet::Data {
-                    destination: DataDestination::Single(_),
-                    ..
-                } | Packet::LinkRequest { .. }
+                Packet::SingleData { .. } | Packet::LinkRequest { .. }
             )
             && self.path_table.contains_key(&destination_hash);
 
@@ -1917,8 +2006,14 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 hex::encode(dest),
                 hops + 1
             );
-            let packet =
-                self.make_announce_packet(dest, hops, has_ratchet, data, Some(self.transport_id));
+            let packet = self.make_announce_packet(
+                dest,
+                hops,
+                has_ratchet,
+                false,
+                data,
+                Some(self.transport_id),
+            );
             let packet_len = packet.to_bytes().len();
             let num_interfaces = self.interfaces.len().saturating_sub(1); // minus source
             self.stats.packets_relayed += num_interfaces as u64;
@@ -2577,6 +2672,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         dest: Address,
         hops: u8,
         has_ratchet: bool,
+        is_path_response: bool,
         data: Vec<u8>,
         transport_id: Option<Address>,
     ) -> Packet {
@@ -2592,6 +2688,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             hops,
             destination,
             has_ratchet,
+            is_path_response,
             data,
         }
     }
@@ -2672,6 +2769,58 @@ mod tests {
         Interface::new(MockTransport::new())
     }
 
+    struct TestNetwork {
+        nodes: Vec<TestNode>,
+        links: Vec<(usize, usize, usize, usize)>,
+    }
+
+    impl TestNetwork {
+        fn new() -> Self {
+            Self {
+                nodes: Vec::new(),
+                links: Vec::new(),
+            }
+        }
+
+        fn add_node(&mut self, transport_enabled: bool) -> usize {
+            let idx = self.nodes.len();
+            self.nodes.push(Node::new(transport_enabled));
+            idx
+        }
+
+        fn link(&mut self, node_a: usize, node_b: usize) {
+            let iface_a = self.nodes[node_a].interfaces.len();
+            let iface_b = self.nodes[node_b].interfaces.len();
+            self.nodes[node_a].add_interface(test_interface());
+            self.nodes[node_b].add_interface(test_interface());
+            self.links.push((node_a, iface_a, node_b, iface_b));
+        }
+
+        fn node(&mut self, idx: usize) -> &mut TestNode {
+            &mut self.nodes[idx]
+        }
+
+        fn step(&mut self, now: Instant) {
+            for node in &mut self.nodes {
+                node.poll(now);
+            }
+            for &(a, a_iface, b, b_iface) in &self.links {
+                let (left, right) = self.nodes.split_at_mut(a.max(b));
+                let (node_a, node_b) = if a < b {
+                    (&mut left[a], &mut right[0])
+                } else {
+                    (&mut right[0], &mut left[b])
+                };
+                while let Some(pkt) = node_a.interfaces[a_iface].transport.outbox.pop_front() {
+                    node_b.interfaces[b_iface].transport.inbox.push_back(pkt);
+                }
+                while let Some(pkt) = node_b.interfaces[b_iface].transport.outbox.pop_front() {
+                    node_a.interfaces[a_iface].transport.inbox.push_back(pkt);
+                }
+            }
+        }
+    }
+
     #[derive(Clone)]
     struct ReceivedRequest {
         _request_id: RequestId,
@@ -2683,13 +2832,13 @@ mod tests {
     #[derive(Clone)]
     struct ReceivedResponse {
         request_id: RequestId,
-        from: Address,
+        _from: Address,
         data: Vec<u8>,
     }
 
     #[derive(Clone)]
     struct ReceivedRaw {
-        from: Address,
+        _from: Address,
         data: Vec<u8>,
     }
 
@@ -2758,7 +2907,7 @@ mod tests {
 
         fn on_raw(&mut self, _handle: &mut NodeHandle, from: Address, data: &[u8]) {
             self.state.borrow_mut().raw_messages.push(ReceivedRaw {
-                from,
+                _from: from,
                 data: data.to_vec(),
             });
         }
@@ -2792,7 +2941,7 @@ mod tests {
                 Ok((from, data)) => {
                     self.state.borrow_mut().responses.push(ReceivedResponse {
                         request_id,
-                        from,
+                        _from: from,
                         data,
                     });
                 }
@@ -3558,8 +3707,8 @@ mod tests {
         assert!(a.pending_outbound_links.contains_key(&link_id));
         assert!(a.pending_outbound_requests.contains_key(&addr_b));
 
-        // Time passes beyond establishment timeout (6s per hop, 1 hop = 6s)
-        let timeout = now + Duration::from_secs(7);
+        // Time passes beyond establishment timeout (base 60s + 6s per hop, 1 hop = 66s)
+        let timeout = now + Duration::from_secs(67);
         a.poll(timeout);
 
         // Pending link should be removed
@@ -3974,8 +4123,8 @@ mod tests {
         let request_id = a.request(addr_a, addr_b, "test.path", b"hello", now);
         a.poll(now);
 
-        // Time out the link
-        let timeout = now + Duration::from_secs(10);
+        // Time out the link (base 60s + 6s per hop)
+        let timeout = now + Duration::from_secs(67);
         a.poll(timeout);
 
         assert_eq!(
@@ -4220,6 +4369,388 @@ mod tests {
             state_a.borrow().responses.len(),
             3,
             "third request should also get response"
+        );
+    }
+
+    // =============================================================================
+    // Path Request/Response Tests
+    // =============================================================================
+    //
+    // These tests verify the path discovery mechanism:
+    // 1. Path requests are forwarded through the network
+    // 2. Nodes track which interface sent path requests (discovery_path_requests)
+    // 3. When an announce arrives for a requested destination, it's forwarded back
+    // 4. PATH_RESPONSE announces don't flood the network
+    //
+    // Topology for chain tests:
+    //   A --[0]-- B --[1]-- C --[0]-- D
+    //        ^         ^         ^
+    //     B.iface0  B.iface1  C.iface0
+    //
+
+    #[test]
+    fn path_request_reaches_destination_through_chain() {
+        // Topology: A -- B -- C -- D
+        let mut net = TestNetwork::new();
+        let a = net.add_node(true);
+        let b = net.add_node(true);
+        let c = net.add_node(true);
+        let d = net.add_node(true);
+        net.link(a, b);
+        net.link(b, c);
+        net.link(c, d);
+
+        let addr_d = net.node(d).add_service(svc("destination"), &id(4));
+        let now = Instant::now();
+
+        net.node(a).request_path(addr_d, now);
+
+        // Step 1: A polls, sends PathRequest to B
+        net.step(now);
+
+        // Verify PathRequest arrived at B with correct query_destination
+        let b_inbox: Vec<_> = net.nodes[b].interfaces[0]
+            .transport
+            .inbox
+            .iter()
+            .cloned()
+            .collect();
+        assert_eq!(b_inbox.len(), 1, "B should have received 1 packet from A");
+        let pkt_at_b = Packet::from_bytes(&b_inbox[0]).unwrap();
+        assert!(
+            matches!(
+                pkt_at_b,
+                Packet::PathRequest { query_destination, hops: 0, tag, .. }
+                if query_destination == addr_d && tag != [0u8; 16]
+            ),
+            "Expected PathRequest for addr_d with hops=0, got {:?}",
+            pkt_at_b
+        );
+
+        // Continue propagation
+        net.step(now);
+        net.step(now);
+        net.step(now);
+
+        // Verify PathRequest reached D (check D's interface inbox before poll clears it)
+        // At this point D has already polled, but we can verify A still has pending request
+        assert!(
+            net.node(a).pending_path_requests.contains_key(&addr_d),
+            "A should have pending path request for D"
+        );
+    }
+
+    #[test]
+    fn path_response_returns_to_requester_through_chain() {
+        // Topology: A -- B -- C -- D
+        // D announces, announce propagates to all nodes
+        // A sends path request for D, D responds, A learns path
+        let mut net = TestNetwork::new();
+        let a = net.add_node(true);
+        let b = net.add_node(true);
+        let c = net.add_node(true);
+        let d = net.add_node(true);
+        net.link(a, b);
+        net.link(b, c);
+        net.link(c, d);
+
+        let addr_d = net.node(d).add_service(svc("destination"), &id(4));
+        let now = Instant::now();
+
+        // Capture D's encryption key for later verification
+        let d_encryption_key = net.node(d).services[0].encryption_public;
+
+        // D announces, propagates through network
+        net.node(d).announce(addr_d, now);
+        for i in 0..8 {
+            net.step(now + std::time::Duration::from_secs(i));
+        }
+
+        // Verify initial path table entries
+        assert!(
+            net.node(a).has_destination(&addr_d),
+            "A should know D after announce"
+        );
+        assert_eq!(
+            net.node(a).path_table.get(&addr_d).unwrap().hops,
+            3,
+            "A's path to D should be 3 hops (A->B->C->D)"
+        );
+        assert_eq!(
+            net.node(a).path_table.get(&addr_d).unwrap().encryption_key,
+            d_encryption_key,
+            "A should have D's correct encryption key"
+        );
+
+        // Clear A's knowledge and pending request
+        net.node(a).path_table.remove(&addr_d);
+        net.node(a).pending_path_requests.clear();
+        assert!(
+            !net.node(a).has_destination(&addr_d),
+            "A should not know D after clearing"
+        );
+
+        // A sends path request
+        let request_time = now + std::time::Duration::from_secs(10);
+        net.node(a).request_path(addr_d, request_time);
+
+        // Let path request propagate and response return
+        for _ in 0..8 {
+            net.step(request_time);
+        }
+
+        // Verify A learned path via path response
+        let a_path_after = net.node(a).path_table.get(&addr_d).cloned();
+        assert!(
+            a_path_after.is_some(),
+            "A should learn path to D via path request/response"
+        );
+        let a_path_after = a_path_after.unwrap();
+        assert_eq!(a_path_after.hops, 3, "A's path to D should still be 3 hops");
+        assert_eq!(
+            a_path_after.encryption_key, d_encryption_key,
+            "A should have D's correct encryption key from path response"
+        );
+
+        // Verify pending path request was cleared
+        assert!(
+            !net.node(a).pending_path_requests.contains_key(&addr_d),
+            "Pending path request should be cleared after receiving response"
+        );
+    }
+
+    #[test]
+    fn path_response_not_rebroadcast_to_all_interfaces() {
+        // Topology (diamond):
+        //       B
+        //      / \
+        //     A   D
+        //      \ /
+        //       C
+        let mut net = TestNetwork::new();
+        let a = net.add_node(true);
+        let b = net.add_node(true);
+        let c = net.add_node(true);
+        let d = net.add_node(true);
+        net.link(a, b); // A iface 0 <-> B iface 0
+        net.link(a, c); // A iface 1 <-> C iface 0
+        net.link(b, d); // B iface 1 <-> D iface 0
+        net.link(c, d); // C iface 1 <-> D iface 1
+
+        let addr_d = net.node(d).add_service(svc("destination"), &id(4));
+        let d_encryption_key = net.node(d).services[0].encryption_public;
+        let now = Instant::now();
+
+        // D announces, propagates through network
+        net.node(d).announce(addr_d, now);
+        for i in 0..6 {
+            net.step(now + std::time::Duration::from_secs(i));
+        }
+
+        // A should know D via 2 hops (either A->B->D or A->C->D)
+        let a_initial_path = net.node(a).path_table.get(&addr_d).cloned();
+        assert!(a_initial_path.is_some(), "A should know D");
+        assert_eq!(
+            a_initial_path.unwrap().hops,
+            2,
+            "A->D should be 2 hops in diamond"
+        );
+
+        // Clear A's path table and pending requests
+        net.node(a).path_table.remove(&addr_d);
+        net.node(a).pending_path_requests.clear();
+
+        // A sends path request
+        let request_time = now + std::time::Duration::from_secs(10);
+        net.node(a).request_path(addr_d, request_time);
+
+        // Step 1: A sends path request to B and C
+        net.step(request_time);
+
+        // Verify both B and C received the path request
+        assert_eq!(
+            net.nodes[b].interfaces[0].transport.inbox.len(),
+            1,
+            "B should receive path request from A"
+        );
+        assert_eq!(
+            net.nodes[c].interfaces[0].transport.inbox.len(),
+            1,
+            "C should receive path request from A"
+        );
+
+        // Step 2: B and C process path requests
+        // B and C already know D from the earlier announce, so they should
+        // immediately respond with PATH_RESPONSE to A
+        for node in &mut net.nodes {
+            node.poll(request_time);
+        }
+
+        // Check what B and C have in their outboxes BEFORE transfer
+        // B's interface 0 is to A, interface 1 is to D
+        // C's interface 0 is to A, interface 1 is to D
+        let b_to_a_count = net.nodes[b].interfaces[0].transport.outbox.len();
+        let b_to_d_count = net.nodes[b].interfaces[1].transport.outbox.len();
+        let c_to_a_count = net.nodes[c].interfaces[0].transport.outbox.len();
+        let c_to_d_count = net.nodes[c].interfaces[1].transport.outbox.len();
+
+        // PATH_RESPONSE should go to A (requester), not back to D
+        assert_eq!(
+            b_to_d_count, 0,
+            "B should NOT rebroadcast PATH_RESPONSE back to D"
+        );
+        assert_eq!(
+            c_to_d_count, 0,
+            "C should NOT rebroadcast PATH_RESPONSE back to D"
+        );
+        assert!(
+            b_to_a_count > 0 || c_to_a_count > 0,
+            "B or C should forward PATH_RESPONSE to A"
+        );
+
+        // Verify the packets going to A are PATH_RESPONSE announces
+        for raw in &net.nodes[b].interfaces[0].transport.outbox {
+            let pkt = Packet::from_bytes(raw).unwrap();
+            assert!(
+                matches!(
+                    pkt,
+                    Packet::Announce {
+                        is_path_response: true,
+                        ..
+                    }
+                ),
+                "Announce from B to A should be PATH_RESPONSE, got {:?}",
+                pkt
+            );
+        }
+
+        // Finish the network steps to let response reach A
+        for _ in 0..4 {
+            net.step(request_time);
+        }
+
+        // Verify A learned the path
+        let a_final_path = net.node(a).path_table.get(&addr_d).cloned();
+        assert!(
+            a_final_path.is_some(),
+            "A should learn path to D via path response"
+        );
+        let a_final_path = a_final_path.unwrap();
+        assert_eq!(a_final_path.hops, 2, "A->D should be 2 hops");
+        assert_eq!(
+            a_final_path.encryption_key, d_encryption_key,
+            "A should have correct encryption key for D"
+        );
+    }
+
+    #[test]
+    fn intermediate_node_tracks_path_request_source() {
+        // Topology: A -- B -- C
+        // A sends path request for C
+        // B should record that the request came from interface 0
+        // When C's announce comes, B should forward it to interface 0
+        let mut net = TestNetwork::new();
+        let a = net.add_node(true);
+        let b = net.add_node(true);
+        let c = net.add_node(true);
+        net.link(a, b);
+        net.link(b, c);
+
+        let addr_c = net.node(c).add_service(svc("destination"), &id(3));
+        let c_encryption_key = net.node(c).services[0].encryption_public;
+        let now = Instant::now();
+
+        // A sends path request for C
+        net.node(a).request_path(addr_c, now);
+
+        // Step 1: A sends to B
+        net.step(now);
+
+        // Verify B received the path request
+        assert_eq!(
+            net.nodes[b].interfaces[0].transport.inbox.len(),
+            1,
+            "B should receive path request from A"
+        );
+
+        // Step 2: B forwards to C
+        net.step(now);
+
+        // Verify C received the path request
+        assert_eq!(
+            net.nodes[c].interfaces[0].transport.inbox.len(),
+            1,
+            "C should receive path request from B"
+        );
+
+        assert_eq!(
+            net.node(b).discovery_path_requests.get(&addr_c),
+            Some(&0),
+            "B should record that interface 0 asked about addr_c"
+        );
+
+        // C announces (as response to path request)
+        net.node(c).announce(addr_c, now);
+
+        // Step 3: C sends announce to B
+        net.step(now);
+
+        // Step 4: B processes announce and sends PATH_RESPONSE to A
+        net.step(now);
+
+        // Check A's inbox for the PATH_RESPONSE from B
+        let a_inbox: Vec<_> = net.nodes[a].interfaces[0]
+            .transport
+            .inbox
+            .iter()
+            .cloned()
+            .collect();
+
+        assert_eq!(
+            a_inbox.len(),
+            1,
+            "A should receive exactly 1 packet (the PATH_RESPONSE announce) from B"
+        );
+
+        // Verify the packet is a PATH_RESPONSE announce
+        let pkt = Packet::from_bytes(&a_inbox[0]).unwrap();
+        match pkt {
+            Packet::Announce {
+                is_path_response, ..
+            } => {
+                assert!(
+                    is_path_response,
+                    "B should forward announce as PATH_RESPONSE"
+                );
+                assert_eq!(
+                    pkt.destination_hash(),
+                    addr_c,
+                    "Announce should be for addr_c"
+                );
+            }
+            _ => panic!("Expected Announce packet, got {:?}", pkt),
+        }
+
+        // Step 5: A processes the PATH_RESPONSE
+        net.step(now);
+
+        // Verify A learned the path
+        let a_path = net.node(a).path_table.get(&addr_c).cloned();
+        assert!(
+            a_path.is_some(),
+            "A should learn path to C after path request/response"
+        );
+        let a_path = a_path.unwrap();
+        assert_eq!(a_path.hops, 2, "A->C should be 2 hops (A->B->C)");
+        assert_eq!(
+            a_path.encryption_key, c_encryption_key,
+            "A should have correct encryption key for C"
+        );
+
+        // Verify A's pending path request was cleared
+        assert!(
+            !net.node(a).pending_path_requests.contains_key(&addr_c),
+            "A's pending path request should be cleared"
         );
     }
 }

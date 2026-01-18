@@ -291,6 +291,7 @@ mod tests {
             hops,
             destination: AnnounceDestination::Single(dest),
             has_ratchet: false,
+            is_path_response: false,
             data: vec![],
         }
     }

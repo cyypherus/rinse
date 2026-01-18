@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use crate::aspect::AspectHash;
 use crate::packet::Address;
 use crate::request::RequestId;
 
@@ -21,6 +22,7 @@ pub struct Destination {
     pub address: Address,
     pub app_data: Option<Vec<u8>>,
     pub hops: u8,
+    pub aspect: AspectHash,
     pub last_seen: Instant,
 }
 
