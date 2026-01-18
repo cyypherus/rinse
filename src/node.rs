@@ -443,7 +443,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
             if self.link(destination, Some(service_addr), now).is_none() {
                 log::info!(
-                    "Link establishment failed, sending path request for <{}>",
+                    "No existing link, sending path request for <{}>",
                     hex::encode(destination)
                 );
                 self.request_path(destination, now);
@@ -673,6 +673,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         if let Some(dest) = destination {
             self.destination_links.remove(&dest);
         }
+        self.established_links.remove(&link_id);
 
         log::debug!("Closed link <{}>", hex::encode(link_id));
     }
@@ -1761,10 +1762,12 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                         );
                     }
 
+                    let link = self.established_links.get(&destination_hash).unwrap();
                     log::debug!(
-                        "Link <{}> established as initiator, RTT: {:?}ms",
+                        "Link <{}> established as initiator, RTT: {:?}ms, keepalive_interval: {}s",
                         hex::encode(destination_hash),
-                        rtt_secs.map(|r| (r * 1000.0) as u64)
+                        link.rtt_ms,
+                        link.keepalive_interval_secs()
                     );
 
                     // Send any pending requests that were waiting for this link
@@ -2171,7 +2174,10 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             let stale_secs = link.stale_time_secs();
             let since_inbound = now.duration_since(link.last_inbound).as_secs();
 
-            if link.state == LinkState::Active && since_inbound >= stale_secs {
+            if link.state == LinkState::Active
+                && since_inbound >= stale_secs
+                && link.pending_requests.is_empty()
+            {
                 log::info!(
                     "Link {} to <{}> became stale (no inbound for {}s, stale_time={}s)",
                     hex::encode(link_id),
@@ -2188,16 +2194,23 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             }
 
             if link.is_initiator && link.state == LinkState::Active {
-                // Send keepalive if:
-                // 1. No inbound for keepalive interval (peer went quiet)
-                // 2. No keepalive already pending (waiting for response)
-                if since_inbound >= keepalive_secs && link.last_keepalive_sent.is_none() {
+                // Python: send keepalive if now >= last_inbound + keepalive AND now >= last_keepalive + keepalive
+                let since_last_keepalive = link
+                    .last_keepalive_sent
+                    .map(|t| now.duration_since(t).as_secs())
+                    .unwrap_or(u64::MAX);
+
+                if since_inbound >= keepalive_secs && since_last_keepalive >= keepalive_secs {
                     to_keepalive.push(*link_id);
-                } else if link.last_keepalive_sent.is_none() {
+                } else {
                     // Schedule wake for next keepalive check
-                    let next_keepalive =
+                    let next_inbound_check =
                         link.last_inbound + std::time::Duration::from_secs(keepalive_secs);
-                    update_wake(next_keepalive);
+                    let next_keepalive_check = link
+                        .last_keepalive_sent
+                        .map(|t| t + std::time::Duration::from_secs(keepalive_secs))
+                        .unwrap_or(now);
+                    update_wake(next_inbound_check.max(next_keepalive_check));
                 }
             }
 
@@ -2211,9 +2224,11 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
         for link_id in to_keepalive {
             if let Some(link) = self.established_links.get_mut(&link_id) {
                 log::debug!(
-                    "Sending keepalive request on link {} (no inbound for {}s)",
+                    "Sending keepalive request on link {} (no inbound for {}s, rtt={:?}ms, interval={}s)",
                     hex::encode(link_id),
-                    now.duration_since(link.last_inbound).as_secs()
+                    now.duration_since(link.last_inbound).as_secs(),
+                    link.rtt_ms,
+                    link.keepalive_interval_secs()
                 );
                 link.last_keepalive_sent = Some(now);
             }
@@ -2236,6 +2251,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     hex::encode(link.destination),
                     link.state
                 );
+                let dest = link.destination;
                 let close_data = link.encrypt(&mut self.rng, &link_id);
                 let packet = Packet::LinkData {
                     hops: 0,
@@ -2246,6 +2262,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 for iface in &mut self.interfaces {
                     iface.send(packet.clone(), 0, now);
                 }
+                self.destination_links.remove(&dest);
             }
             self.established_links.remove(&link_id);
         }
@@ -2279,17 +2296,11 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     iface.send(packet.clone(), 0, now);
                 }
             } else if plaintext[0] == KEEPALIVE_RESPONSE && link.is_initiator {
-                // Initiator: received keepalive response, update RTT
-                if let Some(sent_at) = link.last_keepalive_sent {
-                    let rtt_ms = now.duration_since(sent_at).as_millis() as u64;
-                    log::debug!(
-                        "Received keepalive response on link {}, RTT={}ms",
-                        hex::encode(link_id),
-                        rtt_ms
-                    );
-                    link.set_rtt(rtt_ms);
-                    link.last_keepalive_sent = None;
-                }
+                // Initiator: received keepalive response
+                log::debug!(
+                    "Received keepalive response on link {}",
+                    hex::encode(link_id)
+                );
             } else {
                 log::warn!(
                     "Unexpected keepalive byte 0x{:02x} on link {} (is_initiator={})",
@@ -2910,8 +2921,7 @@ mod tests {
 
     #[derive(Clone)]
     struct ReceivedRequest {
-        _request_id: RequestId,
-        _from: Address,
+        request_id: RequestId,
         path: String,
         data: Vec<u8>,
     }
@@ -2919,7 +2929,6 @@ mod tests {
     #[derive(Clone)]
     struct ReceivedResponse {
         request_id: RequestId,
-        _from: Address,
         data: Vec<u8>,
     }
 
@@ -3003,13 +3012,12 @@ mod tests {
             &mut self,
             handle: &mut NodeHandle,
             request_id: RequestId,
-            from: Address,
+            _from: Address,
             path: &str,
             data: &[u8],
         ) {
             self.state.borrow_mut().requests.push(ReceivedRequest {
-                _request_id: request_id,
-                _from: from,
+                request_id,
                 path: path.to_string(),
                 data: data.to_vec(),
             });
@@ -3025,10 +3033,9 @@ mod tests {
             result: Result<(Address, Vec<u8>), crate::handle::RequestError>,
         ) {
             match result {
-                Ok((from, data)) => {
+                Ok((_from, data)) => {
                     self.state.borrow_mut().responses.push(ReceivedResponse {
                         request_id,
-                        _from: from,
                         data,
                     });
                 }
@@ -3327,6 +3334,7 @@ mod tests {
             assert_eq!(state.requests.len(), 1);
             assert_eq!(state.requests[0].path, "test.path");
             assert_eq!(state.requests[0].data, b"request data");
+            // Note: from field is unreliable - responder doesn't know initiator's service address
         }
 
         // B's auto_response should have sent a response, transfer it back
@@ -3907,6 +3915,80 @@ mod tests {
     }
 
     #[test]
+    fn link_not_stale_while_request_pending() {
+        use std::time::Duration;
+
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = svc("client");
+        let state_a = svc_a.state();
+        let addr_a = a.add_service(svc_a, &id(1));
+
+        // Server that doesn't auto-respond - we control when response is sent
+        let svc_b = svc("server").with_paths(&["test"]);
+        let state_b = svc_b.state();
+        let addr_b = b.add_service(svc_b, &id(2));
+
+        let now = Instant::now();
+
+        // Establish link
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(addr_b, None, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        // Send a request
+        a.request(addr_a, addr_b, "test", b"request", now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        // Verify request was received
+        assert_eq!(
+            state_b.borrow().requests.len(),
+            1,
+            "Server should have received request"
+        );
+
+        // With RTT ~0, stale_time = 10s (KEEPALIVE_MIN * STALE_FACTOR = 5 * 2)
+        // Simulate time passing beyond stale_time, but don't send response yet
+        let after_stale = now + Duration::from_secs(15);
+        a.poll(after_stale);
+
+        // Link should NOT be closed because we have a pending request
+        assert!(
+            a.established_links.contains_key(&link_id),
+            "Link should NOT be closed while request is pending"
+        );
+
+        // Now server responds (late)
+        let request_id = state_b.borrow().requests[0].request_id;
+        b.respond(request_id, b"late response", after_stale);
+        b.poll(after_stale);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(after_stale);
+
+        // Response should be received
+        assert_eq!(
+            state_a.borrow().responses.len(),
+            1,
+            "Client should receive late response"
+        );
+    }
+
+    #[test]
     fn keepalive_request_response() {
         use std::time::Duration;
 
@@ -3973,16 +4055,12 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(response_time);
 
-        // RTT should be updated from keepalive measurement
+        // Keepalive timestamp should be preserved (not cleared like before)
+        // This allows throttling future keepalives
         let a_link = a.established_links.get(&link_id).unwrap();
         assert!(
-            a_link.last_keepalive_sent.is_none(),
-            "keepalive should be acknowledged"
-        );
-        let rtt_after = a_link.rtt_ms.unwrap();
-        assert_eq!(
-            rtt_after, 50,
-            "RTT should be exactly 50ms from keepalive roundtrip"
+            a_link.last_keepalive_sent.is_some(),
+            "keepalive timestamp should be preserved for throttling"
         );
     }
 
@@ -5254,6 +5332,7 @@ mod tests {
 
         // Count how many ResourceReq packets are sent
         let initial_reqs = a.interfaces[0].transport.outbox.len();
+        assert!(initial_reqs > 0, "Should have sent initial ResourceReq");
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
 
@@ -5292,6 +5371,12 @@ mod tests {
         eprintln!(
             "Parts received before each request: {:?}",
             parts_received_before_request
+        );
+
+        // We should have pipelined - sent additional requests while receiving parts
+        assert!(
+            requests_after_single_part > 0,
+            "Should have sent pipelined requests after receiving parts"
         );
 
         // We should NOT wait for full window (4 parts) before requesting more

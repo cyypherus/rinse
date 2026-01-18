@@ -502,7 +502,10 @@ impl InboundResource {
 
             if rate > RATE_FAST && self.fast_rate_rounds < FAST_RATE_THRESHOLD {
                 self.fast_rate_rounds += 1;
-                log::debug!("Fast rate detected, fast_rate_rounds={}", self.fast_rate_rounds);
+                log::debug!(
+                    "Fast rate detected, fast_rate_rounds={}",
+                    self.fast_rate_rounds
+                );
                 if self.fast_rate_rounds == FAST_RATE_THRESHOLD {
                     self.window_max = WINDOW_MAX_FAST;
                     log::debug!("Reached fast threshold, window_max={}", self.window_max);

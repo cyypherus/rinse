@@ -6,7 +6,7 @@ edition = "2024"
 [features]
 default = []
 tcp = []
-tokio = ["dep:tokio", "tcp"]
+tokio = ["dep:tokio", "dep:env_logger", "tcp"]
 
 [dependencies]
 aes = "0.8.4"
@@ -24,7 +24,12 @@ serde_bytes = "0.11"
 sha2 = "0.10.9"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 bzip2 = "0.5"
-tokio = { version = "1", features = ["sync", "time", "io-util", "net", "rt", "macros"], optional = true }
+tokio = { version = "1", features = ["sync", "time", "io-util", "net", "rt", "rt-multi-thread", "macros", "fs"], optional = true }
+env_logger = { version = "0.11", optional = true }
+
+[[bin]]
+name = "rinse-serve"
+path = "src/bin/serve.rs"
+required-features = ["tokio"]
 
 [dev-dependencies]
-env_logger = "0.11"
