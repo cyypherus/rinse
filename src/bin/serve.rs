@@ -1,8 +1,24 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rinse::{AsyncNode, Identity, ServiceHandle};
 use tokio::net::TcpListener;
+
+fn scan_directory(base: &Path, current: &Path, paths: &mut Vec<String>) {
+    if let Ok(entries) = std::fs::read_dir(current) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                scan_directory(base, &path, paths);
+            } else if path.is_file() {
+                if let Ok(relative) = path.strip_prefix(base) {
+                    let request_path = format!("/page/{}", relative.display());
+                    paths.push(request_path);
+                }
+            }
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -63,10 +79,22 @@ async fn main() {
     }
     let dir = Arc::new(dir.canonicalize().expect("failed to canonicalize path"));
 
+    // Scan directory for files and register each as a path (like Python NomadNet does)
+    let mut paths: Vec<String> = Vec::new();
+    scan_directory(&dir, &dir, &mut paths);
+    if paths.is_empty() {
+        paths.push("/page/index.mu".to_string());
+    }
+    log::info!("Registered {} paths", paths.len());
+    for p in &paths {
+        log::debug!("  {}", p);
+    }
+
     let mut node = AsyncNode::new(false);
     let identity = Identity::generate(&mut rand::thread_rng());
 
-    let mut service = node.add_service("nomadnetwork.node", &["/page/*"], &identity);
+    let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+    let mut service = node.add_service("nomadnetwork.node", &path_refs, &identity);
     let addr = service.address();
     log::info!("Node: {} ({})", name, hex::encode(addr));
 
@@ -88,7 +116,7 @@ async fn main() {
     let name_bytes = name.into_bytes();
 
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             tokio::select! {
                 _ = interval.tick() => {

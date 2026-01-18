@@ -881,7 +881,6 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 context,
                 LinkContext::Resource
                     | LinkContext::ResourceReq
-                    | LinkContext::ResourcePrf
                     | LinkContext::CacheRequest
                     | LinkContext::Channel
             )
@@ -1550,7 +1549,6 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     LinkContext::ResourceAdv
                         | LinkContext::ResourceReq
                         | LinkContext::ResourceHmu
-                        | LinkContext::ResourcePrf
                         | LinkContext::ResourceIcl
                         | LinkContext::ResourceRcl
                 ) {
@@ -1609,18 +1607,27 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                                 let path = self.services[service_idx]
                                     .registered_paths
                                     .get(&req.path_hash)
-                                    .cloned()
-                                    .unwrap_or_default();
+                                    .cloned();
+                                log::debug!(
+                                    "Request path_hash={} matched={:?} registered_count={}",
+                                    hex::encode(req.path_hash),
+                                    path,
+                                    self.services[service_idx].registered_paths.len()
+                                );
                                 notifications.push(ServiceNotification::Request {
                                     service_idx,
                                     link_id,
                                     request_id,
                                     wire_request_id,
                                     from,
-                                    path,
+                                    path: path.unwrap_or_default(),
                                     data: req.data.unwrap_or_default(),
                                 });
                             } else {
+                                log::warn!(
+                                    "Failed to decode Request from plaintext {} bytes",
+                                    plaintext.len()
+                                );
                                 notifications.push(ServiceNotification::Data {
                                     service_idx,
                                     from,
@@ -1796,7 +1803,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                         let proof: &[u8] = &data[32..64];
 
                         // Find matching outbound resource and validate proof
-                        if let Some((_, _, _, _, outbound)) =
+                        if let Some((_, _, service_idx, local_request_id, outbound)) =
                             self.outbound_resources.get(&resource_hash)
                         {
                             if outbound.verify_proof(proof) {
@@ -1804,7 +1811,20 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                                     "Resource proof validated for {}",
                                     hex::encode(resource_hash)
                                 );
+                                let service_idx = *service_idx;
+                                let local_request_id = *local_request_id;
                                 self.outbound_resources.remove(&resource_hash);
+
+                                // Notify service that response was delivered
+                                if let (Some(service_idx), Some(request_id)) =
+                                    (service_idx, local_request_id)
+                                {
+                                    notifications.push(ServiceNotification::RespondResult {
+                                        service_idx,
+                                        request_id,
+                                        result: Ok(()),
+                                    });
+                                }
                             } else {
                                 log::warn!(
                                     "Resource proof invalid for {}",
@@ -2533,33 +2553,6 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 if let Some((_, resource)) = self.inbound_resources.get_mut(&hash) {
                     resource.receive_hashmap_update(hmu_data);
                     self.send_resource_request(link_id, hash, now);
-                }
-            }
-            LinkContext::ResourcePrf => {
-                if plaintext.len() < 64 {
-                    return;
-                }
-                let hash: [u8; 32] = plaintext[..32].try_into().unwrap();
-                let proof: [u8; 32] = plaintext[32..64].try_into().unwrap();
-                if let Some((_, _, service_idx, local_request_id, resource)) =
-                    self.outbound_resources.get(&hash)
-                    && resource.verify_proof(&proof)
-                {
-                    let service_idx = *service_idx;
-                    let local_request_id = *local_request_id;
-                    self.outbound_resources.remove(&hash);
-
-                    // Notify service that response was delivered
-                    if let (Some(service_idx), Some(request_id)) = (service_idx, local_request_id) {
-                        self.dispatch_notifications(
-                            vec![ServiceNotification::RespondResult {
-                                service_idx,
-                                request_id,
-                                result: Ok(()),
-                            }],
-                            now,
-                        );
-                    }
                 }
             }
             LinkContext::ResourceIcl | LinkContext::ResourceRcl => {
@@ -4423,6 +4416,76 @@ mod tests {
             state_b.borrow().respond_results.len(),
             1,
             "on_respond_result should be called for small response"
+        );
+        assert!(
+            state_b.borrow().respond_results[0].success,
+            "on_respond_result should report success"
+        );
+    }
+
+    #[test]
+    fn on_respond_result_called_on_large_response() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        // Large responses use Resource transfer mechanism.
+        // When the client sends ResourcePrf (proof), the server must call on_respond_result
+        // so the respond() call can complete.
+        let mut a: TestNode = Node::new(true);
+        let mut b: TestNode = Node::new(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let addr_a = a.add_service(svc("client"), &id(1));
+        // Response larger than LINK_MDU (431 bytes) triggers Resource transfer
+        let large_response = vec![0x42; 500];
+        let svc_b = svc("server")
+            .with_paths(&["test.path"])
+            .with_auto_response(large_response.clone());
+        let state_b = svc_b.state();
+        let addr_b = b.add_service(svc_b, &id(1));
+        let now = Instant::now();
+
+        // Establish link
+        b.announce(addr_b, now);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(addr_b, None, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        assert!(a.is_link_established(&link_id));
+
+        // Send request
+        a.request(addr_a, addr_b, "test.path", b"hello", now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now); // Server receives request, starts Resource transfer
+
+        // Transfer ResourceAdv from b to a
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now); // Client receives ResourceAdv, sends ResourceReq
+
+        // Transfer ResourceReq from a to b
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now); // Server sends Resource data packets
+
+        // Transfer Resource data and continue until complete
+        for _ in 0..10 {
+            transfer(&mut b, 0, &mut a, 0);
+            a.poll(now);
+            transfer(&mut a, 0, &mut b, 0);
+            b.poll(now);
+        }
+
+        assert_eq!(
+            state_b.borrow().respond_results.len(),
+            1,
+            "on_respond_result should be called for large response after resource proof"
         );
         assert!(
             state_b.borrow().respond_results[0].success,

@@ -4,8 +4,6 @@ use std::time::{Duration, Instant};
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::aspect::AspectHash;
@@ -13,9 +11,17 @@ use crate::handle::{RequestError, RespondError};
 use crate::packet::Address;
 use crate::request::RequestId;
 use crate::stats::StatsSnapshot;
-use crate::transports::tcp::{HDLC_FLAG, hdlc_escape, hdlc_unescape};
 use crate::{Identity, Interface, NodeHandle, Service, Transport};
 
+#[cfg(feature = "tcp")]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(feature = "tcp")]
+use tokio::net::TcpStream;
+
+#[cfg(feature = "tcp")]
+use crate::transports::tcp::{HDLC_FLAG, hdlc_escape, hdlc_unescape};
+
+#[cfg(feature = "tcp")]
 fn hdlc_frame(data: &[u8]) -> Vec<u8> {
     let escaped = hdlc_escape(data);
     let mut result = Vec::with_capacity(escaped.len() + 2);
@@ -25,6 +31,7 @@ fn hdlc_frame(data: &[u8]) -> Vec<u8> {
     result
 }
 
+#[cfg(feature = "tcp")]
 fn hdlc_extract_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
     loop {
         let start = buf.iter().position(|&b| b == HDLC_FLAG)?;
@@ -35,7 +42,6 @@ fn hdlc_extract_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
 
         let frame_data = &buf[start + 1..end];
 
-        // Handle consecutive FLAG bytes (empty frame) - skip and keep looking
         if frame_data.is_empty() {
             *buf = buf[start + 1..].to_vec();
             continue;
@@ -47,7 +53,6 @@ fn hdlc_extract_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
             return Some(unescaped);
         }
 
-        // Invalid frame (too short), skip and keep looking
         *buf = buf[end..].to_vec();
     }
 }
@@ -61,8 +66,16 @@ pub struct AsyncTransport {
     connected: Arc<Mutex<bool>>,
 }
 
+#[cfg(feature = "tcp")]
+struct TransportIo {
+    inbox: Inbox,
+    outbox: Outbox,
+    connected: Arc<Mutex<bool>>,
+}
+
+#[cfg(feature = "tcp")]
 impl AsyncTransport {
-    fn new_pair() -> (Self, Inbox, Outbox, Arc<Mutex<bool>>) {
+    fn new() -> (Self, TransportIo) {
         let inbox = Arc::new(Mutex::new(VecDeque::new()));
         let outbox = Arc::new(Mutex::new(VecDeque::new()));
         let connected = Arc::new(Mutex::new(true));
@@ -73,7 +86,13 @@ impl AsyncTransport {
             connected: connected.clone(),
         };
 
-        (transport, inbox, outbox, connected)
+        let io = TransportIo {
+            inbox,
+            outbox,
+            connected,
+        };
+
+        (transport, io)
     }
 }
 
@@ -238,6 +257,9 @@ enum Command {
     GetStats {
         reply: oneshot::Sender<StatsSnapshot>,
     },
+    AddInterface {
+        interface: Box<Interface<AsyncTransport>>,
+    },
 }
 
 pub struct AsyncNode {
@@ -315,26 +337,6 @@ impl AsyncNode {
             .command_tx
             .send(Command::GetDestinations { reply: reply_tx });
         reply_rx.await.unwrap_or_default()
-    }
-
-    pub fn add_tcp_stream(&mut self, stream: TcpStream) {
-        log::info!("[ASYNC] adding TCP stream");
-        if let Err(e) = stream.set_nodelay(true) {
-            log::warn!("Failed to set TCP_NODELAY: {}", e);
-        } else {
-            log::debug!("[ASYNC] TCP_NODELAY set successfully");
-        }
-        let (transport, inbox, outbox, connected) = AsyncTransport::new_pair();
-        self.node.add_interface(Interface::new(transport));
-        let wake_tx = self.wake_tx.clone();
-        log::info!("[ASYNC] spawning tcp_io_task");
-        tokio::spawn(tcp_io_task(stream, inbox, outbox, connected, wake_tx));
-    }
-
-    pub async fn connect(&mut self, addr: &str) -> std::io::Result<()> {
-        let stream = TcpStream::connect(addr).await?;
-        self.add_tcp_stream(stream);
-        Ok(())
     }
 
     pub async fn run(mut self) {
@@ -436,7 +438,65 @@ impl AsyncNode {
             Command::GetStats { reply } => {
                 let _ = reply.send(self.node.stats());
             }
+            Command::AddInterface { interface } => {
+                log::info!("[ASYNC] adding interface via command");
+                self.node.add_interface(*interface);
+            }
         }
+    }
+}
+
+#[cfg(feature = "tcp")]
+impl AsyncNode {
+    pub fn add_tcp_stream(&mut self, stream: TcpStream) {
+        log::info!("[ASYNC] adding TCP stream");
+        if let Err(e) = stream.set_nodelay(true) {
+            log::warn!("Failed to set TCP_NODELAY: {}", e);
+        } else {
+            log::debug!("[ASYNC] TCP_NODELAY set successfully");
+        }
+        let (transport, io) = AsyncTransport::new();
+        self.node.add_interface(Interface::new(transport));
+        let wake_tx = self.wake_tx.clone();
+        log::info!("[ASYNC] spawning tcp_io_task");
+        tokio::spawn(tcp_io_task(stream, io, wake_tx));
+    }
+
+    pub async fn connect(&mut self, addr: &str) -> std::io::Result<()> {
+        let stream = TcpStream::connect(addr).await?;
+        self.add_tcp_stream(stream);
+        Ok(())
+    }
+
+    pub async fn listen(&mut self, addr: &str) -> std::io::Result<()> {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let local_addr = listener.local_addr()?;
+        log::info!("Listening on {}", local_addr);
+
+        let command_tx = self.command_tx.clone();
+        let wake_tx = self.wake_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, peer)) => {
+                        log::info!("Accepted connection from {}", peer);
+                        if let Err(e) = stream.set_nodelay(true) {
+                            log::warn!("Failed to set TCP_NODELAY: {}", e);
+                        }
+                        let (transport, io) = AsyncTransport::new();
+                        let interface = Box::new(Interface::new(transport));
+                        let _ = command_tx.send(Command::AddInterface { interface });
+                        let wake = wake_tx.clone();
+                        tokio::spawn(tcp_io_task(stream, io, wake));
+                    }
+                    Err(e) => {
+                        log::warn!("Accept error: {}", e);
+                    }
+                }
+            }
+        });
+
+        Ok(())
     }
 }
 
@@ -572,16 +632,15 @@ impl ServiceHandle {
     }
 }
 
-async fn tcp_io_task(
-    stream: TcpStream,
-    inbox: Inbox,
-    outbox: Outbox,
-    connected: Arc<Mutex<bool>>,
-    wake_tx: mpsc::Sender<()>,
-) {
+#[cfg(feature = "tcp")]
+async fn tcp_io_task(stream: TcpStream, io: TransportIo, wake_tx: mpsc::Sender<()>) {
     log::info!("[TCP] io task starting");
     let (mut reader, mut writer) = stream.into_split();
-    let outbox_writer = outbox.clone();
+    let TransportIo {
+        inbox,
+        outbox,
+        connected,
+    } = io;
 
     let read_task = async {
         log::info!("[TCP IN] read task starting");
@@ -657,7 +716,7 @@ async fn tcp_io_task(
         let mut idle_count = 0u64;
 
         loop {
-            let data = outbox_writer.lock().unwrap().pop_front();
+            let data = outbox.lock().unwrap().pop_front();
             if let Some(data) = data {
                 write_count += 1;
                 let framed = hdlc_frame(&data);
@@ -708,7 +767,7 @@ async fn tcp_io_task(
     log::info!("[TCP] io task ended");
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tcp"))]
 mod tests {
     use super::*;
     use crate::transports::tcp::HDLC_ESC;
