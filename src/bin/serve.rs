@@ -12,7 +12,7 @@ fn scan_directory(base: &Path, current: &Path, paths: &mut Vec<String>) {
             } else if path.is_file()
                 && let Ok(relative) = path.strip_prefix(base)
             {
-                let request_path = format!("/page/{}", relative.display());
+                let request_path = format!("/{}", relative.display());
                 paths.push(request_path);
             }
         }
@@ -80,9 +80,6 @@ async fn main() {
 
     let mut paths: Vec<String> = Vec::new();
     scan_directory(&dir, &dir, &mut paths);
-    if paths.is_empty() {
-        paths.push("/page/index.mu".to_string());
-    }
     log::info!("Registered {} paths", paths.len());
     for p in &paths {
         log::debug!("  {}", p);
@@ -107,7 +104,7 @@ async fn main() {
     let name_bytes = name.into_bytes();
 
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -137,41 +134,23 @@ async fn handle_request(
         req.data.len()
     );
 
-    let response = if req.path.is_empty()
-        || req.path == "/"
-        || req.path == "/page"
-        || req.path.starts_with("/page/")
-    {
-        let filename = req
-            .path
-            .strip_prefix("/page")
-            .unwrap_or(&req.path)
-            .trim_start_matches('/');
-        let filename = if filename.is_empty() {
-            "index.mu"
-        } else {
-            filename
-        };
-        let file_path = dir.join(filename);
+    let filename = req.path.trim_start_matches('/');
+    let file_path = dir.join(filename);
 
-        if !file_path.starts_with(dir) {
-            log::warn!("Path traversal attempt: {}", filename);
-            b"error: invalid path".to_vec()
-        } else {
-            match tokio::fs::read(&file_path).await {
-                Ok(data) => {
-                    log::info!("Serving {} ({} bytes)", file_path.display(), data.len());
-                    data
-                }
-                Err(e) => {
-                    log::warn!("Failed to read {}: {}", file_path.display(), e);
-                    format!("error: {}", e).into_bytes()
-                }
+    let response = if !file_path.starts_with(dir) {
+        log::warn!("Path traversal attempt: {}", filename);
+        b"error: invalid path".to_vec()
+    } else {
+        match tokio::fs::read(&file_path).await {
+            Ok(data) => {
+                log::info!("Serving {} ({} bytes)", file_path.display(), data.len());
+                data
+            }
+            Err(e) => {
+                log::warn!("Failed to read {}: {}", file_path.display(), e);
+                format!("error: {}", e).into_bytes()
             }
         }
-    } else {
-        log::warn!("Unknown path: {}", req.path);
-        b"error: unknown path".to_vec()
     };
 
     if let Err(e) = service.respond(req.request_id, &response).await {

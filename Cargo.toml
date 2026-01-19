@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["tcp", "tokio"]
+default = ["tcp", "tokio", "config", "relay"]
 tcp = []
 tokio = ["dep:tokio", "dep:env_logger", "tcp"]
+config = ["dep:toml"]
+relay = ["tokio", "config", "dep:serde_json", "dep:simplelog"]
 
 [dependencies]
 aes = "0.8.4"
@@ -24,12 +26,20 @@ serde_bytes = "0.11"
 sha2 = "0.10.9"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 bzip2 = "0.5"
-tokio = { version = "1", features = ["sync", "time", "io-util", "net", "rt", "rt-multi-thread", "macros", "fs"], optional = true }
+tokio = { version = "1", features = ["sync", "time", "io-util", "net", "rt", "rt-multi-thread", "macros", "fs", "signal"], optional = true }
 env_logger = { version = "0.11", optional = true }
+serde_json = { version = "1.0", optional = true }
+toml = { version = "0.8", optional = true }
+simplelog = { version = "0.12", optional = true }
 
 [[bin]]
 name = "rinse-serve"
 path = "src/bin/serve.rs"
 required-features = ["tokio"]
+
+[[bin]]
+name = "rinse-relay"
+path = "src/bin/relay.rs"
+required-features = ["relay"]
 
 [dev-dependencies]

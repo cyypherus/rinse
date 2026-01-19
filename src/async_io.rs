@@ -98,25 +98,11 @@ impl AsyncTransport {
 
 impl Transport for AsyncTransport {
     fn send(&mut self, data: &[u8]) {
-        let len = data.len();
         self.outbox.lock().unwrap().push_back(data.to_vec());
-        log::trace!(
-            "[TRANSPORT] send queued {} bytes, outbox len={}",
-            len,
-            self.outbox.lock().unwrap().len()
-        );
     }
 
     fn recv(&mut self) -> Option<Vec<u8>> {
-        let result = self.inbox.lock().unwrap().pop_front();
-        if let Some(ref data) = result {
-            log::trace!(
-                "[TRANSPORT] recv {} bytes, inbox len={}",
-                data.len(),
-                self.inbox.lock().unwrap().len()
-            );
-        }
-        result
+        self.inbox.lock().unwrap().pop_front()
     }
 
     fn bandwidth_available(&self) -> bool {
@@ -340,7 +326,7 @@ impl AsyncNode {
     }
 
     pub async fn run(mut self) {
-        let mut tick_interval = tokio::time::interval(Duration::from_millis(10));
+        let mut tick_interval = tokio::time::interval(Duration::from_millis(1000));
         tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
@@ -350,10 +336,11 @@ impl AsyncNode {
                     self.handle_command(cmd, Instant::now());
                 }
                 _ = self.wake_rx.recv() => {
-                    // Drain any extra wakes to prevent backup
                     while self.wake_rx.try_recv().is_ok() {}
+                    self.node.poll(Instant::now());
                 }
                 _ = tick_interval.tick() => {
+                    self.node.poll(Instant::now());
                 }
             }
         }
@@ -601,7 +588,6 @@ impl ServiceHandle {
 
 #[cfg(feature = "tcp")]
 async fn tcp_io_task(stream: TcpStream, io: TransportIo, wake_tx: mpsc::Sender<()>) {
-    log::info!("[TCP] io task starting");
     let (mut reader, mut writer) = stream.into_split();
     let TransportIo {
         inbox,
@@ -610,7 +596,6 @@ async fn tcp_io_task(stream: TcpStream, io: TransportIo, wake_tx: mpsc::Sender<(
     } = io;
 
     let read_task = async {
-        log::info!("[TCP IN] read task starting");
         let mut buf = [0u8; 65536];
         let mut hdlc_buf = Vec::new();
         let mut read_count = 0u64;
@@ -618,7 +603,6 @@ async fn tcp_io_task(stream: TcpStream, io: TransportIo, wake_tx: mpsc::Sender<(
         loop {
             match reader.read(&mut buf).await {
                 Ok(0) => {
-                    log::info!("[TCP IN] connection closed (read 0)");
                     break;
                 }
                 Ok(n) => {
@@ -631,56 +615,26 @@ async fn tcp_io_task(stream: TcpStream, io: TransportIo, wake_tx: mpsc::Sender<(
                     );
                     hdlc_buf.extend_from_slice(&buf[..n]);
 
-                    let mut frame_count = 0;
                     while let Some(frame) = hdlc_extract_frame(&mut hdlc_buf) {
-                        frame_count += 1;
-                        log::debug!(
-                            "[TCP IN] frame {} bytes: {}",
-                            frame.len(),
-                            hex::encode(&frame[..frame.len().min(32)])
-                        );
                         inbox.lock().unwrap().push_back(frame);
                     }
-                    if frame_count > 0 {
-                        log::trace!(
-                            "[TCP IN] extracted {} frames, {} bytes remaining in hdlc_buf",
-                            frame_count,
-                            hdlc_buf.len()
-                        );
-                    } else if !hdlc_buf.is_empty() {
-                        // No frames extracted but buffer has data - log for debugging
-                        let flag_positions: Vec<usize> = hdlc_buf
-                            .iter()
-                            .enumerate()
-                            .filter(|&(_, b)| *b == HDLC_FLAG)
-                            .map(|(i, _)| i)
-                            .collect();
-                        log::debug!(
-                            "[TCP IN] no frames extracted, buf {} bytes, FLAG positions: {:?}, first 16: {}",
-                            hdlc_buf.len(),
-                            &flag_positions[..flag_positions.len().min(10)],
-                            hex::encode(&hdlc_buf[..hdlc_buf.len().min(16)])
-                        );
-                    }
+
                     // Wake the node once after processing all frames (non-blocking)
                     match wake_tx.try_send(()) {
-                        Ok(()) => log::trace!("[TCP IN] wake sent"),
-                        Err(_) => log::trace!("[TCP IN] wake channel full"),
+                        Ok(()) => (),
+                        Err(e) => log::warn!("[TCP IN] wake channel full: {}", e),
                     }
                 }
                 Err(e) => {
-                    log::info!("[TCP IN] read error: {}", e);
+                    log::warn!("[TCP IN] read error: {}", e);
                     break;
                 }
             }
         }
-        log::info!("[TCP IN] read task ended after {} reads", read_count);
     };
 
     let write_task = async {
-        log::info!("[TCP OUT] write task starting");
         let mut write_count = 0u64;
-        let mut idle_count = 0u64;
 
         loop {
             let data = outbox.lock().unwrap().pop_front();
@@ -694,30 +648,16 @@ async fn tcp_io_task(stream: TcpStream, io: TransportIo, wake_tx: mpsc::Sender<(
                     framed.len(),
                     hex::encode(&data[..data.len().min(32)])
                 );
-                let write_start = Instant::now();
                 if writer.write_all(&framed).await.is_err() {
-                    log::info!("[TCP OUT] write error");
                     break;
                 }
                 if writer.flush().await.is_err() {
-                    log::info!("[TCP OUT] flush error");
                     break;
                 }
-                let write_duration = write_start.elapsed();
-                if write_duration > Duration::from_millis(100) {
-                    log::warn!("[TCP OUT] write+flush took {:?}", write_duration);
-                }
-                idle_count = 0;
             } else {
-                idle_count += 1;
-                if idle_count == 1000 {
-                    log::trace!("[TCP OUT] idle for 1s (1000 iterations)");
-                    idle_count = 0;
-                }
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }
-        log::info!("[TCP OUT] write task ended after {} writes", write_count);
     };
 
     tokio::select! {

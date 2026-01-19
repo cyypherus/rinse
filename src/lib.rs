@@ -19,6 +19,9 @@ pub mod transports;
 #[cfg(feature = "tokio")]
 mod async_io;
 
+#[cfg(feature = "config")]
+pub mod config;
+
 pub use aspect::AspectHash;
 pub use handle::{Destination, NodeHandle, RequestError, RespondError, Service};
 pub use identity::Identity;
