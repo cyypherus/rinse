@@ -634,20 +634,10 @@ async fn tcp_io_task(stream: TcpStream, io: TransportIo, wake_tx: mpsc::Sender<(
     };
 
     let write_task = async {
-        let mut write_count = 0u64;
-
         loop {
             let data = outbox.lock().unwrap().pop_front();
             if let Some(data) = data {
-                write_count += 1;
                 let framed = hdlc_frame(&data);
-                log::debug!(
-                    "[TCP OUT] #{} frame {} bytes (framed {}): {}",
-                    write_count,
-                    data.len(),
-                    framed.len(),
-                    hex::encode(&data[..data.len().min(32)])
-                );
                 if writer.write_all(&framed).await.is_err() {
                     break;
                 }

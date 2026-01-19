@@ -1,19 +1,33 @@
+use std::collections::VecDeque;
 use std::fs::File;
+use std::io;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crossterm::{
+    event::{self, Event, KeyCode, KeyModifiers},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{
+    Frame, Terminal,
+    layout::{Constraint, Layout, Rect},
+    prelude::CrosstermBackend,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Gauge, Paragraph},
+};
 use rinse::config::{Config, InterfaceConfig, data_dir, load_or_generate_identity};
 use rinse::{AsyncNode, StatsSnapshot};
 use serde::{Deserialize, Serialize};
-use simplelog::{Config as LogConfig, LevelFilter, WriteLogger};
+use simplelog::{Config as LogConfig, LevelFilter, SharedLogger, WriteLogger};
 
-const BANNER: &str = r#"
-    ____  _
+const BANNER: &str = r#"    ____  _
    / __ \(_)___  ________
   / /_/ / / __ \/ ___/ _ \
  / _, _/ / / / (__  )  __/
-/_/ |_/_/_/ /_/____/\___/  RELAY
-"#;
+/_/ |_/_/_/ /_/____/\___/  RELAY"#;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PersistedStats {
@@ -104,27 +118,90 @@ struct CombinedStats {
     session_announces_relayed: u64,
 }
 
-struct RelayDisplay {
+struct LogEntry {
+    level: log::Level,
+    message: String,
+}
+
+struct TuiLogger {
+    buffer: Arc<Mutex<VecDeque<LogEntry>>>,
+    file_logger: Box<dyn SharedLogger>,
+}
+
+impl TuiLogger {
+    fn new(buffer: Arc<Mutex<VecDeque<LogEntry>>>, file_logger: Box<dyn SharedLogger>) -> Self {
+        Self {
+            buffer,
+            file_logger,
+        }
+    }
+}
+
+impl log::Log for TuiLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Debug
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            let entry = LogEntry {
+                level: record.level(),
+                message: format!("{}", record.args()),
+            };
+            if let Ok(mut buf) = self.buffer.lock() {
+                buf.push_back(entry);
+                while buf.len() > 100 {
+                    buf.pop_front();
+                }
+            }
+            self.file_logger.log(record);
+        }
+    }
+
+    fn flush(&self) {
+        self.file_logger.flush();
+    }
+}
+
+impl SharedLogger for TuiLogger {
+    fn level(&self) -> LevelFilter {
+        LevelFilter::Debug
+    }
+
+    fn config(&self) -> Option<&LogConfig> {
+        None
+    }
+
+    fn as_log(self: Box<Self>) -> Box<dyn log::Log> {
+        self
+    }
+}
+
+struct RelayTui {
     prev_session_packets: u64,
     prev_session_bytes: u64,
     prev_session_announces: u64,
+    log_buffer: Arc<Mutex<VecDeque<LogEntry>>>,
 }
 
-impl RelayDisplay {
-    fn new() -> Self {
+impl RelayTui {
+    fn new(log_buffer: Arc<Mutex<VecDeque<LogEntry>>>) -> Self {
         Self {
             prev_session_packets: 0,
             prev_session_bytes: 0,
             prev_session_announces: 0,
+            log_buffer,
         }
     }
 
-    fn check_milestones(persisted: &mut PersistedStats, combined: &CombinedStats) {
+    fn check_milestones(persisted: &mut PersistedStats, combined: &CombinedStats) -> Vec<String> {
+        let mut achievements = Vec::new();
+
         let announce_milestones = [10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000];
         for &m in &announce_milestones {
             if combined.announces_relayed >= m && persisted.announces_milestone < m {
                 persisted.announces_milestone = m;
-                Self::celebrate("ANNOUNCER", m, "announces relayed");
+                achievements.push(format!("ANNOUNCER: {} announces relayed!", m));
             }
         }
 
@@ -132,7 +209,7 @@ impl RelayDisplay {
         for &m in &packet_milestones {
             if combined.packets_relayed >= m && persisted.packets_milestone < m {
                 persisted.packets_milestone = m;
-                Self::celebrate("PACKET PUSHER", m, "packets relayed");
+                achievements.push(format!("PACKET PUSHER: {} packets relayed!", m));
             }
         }
 
@@ -140,29 +217,20 @@ impl RelayDisplay {
             1_000_000,
             10_000_000,
             100_000_000,
-            1_000_000_000,
-            10_000_000_000,
-            100_000_000_000,
+            1_000_000_000,     // 1 GB
+            10_000_000_000,    // 10 GB
+            100_000_000_000,   // 100 GB
+            500_000_000_000,   // 500 GB
+            1_000_000_000_000, // 1 TB
         ];
         for &m in &byte_milestones {
             if combined.bytes_relayed >= m && persisted.bytes_milestone < m {
                 persisted.bytes_milestone = m;
-                Self::celebrate(
-                    "DATA MOVER",
-                    m,
-                    &format!("bytes relayed ({})", Self::format_bytes(m)),
-                );
+                achievements.push(format!("DATA MOVER: {} relayed!", Self::format_bytes(m)));
             }
         }
-    }
 
-    fn celebrate(title: &str, value: u64, description: &str) {
-        println!();
-        println!("  ***********************************************");
-        println!("  *  ACHIEVEMENT UNLOCKED: {:<20} *", title);
-        println!("  *  {} {}!", value, description);
-        println!("  ***********************************************");
-        println!();
+        achievements
     }
 
     fn format_bytes(bytes: u64) -> String {
@@ -179,26 +247,14 @@ impl RelayDisplay {
         }
     }
 
-    fn progress_bar(current: u64, max: u64, width: usize) -> String {
-        let ratio = if max > 0 {
-            (current as f64 / max as f64).min(1.0)
-        } else {
-            0.0
-        };
-        let filled = (ratio * width as f64) as usize;
-        let empty = width - filled;
-        format!("[{}{}]", "=".repeat(filled), " ".repeat(empty))
-    }
-
-    fn display(
+    fn render(
         &mut self,
-        persisted: &mut PersistedStats,
+        frame: &mut Frame,
         combined: &CombinedStats,
         interval_secs: f64,
         upstreams: &[String],
+        achievements: &[String],
     ) {
-        Self::check_milestones(persisted, combined);
-
         let relayed_delta = combined
             .session_packets_relayed
             .saturating_sub(self.prev_session_packets);
@@ -211,57 +267,232 @@ impl RelayDisplay {
 
         let bytes_per_sec = bytes_delta as f64 / interval_secs;
 
-        print!("\x1B[2J\x1B[H");
+        let area = frame.area();
 
-        println!("{}", BANNER);
-        println!(
-            "  Session: {} | Total: {}",
-            StatsSnapshot::format_uptime(combined.session_uptime_secs),
-            StatsSnapshot::format_uptime(combined.total_uptime_secs),
-        );
-        if !upstreams.is_empty() {
-            println!(
-                "  Upstream:  {} ({})",
-                upstreams.join(", "),
-                upstreams.len()
-            );
-        }
-        println!();
+        let chunks = Layout::vertical([
+            Constraint::Length(7),
+            Constraint::Min(10),
+            Constraint::Length(12),
+        ])
+        .split(area);
 
-        println!("  RELAY PERFORMANCE (ALL TIME)");
-        println!("  ----------------------------");
-        println!(
-            "  Packets relayed:   {:>10}  (+{} this interval)",
-            combined.packets_relayed, relayed_delta
+        self.render_header(frame, chunks[0], combined, upstreams);
+        self.render_stats(
+            frame,
+            chunks[1],
+            combined,
+            relayed_delta,
+            announces_delta,
+            bytes_per_sec,
+            achievements,
         );
-        println!(
-            "  Data relayed:      {:>10}  ({})",
-            Self::format_bytes(combined.bytes_relayed),
-            Self::format_rate(bytes_per_sec)
-        );
-        println!();
+        self.render_logs(frame, chunks[2]);
 
-        println!("  BREAKDOWN");
-        println!(
-            "    Announces:       {:>10}  (+{})",
-            combined.announces_relayed, announces_delta
-        );
-        println!("    Proofs:          {:>10}", combined.proofs_relayed);
-        println!("    Link packets:    {:>10}", combined.link_packets_relayed);
-        println!();
+        self.prev_session_packets = combined.session_packets_relayed;
+        self.prev_session_bytes = combined.session_bytes_relayed;
+        self.prev_session_announces = combined.session_announces_relayed;
+    }
 
-        println!("  NETWORK I/O (ALL TIME)");
-        println!(
-            "    RX: {} pkts / {}",
-            combined.packets_received,
-            Self::format_bytes(combined.bytes_received)
-        );
-        println!(
-            "    TX: {} pkts / {}",
-            combined.packets_sent,
-            Self::format_bytes(combined.bytes_sent)
-        );
-        println!();
+    fn render_header(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        combined: &CombinedStats,
+        upstreams: &[String],
+    ) {
+        let mut lines: Vec<Line> = BANNER
+            .lines()
+            .map(|l| Line::from(Span::styled(l, Style::default().fg(Color::Cyan))))
+            .collect();
+
+        lines.push(Line::from(vec![
+            Span::styled(" Session: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                StatsSnapshot::format_uptime(combined.session_uptime_secs),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(" | Total: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                StatsSnapshot::format_uptime(combined.total_uptime_secs),
+                Style::default().fg(Color::White),
+            ),
+            if !upstreams.is_empty() {
+                Span::styled(
+                    format!(
+                        " | Upstream: {} ({})",
+                        upstreams.join(", "),
+                        upstreams.len()
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )
+            } else {
+                Span::raw("")
+            },
+        ]));
+
+        let para = Paragraph::new(lines);
+        frame.render_widget(para, area);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_stats(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        combined: &CombinedStats,
+        relayed_delta: u64,
+        announces_delta: u64,
+        bytes_per_sec: f64,
+        achievements: &[String],
+    ) {
+        let chunks = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(area);
+
+        let left_chunks = Layout::vertical([
+            Constraint::Length(6),
+            Constraint::Length(5),
+            Constraint::Min(3),
+        ])
+        .split(chunks[0]);
+
+        let perf_lines = vec![
+            Line::from(vec![
+                Span::styled("  Packets relayed:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{:>10}", combined.packets_relayed),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::styled(
+                    format!("  (+{})", relayed_delta),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  Data relayed:     ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{:>10}", Self::format_bytes(combined.bytes_relayed)),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::styled(
+                    format!("  ({})", Self::format_rate(bytes_per_sec)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Announces:        ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{:>10}", combined.announces_relayed),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(
+                    format!("  (+{})", announces_delta),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  Proofs:           ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{:>10}", combined.proofs_relayed),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  Link packets:     ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{:>10}", combined.link_packets_relayed),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]),
+        ];
+
+        let perf_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(
+                " Relay Performance ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let perf_para = Paragraph::new(perf_lines).block(perf_block);
+        frame.render_widget(perf_para, left_chunks[0]);
+
+        let io_lines = vec![
+            Line::from(vec![
+                Span::styled("  RX: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{} pkts", combined.packets_received),
+                    Style::default().fg(Color::Blue),
+                ),
+                Span::styled(" / ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    Self::format_bytes(combined.bytes_received),
+                    Style::default().fg(Color::Blue),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  TX: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{} pkts", combined.packets_sent),
+                    Style::default().fg(Color::Magenta),
+                ),
+                Span::styled(" / ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    Self::format_bytes(combined.bytes_sent),
+                    Style::default().fg(Color::Magenta),
+                ),
+            ]),
+        ];
+
+        let io_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(
+                " Network I/O ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let io_para = Paragraph::new(io_lines).block(io_block);
+        frame.render_widget(io_para, left_chunks[1]);
+
+        let relay_score = combined.packets_relayed * 10
+            + combined.announces_relayed * 100
+            + combined.proofs_relayed * 50
+            + combined.link_packets_relayed * 25
+            + combined.bytes_relayed / 1000;
+        let pts_per_min = relay_score as f64 / (combined.total_uptime_secs as f64 / 60.0).max(1.0);
+
+        let score_lines = vec![Line::from(vec![
+            Span::styled("  Score: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", relay_score),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" pts  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("({:.1} pts/min)", pts_per_min),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])];
+
+        let score_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(
+                " Relay Score ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let score_para = Paragraph::new(score_lines).block(score_block);
+        frame.render_widget(score_para, left_chunks[2]);
+
+        let right_chunks =
+            Layout::vertical([Constraint::Length(6), Constraint::Min(3)]).split(chunks[1]);
 
         let next_announce_milestone = [10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000]
             .iter()
@@ -275,37 +506,114 @@ impl RelayDisplay {
             .copied()
             .unwrap_or(5000000);
 
-        println!("  PROGRESS TO NEXT MILESTONE");
-        println!(
-            "    Announces: {} {}/{}",
-            Self::progress_bar(combined.announces_relayed, next_announce_milestone, 20),
-            combined.announces_relayed,
-            next_announce_milestone
-        );
-        println!(
-            "    Packets:   {} {}/{}",
-            Self::progress_bar(combined.packets_relayed, next_packet_milestone, 20),
-            combined.packets_relayed,
-            next_packet_milestone
-        );
-        println!();
+        let announce_ratio =
+            (combined.announces_relayed as f64 / next_announce_milestone as f64).min(1.0);
+        let packet_ratio =
+            (combined.packets_relayed as f64 / next_packet_milestone as f64).min(1.0);
 
-        let relay_score = combined.packets_relayed * 10
-            + combined.announces_relayed * 100
-            + combined.proofs_relayed * 50
-            + combined.link_packets_relayed * 25
-            + combined.bytes_relayed / 1000;
+        let milestone_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(
+                " Progress ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let milestone_inner = milestone_block.inner(right_chunks[0]);
+        frame.render_widget(milestone_block, right_chunks[0]);
 
-        println!(
-            "  RELAY SCORE: {} pts  ({:.1} pts/min)",
-            relay_score,
-            relay_score as f64 / (combined.total_uptime_secs as f64 / 60.0).max(1.0)
-        );
-        println!();
+        let gauge_chunks =
+            Layout::vertical([Constraint::Length(2), Constraint::Length(2)]).split(milestone_inner);
 
-        self.prev_session_packets = combined.session_packets_relayed;
-        self.prev_session_bytes = combined.session_bytes_relayed;
-        self.prev_session_announces = combined.session_announces_relayed;
+        let announce_gauge = Gauge::default()
+            .gauge_style(Style::default().fg(Color::Yellow).bg(Color::Black))
+            .ratio(announce_ratio)
+            .label(format!(
+                "Announces: {}/{}",
+                combined.announces_relayed, next_announce_milestone
+            ));
+        frame.render_widget(announce_gauge, gauge_chunks[0]);
+
+        let packet_gauge = Gauge::default()
+            .gauge_style(Style::default().fg(Color::Green).bg(Color::Black))
+            .ratio(packet_ratio)
+            .label(format!(
+                "Packets: {}/{}",
+                combined.packets_relayed, next_packet_milestone
+            ));
+        frame.render_widget(packet_gauge, gauge_chunks[1]);
+
+        let achievement_lines: Vec<Line> = achievements
+            .iter()
+            .map(|a| {
+                Line::from(Span::styled(
+                    format!("  {} {}", "\u{2605}", a),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            })
+            .collect();
+
+        let achievement_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(Span::styled(
+                " Achievements ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let achievement_para = Paragraph::new(achievement_lines).block(achievement_block);
+        frame.render_widget(achievement_para, right_chunks[1]);
+    }
+
+    fn render_logs(&self, frame: &mut Frame, area: Rect) {
+        let entries: Vec<(log::Level, String)> = self
+            .log_buffer
+            .lock()
+            .ok()
+            .map(|buf| {
+                buf.iter()
+                    .rev()
+                    .take(area.height.saturating_sub(2) as usize)
+                    .map(|e| (e.level, e.message.clone()))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let lines: Vec<Line> = entries
+            .into_iter()
+            .map(|(level, message)| {
+                let (color, prefix) = match level {
+                    log::Level::Error => (Color::Red, "ERR"),
+                    log::Level::Warn => (Color::Yellow, "WRN"),
+                    log::Level::Info => (Color::Green, "INF"),
+                    log::Level::Debug => (Color::Blue, "DBG"),
+                    log::Level::Trace => (Color::DarkGray, "TRC"),
+                };
+                Line::from(vec![
+                    Span::styled(format!(" {} ", prefix), Style::default().fg(color)),
+                    Span::styled(message, Style::default().fg(Color::White)),
+                ])
+            })
+            .collect();
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(
+                " Logs ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let para = Paragraph::new(lines).block(block);
+        frame.render_widget(para, area);
     }
 }
 
@@ -313,12 +621,31 @@ fn stats_path() -> PathBuf {
     data_dir().join("relay_stats.json")
 }
 
+fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    Terminal::new(backend)
+}
+
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+}
+
 #[tokio::main]
 async fn main() {
     let _ = std::fs::create_dir_all(data_dir());
+
+    let log_buffer: Arc<Mutex<VecDeque<LogEntry>>> = Arc::new(Mutex::new(VecDeque::new()));
+
     let log_file = File::create(data_dir().join("relay.log")).expect("failed to create log file");
-    WriteLogger::init(LevelFilter::Trace, LogConfig::default(), log_file)
-        .expect("failed to init logger");
+    let file_logger = WriteLogger::new(LevelFilter::Trace, LogConfig::default(), log_file);
+    let tui_logger = TuiLogger::new(log_buffer.clone(), file_logger);
+
+    log::set_boxed_logger(Box::new(tui_logger)).expect("failed to set logger");
+    log::set_max_level(LevelFilter::Debug);
 
     let config = Config::load().expect("failed to load config");
     let identity = load_or_generate_identity().expect("failed to load identity");
@@ -380,25 +707,69 @@ async fn main() {
         }
     }
 
-    let stats_interval = Duration::from_secs(5);
+    let mut terminal = setup_terminal().expect("failed to setup terminal");
+
+    let stats_interval = Duration::from_secs(1);
     let save_interval = Duration::from_secs(60);
 
-    let mut display = RelayDisplay::new();
+    let mut tui = RelayTui::new(log_buffer);
     let mut last_save = std::time::Instant::now();
+    let mut achievements: Vec<String> = Vec::new();
 
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(stats_interval);
-        let mut announce_tick = tokio::time::interval_at(
-            tokio::time::Instant::now() + Duration::from_secs(10),
-            Duration::from_secs(60),
-        );
+        node.run().await;
+    });
 
-        loop {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
+    let mut tick = tokio::time::interval(stats_interval);
+    let mut announce_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(10),
+        Duration::from_secs(60),
+    );
+
+    loop {
+        tokio::select! {
+            _ = announce_tick.tick() => {
+                service.announce();
+                log::debug!("Announced relay");
+            }
+            _ = tick.tick() => {
+                let session_stats = service.stats().await;
+                let combined = persisted.combined(&session_stats);
+
+                let new_achievements = RelayTui::check_milestones(&mut persisted, &combined);
+                achievements.extend(new_achievements);
+                while achievements.len() > 5 {
+                    achievements.remove(0);
+                }
+
+                terminal.draw(|frame| {
+                    tui.render(
+                        frame,
+                        &combined,
+                        stats_interval.as_secs_f64(),
+                        &upstreams,
+                        &achievements,
+                    );
+                }).ok();
+
+                if last_save.elapsed() >= save_interval {
+                    let mut save_persisted = persisted.clone();
+                    save_persisted.merge(&session_stats);
+                    save_persisted.total_uptime_secs = persisted.total_uptime_secs;
+                    save_persisted.save(&stats_file);
+                    last_save = std::time::Instant::now();
+                }
+
+                if event::poll(Duration::from_millis(0)).unwrap_or(false)
+                    && let Ok(Event::Key(key)) = event::read()
+                    && key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                {
                     let session_stats = service.stats().await;
                     persisted.merge(&session_stats);
                     persisted.save(&stats_file);
+
+                    restore_terminal(&mut terminal);
 
                     println!();
                     println!("  Stats saved to {:?}", stats_file);
@@ -406,7 +777,7 @@ async fn main() {
                     println!("    Packets relayed: {}", persisted.packets_relayed);
                     println!(
                         "    Data relayed: {}",
-                        RelayDisplay::format_bytes(persisted.bytes_relayed)
+                        RelayTui::format_bytes(persisted.bytes_relayed)
                     );
                     println!("    Announces relayed: {}", persisted.announces_relayed);
                     println!(
@@ -417,31 +788,7 @@ async fn main() {
 
                     std::process::exit(0);
                 }
-                _ = announce_tick.tick() => {
-                    service.announce();
-                    log::debug!("Announced relay");
-                }
-                _ = tick.tick() => {
-                    let session_stats = service.stats().await;
-                    let combined = persisted.combined(&session_stats);
-                    display.display(
-                        &mut persisted,
-                        &combined,
-                        stats_interval.as_secs_f64(),
-                        &upstreams,
-                    );
-
-                    if last_save.elapsed() >= save_interval {
-                        let mut save_persisted = persisted.clone();
-                        save_persisted.merge(&session_stats);
-                        save_persisted.total_uptime_secs = persisted.total_uptime_secs;
-                        save_persisted.save(&stats_file);
-                        last_save = std::time::Instant::now();
-                    }
-                }
             }
         }
-    });
-
-    node.run().await;
+    }
 }
