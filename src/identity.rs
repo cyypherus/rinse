@@ -54,7 +54,7 @@ impl Identity {
         out
     }
 
-    pub fn public_key(&self) -> [u8; 64] {
+    pub(crate) fn public_key(&self) -> [u8; 64] {
         let mut out = [0u8; 64];
         out[..32].copy_from_slice(self.encryption_public.as_bytes());
         out[32..].copy_from_slice(self.signing_key.verifying_key().as_bytes());

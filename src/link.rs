@@ -5,6 +5,7 @@ use rand::RngCore;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 use crate::crypto::{LinkEncryption, LinkKeys, sha256, sign, verify};
+use crate::handle::ServiceId;
 use crate::packet::Address;
 
 pub type LinkId = [u8; 16];
@@ -153,7 +154,6 @@ pub(crate) struct PendingLink {
     pub initiator_encryption_secret: StaticSecret,
     pub destination: Address,
     pub request_time: Instant,
-    pub initiating_service: Option<Address>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,7 +175,7 @@ pub(crate) struct EstablishedLink {
     pub rtt_ms: Option<u64>,
     keys: LinkKeys,
     pub(crate) pending_requests:
-        std::collections::HashMap<crate::WireRequestId, (Address, crate::RequestId)>,
+        std::collections::HashMap<crate::WireRequestId, (ServiceId, crate::RequestId)>,
 }
 
 const KEEPALIVE_MAX_SECS: u64 = 360;
@@ -370,7 +370,6 @@ mod tests {
             initiator_encryption_secret: initiator_keypair.secret,
             destination: dest,
             request_time: now,
-            initiating_service: None,
         };
 
         let initiator_link =
@@ -430,7 +429,6 @@ mod tests {
             initiator_encryption_secret: initiator_enc.secret,
             destination: dest,
             request_time: now,
-            initiating_service: None,
         };
         let initiator_link = EstablishedLink::from_initiator(pending, &responder_enc.public, now);
 
@@ -490,7 +488,6 @@ mod tests {
             initiator_encryption_secret: initiator_keypair.secret,
             destination: dest,
             request_time,
-            initiating_service: None,
         };
 
         let link = EstablishedLink::from_initiator(pending, &responder_keypair.public, proof_time);
@@ -513,7 +510,6 @@ mod tests {
             initiator_encryption_secret: initiator_keypair.secret,
             destination: dest,
             request_time: now,
-            initiating_service: None,
         };
 
         let mut link = EstablishedLink::from_initiator(pending, &responder_keypair.public, now);

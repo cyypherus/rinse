@@ -1,5 +1,4 @@
 use std::collections::BinaryHeap;
-use std::time::Instant;
 
 use ed25519_dalek::SigningKey;
 
@@ -40,16 +39,9 @@ impl Ord for QueuedPacket {
     }
 }
 
-struct DelayedPacket {
-    packet: Packet,
-    priority: u8,
-    send_at: Instant,
-}
-
 pub struct Interface<T> {
     pub(crate) transport: T,
     queue: BinaryHeap<QueuedPacket>,
-    delayed: Vec<DelayedPacket>,
     pub(crate) ifac_size: usize,
     pub(crate) ifac_identity: Option<SigningKey>,
     pub(crate) ifac_key: Option<Vec<u8>>,
@@ -60,16 +52,15 @@ impl<T: Transport> Interface<T> {
         Self {
             transport,
             queue: BinaryHeap::new(),
-            delayed: Vec::new(),
             ifac_size: 0,
             ifac_identity: None,
             ifac_key: None,
         }
     }
 
-    pub fn with_ifac(mut self, identity: SigningKey, key: Vec<u8>, size: usize) -> Self {
-        self.ifac_identity = Some(identity);
-        self.ifac_key = Some(key);
+    pub fn with_ifac(mut self, signing_key: [u8; 32], shared_key: Vec<u8>, size: usize) -> Self {
+        self.ifac_identity = Some(SigningKey::from_bytes(&signing_key));
+        self.ifac_key = Some(shared_key);
         self.ifac_size = size;
         self
     }
@@ -82,20 +73,8 @@ impl<T: Transport> Interface<T> {
         self.transport.is_connected()
     }
 
-    pub(crate) fn send(&mut self, packet: Packet, priority: u8, now: Instant) {
-        self.delayed.push(DelayedPacket {
-            packet,
-            priority,
-            send_at: now,
-        });
-    }
-
-    fn queue(&mut self, packet: Packet, priority: u8) {
+    pub(crate) fn send(&mut self, packet: Packet, priority: u8) {
         self.queue.push(QueuedPacket { packet, priority });
-    }
-
-    fn dequeue(&mut self) -> Option<Packet> {
-        self.queue.pop().map(|q| q.packet)
     }
 
     fn validate_and_strip_ifac(&self, raw: &[u8]) -> Option<Vec<u8>> {
@@ -215,36 +194,17 @@ impl<T: Transport> Interface<T> {
         }
     }
 
-    pub(crate) fn poll(&mut self, now: Instant) -> Option<Instant> {
-        let mut i = 0;
-        while i < self.delayed.len() {
-            if self.delayed[i].send_at <= now {
-                let delayed = self.delayed.swap_remove(i);
-                if self.bandwidth_available() {
-                    log::trace!("[SEND] {}", delayed.packet.log_format());
-                    let raw = delayed.packet.to_bytes();
-                    let out = self.apply_ifac(&raw);
-                    self.transport.send(&out);
-                } else {
-                    self.queue(delayed.packet, delayed.priority);
-                }
-            } else {
-                i += 1;
-            }
-        }
-
+    pub(crate) fn poll(&mut self) {
         while self.bandwidth_available() {
-            if let Some(packet) = self.dequeue() {
-                log::trace!("[SEND] {}", packet.log_format());
-                let raw = packet.to_bytes();
+            if let Some(queued) = self.queue.pop() {
+                log::trace!("[SEND] {}", queued.packet.log_format());
+                let raw = queued.packet.to_bytes();
                 let out = self.apply_ifac(&raw);
                 self.transport.send(&out);
             } else {
                 break;
             }
         }
-
-        self.delayed.iter().map(|d| d.send_at).min()
     }
 }
 
@@ -308,17 +268,22 @@ mod tests {
     }
 
     #[test]
-    fn prioritise_announces_for_destinations_that_are_closest_in_terms_of_hops() {
-        let (transport, _) = MockTransport::new(true);
+    fn priority_queue_sends_lowest_priority_first() {
+        let (transport, sent) = MockTransport::new(true);
         let mut iface = Interface::new(transport);
 
-        iface.queue(make_packet([1u8; 16], 10), 10);
-        iface.queue(make_packet([2u8; 16], 2), 2);
-        iface.queue(make_packet([3u8; 16], 5), 5);
+        iface.send(make_packet([1u8; 16], 10), 10);
+        iface.send(make_packet([2u8; 16], 2), 2);
+        iface.send(make_packet([3u8; 16], 5), 5);
 
-        let p1 = iface.dequeue().unwrap();
-        let p2 = iface.dequeue().unwrap();
-        let p3 = iface.dequeue().unwrap();
+        iface.poll();
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 3);
+
+        let p1 = Packet::from_bytes(&sent[0]).unwrap();
+        let p2 = Packet::from_bytes(&sent[1]).unwrap();
+        let p3 = Packet::from_bytes(&sent[2]).unwrap();
 
         assert_eq!(p1.hops(), 2);
         assert_eq!(p2.hops(), 5);
@@ -331,11 +296,10 @@ mod tests {
         let mut iface = Interface::new(transport);
 
         let packet = make_packet([1u8; 16], 5);
-        let now = Instant::now();
-        iface.send(packet, 5, now);
+        iface.send(packet, 5);
 
         assert_eq!(sent.lock().unwrap().len(), 0);
-        iface.poll(now);
+        iface.poll();
         assert_eq!(sent.lock().unwrap().len(), 1);
     }
 
@@ -344,23 +308,23 @@ mod tests {
         let (transport, sent) = MockTransport::new(false);
         let mut iface = Interface::new(transport);
 
-        let now = Instant::now();
         let packet = make_packet([1u8; 16], 5);
-        iface.send(packet, 5, now);
+        iface.send(packet, 5);
 
-        iface.poll(now);
+        iface.poll();
 
         assert_eq!(sent.lock().unwrap().len(), 0);
         assert_eq!(iface.queue.len(), 1);
     }
 
     fn make_ifac_interface() -> (Interface<MockTransport>, Arc<Mutex<Vec<Vec<u8>>>>) {
-        use ed25519_dalek::SigningKey;
+        use rand::RngCore;
         use rand::SeedableRng;
         use rand::rngs::StdRng;
 
         let mut rng = StdRng::seed_from_u64(42);
-        let ifac_identity = SigningKey::generate(&mut rng);
+        let mut ifac_identity = [0u8; 32];
+        rng.fill_bytes(&mut ifac_identity);
         let ifac_key = vec![0xAB; 32];
 
         let (transport, sent) = MockTransport::new(true);
@@ -386,7 +350,7 @@ mod tests {
 
     #[test]
     fn ifac_wrong_key_rejected() {
-        use ed25519_dalek::SigningKey;
+        use rand::RngCore;
         use rand::SeedableRng;
         use rand::rngs::StdRng;
 
@@ -394,7 +358,8 @@ mod tests {
 
         // Create interface B with different key
         let mut rng = StdRng::seed_from_u64(99);
-        let ifac_identity_b = SigningKey::generate(&mut rng);
+        let mut ifac_identity_b = [0u8; 32];
+        rng.fill_bytes(&mut ifac_identity_b);
         let ifac_key_b = vec![0xCD; 32]; // different key
         let (transport_b, _) = MockTransport::new(true);
         let iface_b = Interface::new(transport_b).with_ifac(ifac_identity_b, ifac_key_b, 8);

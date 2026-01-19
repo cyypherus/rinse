@@ -23,10 +23,9 @@ mod async_io;
 pub mod config;
 
 pub use aspect::AspectHash;
-pub use handle::{Destination, NodeHandle, RequestError, RespondError, Service};
+pub use handle::{Destination, RequestError, RespondError, ServiceEvent, ServiceId};
 pub use identity::Identity;
 pub use interface::{Interface, Transport};
-pub use link::LinkId;
 pub use node::Node;
 pub use packet::Address;
 pub use request::RequestId;

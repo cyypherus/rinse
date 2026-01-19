@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["tcp", "tokio", "config", "relay"]
+default = []
 tcp = []
 tokio = ["dep:tokio", "dep:env_logger", "tcp"]
 config = ["dep:toml"]
@@ -50,3 +50,4 @@ path = "src/bin/request.rs"
 required-features = ["tokio"]
 
 [dev-dependencies]
+env_logger = "0.11"

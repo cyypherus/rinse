@@ -127,12 +127,7 @@ async fn handle_request(
     dir: &std::path::Path,
     req: rinse::IncomingRequest,
 ) {
-    log::info!(
-        "Request from {} path='{}' data_len={}",
-        hex::encode(&req.from[..4]),
-        req.path,
-        req.data.len()
-    );
+    log::info!("Request path='{}' data_len={}", req.path, req.data.len());
 
     let filename = req.path.trim_start_matches('/');
     let file_path = dir.join(filename);

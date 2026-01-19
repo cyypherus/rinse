@@ -4,6 +4,9 @@ use crate::aspect::AspectHash;
 use crate::packet::Address;
 use crate::request::RequestId;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ServiceId(pub(crate) usize);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestError {
     Timeout,
@@ -26,108 +29,26 @@ pub struct Destination {
     pub last_seen: Instant,
 }
 
-pub(crate) enum PendingAction {
-    SendRaw {
-        destination: Address,
-        data: Vec<u8>,
-    },
+pub enum ServiceEvent {
     Request {
-        destination: Address,
+        service: ServiceId,
+        request_id: RequestId,
         path: String,
         data: Vec<u8>,
     },
-    Respond {
-        request_id: RequestId,
-        data: Vec<u8>,
-    },
-    Announce {
-        app_data: Option<Vec<u8>>,
-    },
-}
-
-pub struct NodeHandle<'a> {
-    pub(crate) destinations: &'a [Destination],
-    pub(crate) pending: Vec<PendingAction>,
-}
-
-impl NodeHandle<'_> {
-    pub fn send_raw(&mut self, destination: Address, data: &[u8]) {
-        self.pending.push(PendingAction::SendRaw {
-            destination,
-            data: data.to_vec(),
-        });
-    }
-
-    pub fn request(&mut self, destination: Address, path: &str, data: &[u8]) {
-        self.pending.push(PendingAction::Request {
-            destination,
-            path: path.to_string(),
-            data: data.to_vec(),
-        });
-    }
-
-    pub fn announce(&mut self) {
-        self.pending
-            .push(PendingAction::Announce { app_data: None });
-    }
-
-    pub fn announce_with_app_data(&mut self, app_data: &[u8]) {
-        self.pending.push(PendingAction::Announce {
-            app_data: Some(app_data.to_vec()),
-        });
-    }
-
-    pub fn respond(&mut self, request_id: RequestId, data: &[u8]) {
-        self.pending.push(PendingAction::Respond {
-            request_id,
-            data: data.to_vec(),
-        });
-    }
-
-    pub fn destinations(&self) -> impl Iterator<Item = &Destination> {
-        self.destinations.iter()
-    }
-}
-
-pub trait Service {
-    fn name(&self) -> &str;
-
-    fn paths(&self) -> Vec<&str> {
-        vec![]
-    }
-
-    #[allow(unused_variables)]
-    fn on_raw(&mut self, handle: &mut NodeHandle, from: Address, data: &[u8]) {}
-
-    #[allow(unused_variables)]
-    fn on_request(
-        &mut self,
-        handle: &mut NodeHandle,
-        request_id: RequestId,
-        from: Address,
-        path: &str,
-        data: &[u8],
-    ) {
-    }
-
-    #[allow(unused_variables)]
-    fn on_request_result(
-        &mut self,
-        handle: &mut NodeHandle,
+    RequestResult {
+        service: ServiceId,
         request_id: RequestId,
         result: Result<(Address, Vec<u8>), RequestError>,
-    ) {
-    }
-
-    #[allow(unused_variables)]
-    fn on_respond_result(
-        &mut self,
-        handle: &mut NodeHandle,
+    },
+    RespondResult {
+        service: ServiceId,
         request_id: RequestId,
         result: Result<(), RespondError>,
-    ) {
-    }
-
-    #[allow(unused_variables)]
-    fn on_destinations_changed(&mut self, handle: &mut NodeHandle) {}
+    },
+    Raw {
+        service: ServiceId,
+        data: Vec<u8>,
+    },
+    DestinationsChanged,
 }

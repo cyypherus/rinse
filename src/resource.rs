@@ -6,6 +6,7 @@ use std::time::Instant;
 pub(crate) const MAPHASH_LEN: usize = 4;
 pub(crate) const HASHMAP_IS_NOT_EXHAUSTED: u8 = 0x00;
 pub(crate) const HASHMAP_IS_EXHAUSTED: u8 = 0xFF;
+pub(crate) const HASHMAP_MAX_LEN: usize = 74; // floor((Link.MDU - 134) / MAPHASH_LEN)
 
 const WINDOW_DEFAULT: usize = 4;
 const WINDOW_MIN: usize = 2;
@@ -151,17 +152,19 @@ impl OutboundResource {
         }
     }
 
-    pub fn hashmap_update(&mut self, max_len: usize) -> Option<Vec<u8>> {
+    pub fn hashmap_update(&mut self) -> Option<(usize, Vec<u8>)> {
         if self.hashmap_sent >= self.hashmap.len() {
             return None;
         }
-        let end = (self.hashmap_sent + max_len).min(self.hashmap.len());
-        let chunk: Vec<u8> = self.hashmap[self.hashmap_sent..end]
+        let segment = self.hashmap_sent / HASHMAP_MAX_LEN;
+        let start = segment * HASHMAP_MAX_LEN;
+        let end = ((segment + 1) * HASHMAP_MAX_LEN).min(self.hashmap.len());
+        let chunk: Vec<u8> = self.hashmap[start..end]
             .iter()
             .flat_map(|h| h.iter().copied())
             .collect();
         self.hashmap_sent = end;
-        Some(chunk)
+        Some((segment, chunk))
     }
 
     pub fn mark_transferring(&mut self) {
@@ -181,7 +184,7 @@ pub(crate) struct InboundResource {
     pub is_response: bool,
     pub request_id: Option<Vec<u8>>,
     num_parts: usize,
-    hashmap: Vec<[u8; MAPHASH_LEN]>,
+    hashmap: Vec<Option<[u8; MAPHASH_LEN]>>,
     hashmap_height: usize,
     parts: Vec<Option<Vec<u8>>>,
     requested: Vec<bool>,
@@ -211,10 +214,10 @@ impl InboundResource {
 
         let hashmap_height = received_hashes.len();
 
-        let mut hashmap = vec![[0u8; MAPHASH_LEN]; adv.num_parts];
+        let mut hashmap: Vec<Option<[u8; MAPHASH_LEN]>> = vec![None; adv.num_parts];
         for (i, hash) in received_hashes.iter().enumerate() {
             if i < hashmap.len() {
-                hashmap[i] = *hash;
+                hashmap[i] = Some(*hash);
             }
         }
 
@@ -257,15 +260,15 @@ impl InboundResource {
     pub fn receive_part(&mut self, data: Vec<u8>) -> bool {
         let part_hash = self.get_map_hash(&data);
 
-        let search_start = if self.consecutive_completed_height >= 0 {
-            self.consecutive_completed_height as usize
-        } else {
-            0
-        };
+        // Must align with needed_hashes() which uses cch+1 as start
+        let search_start = (self.consecutive_completed_height + 1) as usize;
         let search_end = (search_start + self.window).min(self.hashmap_height);
 
         for i in search_start..search_end {
-            if i < self.hashmap.len() && self.hashmap[i] == part_hash && self.parts[i].is_none() {
+            if i < self.hashmap.len()
+                && self.hashmap[i] == Some(part_hash)
+                && self.parts[i].is_none()
+            {
                 self.bytes_received += data.len();
                 self.parts[i] = Some(data);
                 self.received_count += 1;
@@ -286,22 +289,39 @@ impl InboundResource {
                 return true;
             }
         }
+
         false
     }
 
-    pub fn receive_hashmap_update(&mut self, data: &[u8]) {
+    pub fn receive_hashmap_update(&mut self, start_index: usize, data: &[u8]) {
         let new_hashes: Vec<[u8; MAPHASH_LEN]> = data
             .chunks_exact(MAPHASH_LEN)
             .map(|c| [c[0], c[1], c[2], c[3]])
             .collect();
 
+        log::debug!(
+            "HMU: received {} hashes at start_index={}, current height={}",
+            new_hashes.len(),
+            start_index,
+            self.hashmap_height
+        );
+
+        // Write hashes at the specified start index
         for (i, hash) in new_hashes.iter().enumerate() {
-            let idx = self.hashmap_height + i;
+            let idx = start_index + i;
             if idx < self.hashmap.len() {
-                self.hashmap[idx] = *hash;
+                self.hashmap[idx] = Some(*hash);
             }
         }
-        self.hashmap_height += new_hashes.len();
+
+        // Recalculate hashmap_height: highest contiguous filled index
+        // This makes HMU order-independent - same end state regardless of arrival order
+        while self.hashmap_height < self.hashmap.len()
+            && self.hashmap[self.hashmap_height].is_some()
+        {
+            self.hashmap_height += 1;
+        }
+
         self.waiting_for_hmu = false;
     }
 
@@ -318,8 +338,9 @@ impl InboundResource {
                 continue;
             }
 
-            if i < self.hashmap_height {
-                needed.push(self.hashmap[i]);
+            // Check if we have the hash for this part (like Python's `if part_hash != None`)
+            if let Some(hash) = self.hashmap[i] {
+                needed.push(hash);
                 self.requested[i] = true;
                 self.outstanding_parts += 1;
             } else {
@@ -341,7 +362,7 @@ impl InboundResource {
 
     pub fn last_hashmap_hash(&self) -> Option<[u8; MAPHASH_LEN]> {
         if self.hashmap_height > 0 {
-            Some(self.hashmap[self.hashmap_height - 1])
+            self.hashmap[self.hashmap_height - 1]
         } else {
             None
         }
@@ -380,12 +401,6 @@ impl InboundResource {
             .filter_map(|p| p.as_ref())
             .flat_map(|p| p.iter().copied())
             .collect();
-
-        log::debug!(
-            "Assembling resource: {} parts, {} encrypted bytes",
-            self.parts.len(),
-            encrypted.len()
-        );
 
         let plaintext = match link.decrypt(&encrypted) {
             Some(p) => p,
@@ -747,5 +762,61 @@ mod tests {
         assert_eq!(decoded.is_response, adv.is_response);
         assert_eq!(decoded.has_metadata, adv.has_metadata);
         assert_eq!(decoded.request_id, adv.request_id);
+    }
+
+    #[test]
+    fn out_of_order_hashmap_updates() {
+        let adv = ResourceAdvertisement {
+            transfer_size: 50000,
+            data_size: 49000,
+            num_parts: 200,
+            hash: [1u8; 32],
+            random_hash: [2u8; 4],
+            original_hash: [3u8; 32],
+            segment_index: 1,
+            total_segments: 1,
+            hashmap: vec![0xAA; HASHMAP_MAX_LEN * MAPHASH_LEN], // segment 0
+            compressed: false,
+            split: false,
+            is_request: false,
+            is_response: false,
+            has_metadata: false,
+            request_id: None,
+        };
+
+        let mut resource = InboundResource::from_advertisement(&adv);
+        assert_eq!(resource.hashmap_height, HASHMAP_MAX_LEN);
+
+        // Segment 2 arrives before segment 1 (out of order)
+        let segment2_start = 2 * HASHMAP_MAX_LEN;
+        let segment2_hashes: Vec<u8> = vec![0xCC; 52 * MAPHASH_LEN]; // 52 hashes for segment 2
+        resource.receive_hashmap_update(segment2_start, &segment2_hashes);
+
+        // hashmap_height should NOT advance - there's a gap at segment 1
+        assert_eq!(
+            resource.hashmap_height, HASHMAP_MAX_LEN,
+            "hashmap_height should stay at {} when segment 1 is missing",
+            HASHMAP_MAX_LEN
+        );
+
+        // Verify segment 2 hashes are stored correctly
+        assert_eq!(resource.hashmap[segment2_start], Some([0xCC; 4]));
+
+        // Now segment 1 arrives
+        let segment1_start = HASHMAP_MAX_LEN;
+        let segment1_hashes: Vec<u8> = vec![0xBB; HASHMAP_MAX_LEN * MAPHASH_LEN];
+        resource.receive_hashmap_update(segment1_start, &segment1_hashes);
+
+        // Now hashmap_height should jump to include both segments
+        assert_eq!(
+            resource.hashmap_height,
+            200, // all parts now have hashes
+            "hashmap_height should advance to cover all segments"
+        );
+
+        // Verify all hashes are in correct positions
+        assert_eq!(resource.hashmap[0], Some([0xAA; 4])); // segment 0
+        assert_eq!(resource.hashmap[HASHMAP_MAX_LEN], Some([0xBB; 4])); // segment 1
+        assert_eq!(resource.hashmap[segment2_start], Some([0xCC; 4])); // segment 2
     }
 }

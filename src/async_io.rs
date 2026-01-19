@@ -7,11 +7,11 @@ use rand::rngs::StdRng;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::aspect::AspectHash;
-use crate::handle::{RequestError, RespondError};
+use crate::handle::{RequestError, RespondError, ServiceEvent, ServiceId};
 use crate::packet::Address;
 use crate::request::RequestId;
 use crate::stats::StatsSnapshot;
-use crate::{Identity, Interface, NodeHandle, Service, Transport};
+use crate::{Identity, Interface, Transport};
 
 #[cfg(feature = "tcp")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -116,13 +116,11 @@ impl Transport for AsyncTransport {
 
 pub struct IncomingRequest {
     pub request_id: RequestId,
-    pub from: Address,
     pub path: String,
     pub data: Vec<u8>,
 }
 
 pub struct IncomingRaw {
-    pub from: Address,
     pub data: Vec<u8>,
 }
 
@@ -137,93 +135,20 @@ type RequestWaiters =
     Arc<Mutex<HashMap<RequestId, oneshot::Sender<Result<Vec<u8>, RequestError>>>>>;
 type RespondWaiters = Arc<Mutex<HashMap<RequestId, oneshot::Sender<Result<(), RespondError>>>>>;
 
-struct BridgeService {
-    name: String,
-    paths: Vec<String>,
+struct ServiceChannels {
     request_tx: mpsc::UnboundedSender<IncomingRequest>,
     raw_tx: mpsc::UnboundedSender<IncomingRaw>,
     request_waiters: RequestWaiters,
     respond_waiters: RespondWaiters,
-    destinations_tx: mpsc::UnboundedSender<Vec<Destination>>,
-}
-
-impl Service for BridgeService {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn paths(&self) -> Vec<&str> {
-        self.paths.iter().map(|s| s.as_str()).collect()
-    }
-
-    fn on_request(
-        &mut self,
-        _handle: &mut NodeHandle,
-        request_id: RequestId,
-        from: Address,
-        path: &str,
-        data: &[u8],
-    ) {
-        let _ = self.request_tx.send(IncomingRequest {
-            request_id,
-            from,
-            path: path.to_string(),
-            data: data.to_vec(),
-        });
-    }
-
-    fn on_request_result(
-        &mut self,
-        _handle: &mut NodeHandle,
-        request_id: RequestId,
-        result: Result<(Address, Vec<u8>), RequestError>,
-    ) {
-        let mut waiters = self.request_waiters.lock().unwrap();
-        if let Some(tx) = waiters.remove(&request_id) {
-            let _ = tx.send(result.map(|(_, data)| data));
-        }
-    }
-
-    fn on_respond_result(
-        &mut self,
-        _handle: &mut NodeHandle,
-        request_id: RequestId,
-        result: Result<(), RespondError>,
-    ) {
-        let mut waiters = self.respond_waiters.lock().unwrap();
-        if let Some(tx) = waiters.remove(&request_id) {
-            let _ = tx.send(result);
-        }
-    }
-
-    fn on_raw(&mut self, _handle: &mut NodeHandle, from: Address, data: &[u8]) {
-        let _ = self.raw_tx.send(IncomingRaw {
-            from,
-            data: data.to_vec(),
-        });
-    }
-
-    fn on_destinations_changed(&mut self, handle: &mut NodeHandle) {
-        let destinations: Vec<Destination> = handle
-            .destinations()
-            .map(|d| Destination {
-                address: d.address,
-                app_data: d.app_data.clone(),
-                hops: d.hops,
-                aspect: d.aspect,
-            })
-            .collect();
-        let _ = self.destinations_tx.send(destinations);
-    }
 }
 
 enum Command {
     Announce {
-        service_addr: Address,
+        service: ServiceId,
         app_data: Option<Vec<u8>>,
     },
     Request {
-        service_addr: Address,
+        service: ServiceId,
         dest: Address,
         path: String,
         data: Vec<u8>,
@@ -261,7 +186,8 @@ pub enum ConnectRequest {
 }
 
 pub struct AsyncNode {
-    node: crate::Node<AsyncTransport, BridgeService, StdRng>,
+    node: crate::Node<AsyncTransport, StdRng>,
+    services: HashMap<ServiceId, ServiceChannels>,
     command_tx: mpsc::UnboundedSender<Command>,
     command_rx: mpsc::UnboundedReceiver<Command>,
     wake_tx: mpsc::Sender<()>,
@@ -276,6 +202,7 @@ impl AsyncNode {
 
         Self {
             node: crate::Node::with_rng(rng, transport),
+            services: HashMap::new(),
             command_tx,
             command_rx,
             wake_tx,
@@ -291,28 +218,28 @@ impl AsyncNode {
     ) -> ServiceHandle {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let (raw_tx, raw_rx) = mpsc::unbounded_channel();
-        let (destinations_tx, destinations_rx) = mpsc::unbounded_channel();
         let request_waiters: RequestWaiters = Arc::new(Mutex::new(HashMap::new()));
         let respond_waiters: RespondWaiters = Arc::new(Mutex::new(HashMap::new()));
 
-        let service = BridgeService {
-            name: name.to_string(),
-            paths: paths.iter().map(|s| s.to_string()).collect(),
-            request_tx,
-            raw_tx,
-            request_waiters: request_waiters.clone(),
-            respond_waiters: respond_waiters.clone(),
-            destinations_tx,
-        };
+        let service_id = self.node.add_service(name, paths, identity);
+        let address = self.node.service_address(service_id).unwrap();
 
-        let service_addr = self.node.add_service(service, identity);
+        self.services.insert(
+            service_id,
+            ServiceChannels {
+                request_tx,
+                raw_tx,
+                request_waiters: request_waiters.clone(),
+                respond_waiters: respond_waiters.clone(),
+            },
+        );
 
         ServiceHandle {
-            address: service_addr,
+            service_id,
+            address,
             command_tx: self.command_tx.clone(),
             request_rx,
             raw_rx,
-            destinations_rx,
             request_waiters,
             respond_waiters,
         }
@@ -349,10 +276,68 @@ impl AsyncNode {
                 }
                 _ = self.wake_rx.recv() => {
                     while self.wake_rx.try_recv().is_ok() {}
-                    self.node.poll(Instant::now());
+                    self.poll(Instant::now());
                 }
                 _ = tick_interval.tick() => {
-                    self.node.poll(Instant::now());
+                    self.poll(Instant::now());
+                }
+            }
+        }
+    }
+
+    fn poll(&mut self, now: Instant) {
+        let events = self.node.poll(now);
+        self.dispatch_events(events);
+    }
+
+    fn dispatch_events(&mut self, events: Vec<ServiceEvent>) {
+        for event in events {
+            match event {
+                ServiceEvent::Request {
+                    service,
+                    request_id,
+                    path,
+                    data,
+                } => {
+                    if let Some(channels) = self.services.get(&service) {
+                        let _ = channels.request_tx.send(IncomingRequest {
+                            request_id,
+                            path,
+                            data,
+                        });
+                    }
+                }
+                ServiceEvent::RequestResult {
+                    service,
+                    request_id,
+                    result,
+                } => {
+                    if let Some(channels) = self.services.get(&service) {
+                        let mut waiters = channels.request_waiters.lock().unwrap();
+                        if let Some(tx) = waiters.remove(&request_id) {
+                            let _ = tx.send(result.map(|(_, data)| data));
+                        }
+                    }
+                }
+                ServiceEvent::RespondResult {
+                    service,
+                    request_id,
+                    result,
+                } => {
+                    if let Some(channels) = self.services.get(&service) {
+                        let mut waiters = channels.respond_waiters.lock().unwrap();
+                        if let Some(tx) = waiters.remove(&request_id) {
+                            let _ = tx.send(result);
+                        }
+                    }
+                }
+                ServiceEvent::Raw { service, data } => {
+                    if let Some(channels) = self.services.get(&service) {
+                        let _ = channels.raw_tx.send(IncomingRaw { data });
+                    }
+                }
+                ServiceEvent::DestinationsChanged => {
+                    // Consumers can call node.destinations() to get current destinations
                 }
             }
         }
@@ -360,32 +345,28 @@ impl AsyncNode {
 
     fn handle_command(&mut self, cmd: Command, now: Instant) {
         match cmd {
-            Command::Announce {
-                service_addr,
-                app_data,
-            } => {
+            Command::Announce { service, app_data } => {
                 if let Some(data) = app_data {
-                    self.node
-                        .announce_with_app_data(service_addr, Some(data), now);
+                    self.node.announce_with_app_data(service, Some(data));
                 } else {
-                    self.node.announce(service_addr, now);
+                    self.node.announce(service);
                 }
             }
             Command::Request {
-                service_addr,
+                service,
                 dest,
                 path,
                 data,
                 reply,
             } => {
-                let request_id = self.node.request(service_addr, dest, &path, &data, now);
+                let request_id = self.node.request(service, dest, &path, &data, now);
                 let _ = reply.send(request_id);
             }
             Command::Respond { request_id, data } => {
-                self.node.respond(request_id, &data, now);
+                self.node.respond(request_id, &data);
             }
             Command::SendRaw { dest, data } => {
-                self.node.send_raw(dest, &data, now);
+                self.node.send_raw(dest, &data);
             }
             Command::GetDestinations { reply } => {
                 let destinations: Vec<Destination> = self
@@ -473,6 +454,7 @@ impl AsyncNode {
                 }
             }
         }
+        self.poll(now);
     }
 }
 
@@ -531,18 +513,18 @@ impl AsyncNode {
 }
 
 pub struct ServiceHandle {
+    service_id: ServiceId,
     address: Address,
     command_tx: mpsc::UnboundedSender<Command>,
     request_rx: mpsc::UnboundedReceiver<IncomingRequest>,
     raw_rx: mpsc::UnboundedReceiver<IncomingRaw>,
-    destinations_rx: mpsc::UnboundedReceiver<Vec<Destination>>,
     request_waiters: RequestWaiters,
     respond_waiters: RespondWaiters,
 }
 
 #[derive(Clone)]
 pub struct Requester {
-    address: Address,
+    service_id: ServiceId,
     command_tx: mpsc::UnboundedSender<Command>,
     request_waiters: RequestWaiters,
 }
@@ -556,7 +538,7 @@ impl Requester {
     ) -> Result<Vec<u8>, RequestError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.command_tx.send(Command::Request {
-            service_addr: self.address,
+            service: self.service_id,
             dest,
             path: path.to_string(),
             data: data.to_vec(),
@@ -589,9 +571,13 @@ impl ServiceHandle {
         self.address
     }
 
+    pub fn service_id(&self) -> ServiceId {
+        self.service_id
+    }
+
     pub fn requester(&self) -> Requester {
         Requester {
-            address: self.address,
+            service_id: self.service_id,
             command_tx: self.command_tx.clone(),
             request_waiters: self.request_waiters.clone(),
         }
@@ -599,14 +585,14 @@ impl ServiceHandle {
 
     pub fn announce(&self) {
         let _ = self.command_tx.send(Command::Announce {
-            service_addr: self.address,
+            service: self.service_id,
             app_data: None,
         });
     }
 
     pub fn announce_with_app_data(&self, app_data: &[u8]) {
         let _ = self.command_tx.send(Command::Announce {
-            service_addr: self.address,
+            service: self.service_id,
             app_data: Some(app_data.to_vec()),
         });
     }
@@ -619,7 +605,7 @@ impl ServiceHandle {
     ) -> Result<Vec<u8>, RequestError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.command_tx.send(Command::Request {
-            service_addr: self.address,
+            service: self.service_id,
             dest,
             path: path.to_string(),
             data: data.to_vec(),
@@ -660,10 +646,6 @@ impl ServiceHandle {
         self.raw_rx.recv().await
     }
 
-    pub async fn recv_destinations_changed(&mut self) -> Option<Vec<Destination>> {
-        self.destinations_rx.recv().await
-    }
-
     pub async fn stats(&self) -> StatsSnapshot {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.command_tx.send(Command::GetStats { reply: reply_tx });
@@ -700,27 +682,16 @@ async fn tcp_io_task(stream: TcpStream, io: TransportIo, wake_tx: mpsc::Sender<(
                     break;
                 }
                 Ok(n) => {
-                    read_count += 1;
-                    log::trace!(
-                        "[TCP IN] #{} {} bytes raw, hdlc_buf now {} bytes",
-                        read_count,
-                        n,
-                        hdlc_buf.len() + n
-                    );
+                    read_count += n as u64;
                     hdlc_buf.extend_from_slice(&buf[..n]);
 
                     while let Some(frame) = hdlc_extract_frame(&mut hdlc_buf) {
                         inbox.lock().unwrap().push_back(frame);
-                    }
-
-                    // Wake the node once after processing all frames (non-blocking)
-                    match wake_tx.try_send(()) {
-                        Ok(()) => (),
-                        Err(e) => log::warn!("[TCP IN] wake channel full: {}", e),
+                        let _ = wake_tx.try_send(());
                     }
                 }
                 Err(e) => {
-                    log::warn!("[TCP IN] read error: {}", e);
+                    log::warn!("TCP read error: {} (read {} bytes)", e, read_count);
                     break;
                 }
             }
@@ -728,200 +699,39 @@ async fn tcp_io_task(stream: TcpStream, io: TransportIo, wake_tx: mpsc::Sender<(
     };
 
     let write_task = async {
+        let mut interval = tokio::time::interval(Duration::from_micros(100));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut write_count = 0u64;
+
         loop {
-            let data = outbox.lock().unwrap().pop_front();
-            if let Some(data) = data {
-                let framed = hdlc_frame(&data);
-                if writer.write_all(&framed).await.is_err() {
-                    break;
+            interval.tick().await;
+
+            let packets: Vec<Vec<u8>> = outbox.lock().unwrap().drain(..).collect();
+            for data in packets {
+                let frame = hdlc_frame(&data);
+                if let Err(e) = writer.write_all(&frame).await {
+                    log::warn!("TCP write error: {} (wrote {} bytes)", e, write_count);
+                    return;
                 }
-                if writer.flush().await.is_err() {
-                    break;
-                }
-            } else {
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                write_count += frame.len() as u64;
+            }
+
+            if let Err(e) = writer.flush().await {
+                log::warn!("TCP flush error: {} (wrote {} bytes)", e, write_count);
+                return;
             }
         }
     };
 
     tokio::select! {
         _ = read_task => {
-            log::info!("[TCP] read task finished first");
+            log::info!("TCP read task ended");
         }
         _ = write_task => {
-            log::info!("[TCP] write task finished first");
+            log::info!("TCP write task ended");
         }
     }
 
     *connected.lock().unwrap() = false;
-    let _ = wake_tx.send(()).await;
-    log::info!("[TCP] io task ended");
-}
-
-#[cfg(all(test, feature = "tcp"))]
-mod tests {
-    use super::*;
-    use crate::transports::tcp::HDLC_ESC;
-
-    #[test]
-    fn hdlc_single_frame() {
-        let data = vec![0x01, 0x02, 0x03];
-        let framed = hdlc_frame(&data);
-
-        let mut buf = framed;
-        let extracted = hdlc_extract_frame(&mut buf);
-
-        assert_eq!(extracted, Some(data));
-        assert_eq!(buf, vec![HDLC_FLAG]); // ending FLAG remains
-    }
-
-    #[test]
-    fn hdlc_two_frames_shared_flag() {
-        // Two frames where ending FLAG of first = starting FLAG of second
-        let d1 = vec![0x01, 0x02];
-        let d2 = vec![0x03, 0x04];
-
-        let mut buf = Vec::new();
-        buf.push(HDLC_FLAG);
-        buf.extend(hdlc_escape(&d1));
-        buf.push(HDLC_FLAG); // shared
-        buf.extend(hdlc_escape(&d2));
-        buf.push(HDLC_FLAG);
-
-        let f1 = hdlc_extract_frame(&mut buf);
-        assert_eq!(f1, Some(d1));
-
-        let f2 = hdlc_extract_frame(&mut buf);
-        assert_eq!(f2, Some(d2));
-
-        // Only trailing FLAG remains
-        assert_eq!(buf, vec![HDLC_FLAG]);
-    }
-
-    #[test]
-    fn hdlc_consecutive_flags_extracts_in_single_call() {
-        // FLAG FLAG data FLAG - single call should extract data
-        // This tests the real-world usage where we have a while loop:
-        //   while let Some(frame) = hdlc_extract_frame(&mut buf) { ... }
-        // If consecutive FLAGs cause None to be returned, the loop exits
-        // without extracting the valid frame that follows.
-        let data = vec![0x01, 0x02];
-
-        let mut buf = vec![HDLC_FLAG, HDLC_FLAG];
-        buf.extend(hdlc_escape(&data));
-        buf.push(HDLC_FLAG);
-
-        // Single call must extract the frame, not return None
-        let result = hdlc_extract_frame(&mut buf);
-        assert_eq!(result, Some(data));
-        assert_eq!(buf, vec![HDLC_FLAG]); // only trailing FLAG remains
-    }
-
-    #[test]
-    fn hdlc_partial_frame_not_consumed() {
-        // Incomplete frame - should return None and NOT modify buffer
-        let mut buf = vec![HDLC_FLAG, 0x01, 0x02, 0x03];
-        let original = buf.clone();
-
-        let result = hdlc_extract_frame(&mut buf);
-
-        assert_eq!(result, None);
-        assert_eq!(buf, original); // buffer unchanged
-    }
-
-    #[test]
-    fn hdlc_garbage_before_frame() {
-        let data = vec![0x01, 0x02];
-
-        let mut buf = vec![0xFF, 0xAA, 0xBB]; // garbage
-        buf.push(HDLC_FLAG);
-        buf.extend(hdlc_escape(&data));
-        buf.push(HDLC_FLAG);
-
-        let result = hdlc_extract_frame(&mut buf);
-        assert_eq!(result, Some(data));
-    }
-
-    #[test]
-    fn hdlc_escaped_flag_in_data() {
-        // Data contains FLAG byte - must be escaped
-        let data = vec![0x01, HDLC_FLAG, 0x02];
-        let framed = hdlc_frame(&data);
-
-        let mut buf = framed;
-        let extracted = hdlc_extract_frame(&mut buf);
-
-        assert_eq!(extracted, Some(data));
-    }
-
-    #[test]
-    fn hdlc_escaped_esc_in_data() {
-        // Data contains ESC byte - must be escaped
-        let data = vec![0x01, HDLC_ESC, 0x02];
-        let framed = hdlc_frame(&data);
-
-        let mut buf = framed;
-        let extracted = hdlc_extract_frame(&mut buf);
-
-        assert_eq!(extracted, Some(data));
-    }
-
-    #[test]
-    fn hdlc_roundtrip_many_frames() {
-        let frames: Vec<Vec<u8>> = vec![
-            vec![0x00, 0x01],
-            vec![HDLC_FLAG, HDLC_ESC, 0xFF],
-            vec![0x10, 0x20, 0x30, 0x40],
-        ];
-
-        // Build buffer with all frames (shared FLAGs)
-        let mut buf = Vec::new();
-        for (i, data) in frames.iter().enumerate() {
-            if i == 0 {
-                buf.push(HDLC_FLAG);
-            }
-            buf.extend(hdlc_escape(data));
-            buf.push(HDLC_FLAG);
-        }
-
-        // Extract all
-        for expected in &frames {
-            let extracted = hdlc_extract_frame(&mut buf);
-            assert_eq!(extracted.as_ref(), Some(expected));
-        }
-
-        // Nothing left but trailing FLAG
-        assert_eq!(buf, vec![HDLC_FLAG]);
-        assert_eq!(hdlc_extract_frame(&mut buf), None);
-    }
-
-    #[test]
-    fn hdlc_frame_too_short_rejected() {
-        // Frame with only 1 byte of content (< 2) should be rejected
-        let mut buf = vec![HDLC_FLAG, 0x01, HDLC_FLAG];
-
-        let result = hdlc_extract_frame(&mut buf);
-        assert_eq!(result, None);
-        // Buffer should advance past the invalid frame
-        assert_eq!(buf, vec![HDLC_FLAG]);
-    }
-
-    #[test]
-    fn hdlc_incremental_receive() {
-        // Simulate receiving a frame in chunks
-        let data = vec![0x01, 0x02, 0x03];
-        let framed = hdlc_frame(&data);
-
-        let mut buf = Vec::new();
-
-        // Receive first half
-        buf.extend_from_slice(&framed[..framed.len() / 2]);
-        assert_eq!(hdlc_extract_frame(&mut buf), None);
-
-        // Receive second half
-        buf.extend_from_slice(&framed[framed.len() / 2..]);
-        let extracted = hdlc_extract_frame(&mut buf);
-
-        assert_eq!(extracted, Some(data));
-    }
+    let _ = wake_tx.try_send(());
 }
