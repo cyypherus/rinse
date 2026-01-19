@@ -1076,6 +1076,7 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
         // General transport handling. Takes care of directing packets according
         // to transport tables and recording entries in reverse and link tables.
+        let mut relayed_via_link_table = false;
         if self.transport || for_local_service || for_local_link {
             // TODO missing cache request handling
 
@@ -1203,9 +1204,15 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                         self.stats.link_packets_relayed += 1;
                         iface.send(packet.clone(), 0, now);
                         link_entry.timestamp = now;
+                        relayed_via_link_table = true;
                     }
                 }
             }
+        }
+
+        // Skip local processing for packets that were relayed via link_table
+        if relayed_via_link_table && !for_local_link {
+            return Some((packet, for_local_service, for_local_link));
         }
 
         match packet.clone() {

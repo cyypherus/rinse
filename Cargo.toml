@@ -44,4 +44,9 @@ name = "rinse-relay"
 path = "src/bin/relay.rs"
 required-features = ["relay"]
 
+[[bin]]
+name = "rinse-request"
+path = "src/bin/request.rs"
+required-features = ["tokio"]
+
 [dev-dependencies]

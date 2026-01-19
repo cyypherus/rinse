@@ -35,6 +35,6 @@ pub use stats::StatsSnapshot;
 
 #[cfg(feature = "tokio")]
 pub use async_io::{
-    AsyncNode, AsyncTransport, Destination as AsyncDestination, IncomingRaw, IncomingRequest,
-    Requester, ServiceHandle,
+    AsyncNode, AsyncTransport, ConnectRequest, Destination as AsyncDestination, IncomingRaw,
+    IncomingRequest, Requester, ServiceHandle,
 };

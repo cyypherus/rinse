@@ -138,8 +138,8 @@ impl TuiLogger {
 }
 
 impl log::Log for TuiLogger {
-    fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::Level::Debug
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
     }
 
     fn log(&self, record: &log::Record) {
@@ -165,7 +165,7 @@ impl log::Log for TuiLogger {
 
 impl SharedLogger for TuiLogger {
     fn level(&self) -> LevelFilter {
-        LevelFilter::Debug
+        LevelFilter::Off
     }
 
     fn config(&self) -> Option<&LogConfig> {
@@ -645,7 +645,7 @@ async fn main() {
     let tui_logger = TuiLogger::new(log_buffer.clone(), file_logger);
 
     log::set_boxed_logger(Box::new(tui_logger)).expect("failed to set logger");
-    log::set_max_level(LevelFilter::Debug);
+    log::set_max_level(LevelFilter::Trace);
 
     let config = Config::load().expect("failed to load config");
     let identity = load_or_generate_identity().expect("failed to load identity");

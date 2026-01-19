@@ -246,6 +246,18 @@ enum Command {
     AddInterface {
         interface: Box<Interface<AsyncTransport>>,
     },
+    Connect {
+        request: ConnectRequest,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum ConnectRequest {
+    #[cfg(feature = "tcp")]
+    TcpClient { addr: String },
+    #[cfg(feature = "tcp")]
+    TcpServer { addr: String },
 }
 
 pub struct AsyncNode {
@@ -396,6 +408,70 @@ impl AsyncNode {
                 log::info!("[ASYNC] adding interface via command");
                 self.node.add_interface(*interface);
             }
+            Command::Connect { request, reply } => {
+                let command_tx = self.command_tx.clone();
+                let wake_tx = self.wake_tx.clone();
+                match request {
+                    #[cfg(feature = "tcp")]
+                    ConnectRequest::TcpClient { addr } => {
+                        log::info!("[ASYNC] tcp client connect to {}", addr);
+                        tokio::spawn(async move {
+                            match TcpStream::connect(&addr).await {
+                                Ok(stream) => {
+                                    log::info!("[ASYNC] connected to {}", addr);
+                                    if let Err(e) = stream.set_nodelay(true) {
+                                        log::warn!("Failed to set TCP_NODELAY: {}", e);
+                                    }
+                                    let (transport, io) = AsyncTransport::new();
+                                    let interface = Box::new(Interface::new(transport));
+                                    let _ = command_tx.send(Command::AddInterface { interface });
+                                    tokio::spawn(tcp_io_task(stream, io, wake_tx));
+                                    let _ = reply.send(Ok(()));
+                                }
+                                Err(e) => {
+                                    log::warn!("[ASYNC] failed to connect to {}: {}", addr, e);
+                                    let _ = reply.send(Err(e.to_string()));
+                                }
+                            }
+                        });
+                    }
+                    #[cfg(feature = "tcp")]
+                    ConnectRequest::TcpServer { addr } => {
+                        log::info!("[ASYNC] tcp server listen on {}", addr);
+                        tokio::spawn(async move {
+                            match tokio::net::TcpListener::bind(&addr).await {
+                                Ok(listener) => {
+                                    log::info!("[ASYNC] listening on {}", addr);
+                                    let _ = reply.send(Ok(()));
+                                    loop {
+                                        match listener.accept().await {
+                                            Ok((stream, peer)) => {
+                                                log::info!("Accepted connection from {}", peer);
+                                                if let Err(e) = stream.set_nodelay(true) {
+                                                    log::warn!("Failed to set TCP_NODELAY: {}", e);
+                                                }
+                                                let (transport, io) = AsyncTransport::new();
+                                                let interface = Box::new(Interface::new(transport));
+                                                let _ = command_tx
+                                                    .send(Command::AddInterface { interface });
+                                                let wake = wake_tx.clone();
+                                                tokio::spawn(tcp_io_task(stream, io, wake));
+                                            }
+                                            Err(e) => {
+                                                log::warn!("Accept error: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("[ASYNC] failed to listen on {}: {}", addr, e);
+                                    let _ = reply.send(Err(e.to_string()));
+                                }
+                            }
+                        });
+                    }
+                }
+            }
         }
     }
 }
@@ -497,6 +573,15 @@ impl Requester {
 
         waiter_rx.await.unwrap_or(Err(RequestError::LinkFailed))
     }
+
+    pub async fn connect(&self, request: ConnectRequest) -> Result<(), String> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::Connect {
+            request,
+            reply: reply_tx,
+        });
+        reply_rx.await.unwrap_or(Err("channel closed".into()))
+    }
 }
 
 impl ServiceHandle {
@@ -583,6 +668,15 @@ impl ServiceHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.command_tx.send(Command::GetStats { reply: reply_tx });
         reply_rx.await.unwrap_or_default()
+    }
+
+    pub async fn connect(&self, request: ConnectRequest) -> Result<(), String> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::Connect {
+            request,
+            reply: reply_tx,
+        });
+        reply_rx.await.unwrap_or(Err("channel closed".into()))
     }
 }
 
