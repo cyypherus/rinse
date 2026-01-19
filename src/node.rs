@@ -979,10 +979,13 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
 
         // PathRequest handling
         if let Packet::PathRequest {
-            query_destination, ..
+            query_destination,
+            tag,
+            ..
         } = &packet
         {
             let query_dest = *query_destination;
+            let request_tag = *tag;
 
             // Check if destination is local (one of our services)
             let local_service = self.services.iter().find(|s| s.address == query_dest);
@@ -1050,13 +1053,22 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                 self.discovery_path_requests
                     .insert(query_dest, interface_index);
 
+                // Create a NEW PathRequest with hops=0 (not forward the existing one).
+                // PathRequests are PLAIN packets which get dropped if hops > 1.
+                // We preserve the tag to prevent loops in the network.
+                let new_packet = Packet::PathRequest {
+                    hops: 0,
+                    query_destination: query_dest,
+                    requesting_transport: Some(self.transport_id),
+                    tag: request_tag,
+                };
+
                 // Forward path request on all other interfaces
-                let packet_len = raw.len();
                 for (i, iface) in self.interfaces.iter_mut().enumerate() {
                     if i != interface_index {
                         self.stats.packets_relayed += 1;
-                        self.stats.bytes_relayed += packet_len as u64;
-                        iface.send(packet.clone(), 0, now);
+                        self.stats.bytes_relayed += new_packet.to_bytes().len() as u64;
+                        iface.send(new_packet.clone(), 0, now);
                     }
                 }
             }
@@ -1091,6 +1103,13 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
                     if let Packet::LinkRequest { data, .. } = &packet {
                         let link_id =
                             LinkRequest::link_id_from_packet(&packet.hashable_part(), data.len());
+                        log::debug!(
+                            "Adding link_table entry for transported LinkRequest: link_id=<{}> dest=<{}> recv_iface={} next_hop_iface={}",
+                            hex::encode(link_id),
+                            hex::encode(dest),
+                            interface_index,
+                            outbound_interface
+                        );
                         self.link_table.insert(
                             link_id,
                             LinkTableEntry {
@@ -1126,6 +1145,19 @@ impl<T: Transport, S: Service, R: RngCore> Node<T, S, R> {
             }
 
             // Link transport handling. Directs packets according to entries in the link tables
+            if !matches!(packet, Packet::Announce { .. })
+                && !matches!(packet, Packet::LinkRequest { .. })
+                && !matches!(packet, Packet::LinkProof { .. })
+            {
+                let found = self.link_table.contains_key(&link_id);
+                if !found && matches!(packet, Packet::LinkData { .. }) {
+                    log::debug!(
+                        "LinkData for link <{}> not in link_table, known links: {:?}",
+                        hex::encode(link_id),
+                        self.link_table.keys().map(hex::encode).collect::<Vec<_>>()
+                    );
+                }
+            }
             if !matches!(packet, Packet::Announce { .. })
                 && !matches!(packet, Packet::LinkRequest { .. })
                 && !matches!(packet, Packet::LinkProof { .. })
@@ -3890,7 +3922,6 @@ mod tests {
 
     #[test]
     fn link_removed_on_remote_close() {
-        let _ = env_logger::builder().is_test(true).try_init();
         let mut a: TestNode = Node::new(true);
         let mut b: TestNode = Node::new(true);
         a.add_interface(test_interface());
@@ -4425,8 +4456,6 @@ mod tests {
 
     #[test]
     fn on_respond_result_called_on_large_response() {
-        let _ = env_logger::builder().is_test(true).try_init();
-
         // Large responses use Resource transfer mechanism.
         // When the client sends ResourcePrf (proof), the server must call on_respond_result
         // so the respond() call can complete.
@@ -5063,6 +5092,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn forwarded_path_request_has_hops_zero() {
+        // PathRequests are PLAIN packets which Python RNS drops if hops > 1.
+        // When forwarding a PathRequest, we must create a NEW packet with hops=0,
+        // not forward the existing packet with incremented hops.
+        //
+        // Topology: A -- B -- C
+        // A sends PathRequest with hops=0
+        // B receives it (hops becomes 1 after increment)
+        // B should forward a NEW PathRequest with hops=0 to C
+        let mut net = TestNetwork::new();
+        let a = net.add_node(true);
+        let b = net.add_node(true);
+        let c = net.add_node(true);
+        net.link(a, b);
+        net.link(b, c);
+
+        let addr_c = net.node(c).add_service(svc("destination"), &id(3));
+        let now = Instant::now();
+
+        // A sends path request for C
+        net.node(a).request_path(addr_c, now);
+
+        // Step 1: A sends PathRequest to B
+        net.step(now);
+
+        // Verify B received PathRequest with hops=0 (before B's poll increments it)
+        let b_inbox: Vec<_> = net.nodes[b].interfaces[0]
+            .transport
+            .inbox
+            .iter()
+            .cloned()
+            .collect();
+        assert_eq!(b_inbox.len(), 1);
+        let pkt_at_b = Packet::from_bytes(&b_inbox[0]).unwrap();
+        assert!(
+            matches!(pkt_at_b, Packet::PathRequest { hops: 0, .. }),
+            "B should receive PathRequest with hops=0, got {:?}",
+            pkt_at_b
+        );
+
+        // Step 2: B processes and forwards to C
+        net.step(now);
+
+        // Verify C received PathRequest with hops=0 (NOT hops=1)
+        // This is the critical check - the forwarded packet must have hops=0
+        let c_inbox: Vec<_> = net.nodes[c].interfaces[0]
+            .transport
+            .inbox
+            .iter()
+            .cloned()
+            .collect();
+        assert_eq!(c_inbox.len(), 1, "C should receive 1 packet from B");
+        let pkt_at_c = Packet::from_bytes(&c_inbox[0]).unwrap();
+        assert!(
+            matches!(pkt_at_c, Packet::PathRequest { hops: 0, .. }),
+            "C should receive PathRequest with hops=0 (fresh packet), got hops={:?}",
+            pkt_at_c.hops()
+        );
+    }
+
     // Rate adaptation tests - these verify the window management behavior
     // based on measured transfer rates.
     //
@@ -5074,7 +5164,6 @@ mod tests {
 
     #[test]
     fn resource_window_max_increases_after_sustained_fast_rate() {
-        let _ = env_logger::builder().is_test(true).try_init();
         // After 4 consecutive batches with rate > 50 Kbps, window_max should increase to 75
         let mut a: TestNode = Node::new(true);
         let mut b: TestNode = Node::new(true);
@@ -5146,7 +5235,6 @@ mod tests {
 
     #[test]
     fn resource_window_max_decreases_on_very_slow_rate() {
-        let _ = env_logger::builder().is_test(true).try_init();
         // After 2 consecutive batches with rate < 2 Kbps, window_max should decrease to 4
         let mut a: TestNode = Node::new(true);
         let mut b: TestNode = Node::new(true);
@@ -5215,7 +5303,6 @@ mod tests {
 
     #[test]
     fn resource_window_max_stays_high_if_ever_fast() {
-        let _ = env_logger::builder().is_test(true).try_init();
         // Once window_max reaches 75, it should not decrease even if rate becomes slow
         let mut a: TestNode = Node::new(true);
         let mut b: TestNode = Node::new(true);
@@ -5296,7 +5383,6 @@ mod tests {
 
     #[test]
     fn resource_window_min_trails_window() {
-        let _ = env_logger::builder().is_test(true).try_init();
         // window_min should trail window by at most WINDOW_FLEXIBILITY (4)
         let mut a: TestNode = Node::new(true);
         let mut b: TestNode = Node::new(true);
@@ -5375,7 +5461,6 @@ mod tests {
 
     #[test]
     fn resource_requests_pipeline_without_waiting_for_full_batch() {
-        let _ = env_logger::builder().is_test(true).try_init();
         // After receiving each part, we should request more to keep window full
         // NOT wait for all outstanding parts to arrive
         let mut a: TestNode = Node::new(true);

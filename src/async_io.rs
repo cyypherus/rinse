@@ -342,51 +342,18 @@ impl AsyncNode {
     pub async fn run(mut self) {
         let mut tick_interval = tokio::time::interval(Duration::from_millis(10));
         tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last_poll = Instant::now();
-        let mut poll_count = 0u64;
-        let run_start = Instant::now();
-        log::info!("[ASYNC] node.run() starting");
 
         loop {
-            let now = Instant::now();
-            let since_last = now.duration_since(last_poll);
-            if since_last > Duration::from_secs(1) {
-                log::warn!(
-                    "[ASYNC] poll gap: {:?} - something blocked the event loop",
-                    since_last
-                );
-            }
-            last_poll = now;
-            poll_count += 1;
-
-            if poll_count.is_multiple_of(1000) {
-                log::debug!(
-                    "[ASYNC] poll #{}, uptime {:?}",
-                    poll_count,
-                    run_start.elapsed()
-                );
-            }
-
-            let poll_start = Instant::now();
-            self.node.poll(now);
-            let poll_duration = poll_start.elapsed();
-            if poll_duration > Duration::from_millis(100) {
-                log::warn!("[ASYNC] poll() took {:?}", poll_duration);
-            }
-
             tokio::select! {
                 biased;
                 Some(cmd) = self.command_rx.recv() => {
-                    log::trace!("[ASYNC] select: command received");
                     self.handle_command(cmd, Instant::now());
                 }
                 _ = self.wake_rx.recv() => {
-                    log::trace!("[ASYNC] select: wake received");
                     // Drain any extra wakes to prevent backup
                     while self.wake_rx.try_recv().is_ok() {}
                 }
                 _ = tick_interval.tick() => {
-                    // log::trace!("[ASYNC] select: tick");
                 }
             }
         }

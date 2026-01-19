@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rinse::{AsyncNode, Identity, ServiceHandle};
-use tokio::net::TcpListener;
 
 fn scan_directory(base: &Path, current: &Path, paths: &mut Vec<String>) {
     if let Ok(entries) = std::fs::read_dir(current) {
@@ -10,11 +9,11 @@ fn scan_directory(base: &Path, current: &Path, paths: &mut Vec<String>) {
             let path = entry.path();
             if path.is_dir() {
                 scan_directory(base, &path, paths);
-            } else if path.is_file() {
-                if let Ok(relative) = path.strip_prefix(base) {
-                    let request_path = format!("/page/{}", relative.display());
-                    paths.push(request_path);
-                }
+            } else if path.is_file()
+                && let Ok(relative) = path.strip_prefix(base)
+            {
+                let request_path = format!("/page/{}", relative.display());
+                paths.push(request_path);
             }
         }
     }
@@ -79,7 +78,6 @@ async fn main() {
     }
     let dir = Arc::new(dir.canonicalize().expect("failed to canonicalize path"));
 
-    // Scan directory for files and register each as a path (like Python NomadNet does)
     let mut paths: Vec<String> = Vec::new();
     scan_directory(&dir, &dir, &mut paths);
     if paths.is_empty() {
@@ -102,14 +100,7 @@ async fn main() {
         log::info!("Connecting to {}", addr);
         node.connect(&addr).await.expect("failed to connect");
     } else {
-        let listener = TcpListener::bind(&listen_addr)
-            .await
-            .expect("failed to bind");
-        log::info!("Listening on {} (waiting for connection...)", listen_addr);
-
-        let (stream, peer) = listener.accept().await.expect("failed to accept");
-        log::info!("Accepted connection from {}", peer);
-        node.add_tcp_stream(stream);
+        node.listen(&listen_addr).await.expect("failed to listen");
     }
 
     log::info!("Serving files from {}", dir.display());
