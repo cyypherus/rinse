@@ -635,18 +635,34 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
 }
 
+fn log_level_from_env() -> LevelFilter {
+    std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|s| match s.to_lowercase().as_str() {
+            "trace" => Some(LevelFilter::Trace),
+            "debug" => Some(LevelFilter::Debug),
+            "info" => Some(LevelFilter::Info),
+            "warn" | "warning" => Some(LevelFilter::Warn),
+            "error" => Some(LevelFilter::Error),
+            "off" => Some(LevelFilter::Off),
+            _ => None,
+        })
+        .unwrap_or(LevelFilter::Info)
+}
+
 #[tokio::main]
 async fn main() {
     let _ = std::fs::create_dir_all(data_dir());
 
+    let log_level = log_level_from_env();
     let log_buffer: Arc<Mutex<VecDeque<LogEntry>>> = Arc::new(Mutex::new(VecDeque::new()));
 
     let log_file = File::create(data_dir().join("relay.log")).expect("failed to create log file");
-    let file_logger = WriteLogger::new(LevelFilter::Trace, LogConfig::default(), log_file);
+    let file_logger = WriteLogger::new(log_level, LogConfig::default(), log_file);
     let tui_logger = TuiLogger::new(log_buffer.clone(), file_logger);
 
     log::set_boxed_logger(Box::new(tui_logger)).expect("failed to set logger");
-    log::set_max_level(LevelFilter::Trace);
+    log::set_max_level(log_level);
 
     let config = Config::load().expect("failed to load config");
     let identity = load_or_generate_identity().expect("failed to load identity");

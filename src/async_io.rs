@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 
 use crate::handle::{Destination, RequestError, RespondError, ServiceEvent, ServiceId};
 use crate::packet::Address;
@@ -222,10 +222,12 @@ impl Interface<AsyncTcpTransport> {
 type RequestWaiters =
     Arc<StdMutex<HashMap<RequestId, oneshot::Sender<Result<Vec<u8>, RequestError>>>>>;
 type RespondWaiters = Arc<StdMutex<HashMap<RequestId, oneshot::Sender<Result<(), RespondError>>>>>;
+type EventReceiver = Arc<TokioMutex<mpsc::UnboundedReceiver<ServiceEvent>>>;
 
 #[derive(Clone)]
 struct ServiceChannels {
     event_tx: mpsc::UnboundedSender<ServiceEvent>,
+    event_rx: EventReceiver,
     request_waiters: RequestWaiters,
     respond_waiters: RespondWaiters,
 }
@@ -273,7 +275,6 @@ struct AsyncNodeInner<T: Transport> {
 pub struct AsyncNode<T: Transport> {
     services: Arc<StdMutex<HashMap<ServiceId, ServiceChannels>>>,
     service_addresses: Arc<StdMutex<HashMap<ServiceId, Address>>>,
-    event_receivers: Arc<Mutex<HashMap<ServiceId, mpsc::UnboundedReceiver<ServiceEvent>>>>,
     command_tx: mpsc::UnboundedSender<Command<T>>,
     inner: Option<AsyncNodeInner<T>>,
 }
@@ -283,7 +284,6 @@ impl<T: Transport> Clone for AsyncNode<T> {
         Self {
             services: self.services.clone(),
             service_addresses: self.service_addresses.clone(),
-            event_receivers: self.event_receivers.clone(),
             command_tx: self.command_tx.clone(),
             inner: None,
         }
@@ -298,7 +298,6 @@ impl<T: Transport> AsyncNode<T> {
         Self {
             services: Arc::new(StdMutex::new(HashMap::new())),
             service_addresses: Arc::new(StdMutex::new(HashMap::new())),
-            event_receivers: Arc::new(Mutex::new(HashMap::new())),
             command_tx,
             inner: Some(AsyncNodeInner {
                 node: crate::Node::with_rng(rng, transport),
@@ -330,6 +329,7 @@ impl<T: Transport> AsyncNode<T> {
             service_id,
             ServiceChannels {
                 event_tx,
+                event_rx: Arc::new(TokioMutex::new(event_rx)),
                 request_waiters,
                 respond_waiters,
             },
@@ -338,9 +338,6 @@ impl<T: Transport> AsyncNode<T> {
             .lock()
             .unwrap()
             .insert(service_id, address);
-        self.event_receivers
-            .blocking_lock()
-            .insert(service_id, event_rx);
 
         service_id
     }
@@ -460,11 +457,14 @@ impl<T: Transport> AsyncNode<T> {
     }
 
     pub async fn receive(&self, service: ServiceId) -> Option<ServiceEvent> {
-        let mut receivers = self.event_receivers.lock().await;
-        let rx = receivers
-            .get_mut(&service)
-            .expect("invalid ServiceId - service not registered");
-        rx.recv().await
+        let event_rx = {
+            let services = self.services.lock().unwrap();
+            let channels = services
+                .get(&service)
+                .expect("invalid ServiceId - service not registered");
+            channels.event_rx.clone()
+        };
+        event_rx.lock().await.recv().await
     }
 
     pub async fn run(mut self) {

@@ -145,6 +145,7 @@ pub struct Node<T, R = ThreadRng> {
     discovery_path_requests: HashMap<Address, usize>,
     stats: Stats,
     pending_events: Vec<ServiceEvent>,
+    pending_resource_requests: Vec<(LinkId, [u8; 32])>,
 }
 
 impl<T: Transport> Node<T, ThreadRng> {
@@ -183,6 +184,7 @@ impl<T: Transport> Node<T, ThreadRng> {
             discovery_path_requests: HashMap::new(),
             stats: Stats::new(),
             pending_events: Vec::new(),
+            pending_resource_requests: Vec::new(),
         }
     }
 }
@@ -222,6 +224,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             discovery_path_requests: HashMap::new(),
             stats: Stats::new(),
             pending_events: Vec::new(),
+            pending_resource_requests: Vec::new(),
         }
     }
 
@@ -1917,6 +1920,15 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             self.inbound(&raw, source, now);
         }
 
+        // Process batched resource requests (deduplicated)
+        let pending_reqs: Vec<_> = self.pending_resource_requests.drain(..).collect();
+        let mut seen = std::collections::HashSet::new();
+        for (link_id, hash) in pending_reqs {
+            if seen.insert((link_id, hash)) {
+                self.send_resource_request(link_id, hash, now);
+            }
+        }
+
         // Process outbound queues
         for iface in &mut self.interfaces {
             iface.poll();
@@ -2405,7 +2417,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 if let Some(hash) = completed {
                     self.complete_resource(link_id, hash, now);
                 } else if let Some(hash) = need_more {
-                    self.send_resource_request(link_id, hash, now);
+                    self.pending_resource_requests.push((link_id, hash));
                 }
             }
             LinkContext::ResourceHmu => {
@@ -4922,6 +4934,93 @@ mod tests {
         assert!(
             a.established_links.contains_key(&link_id),
             "Link should still be active at t=20s"
+        );
+    }
+
+    #[test]
+    fn resource_requests_batched_per_poll() {
+        use crate::packet::{LinkContext, Packet};
+
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        // Use data that won't compress much
+        use rand::Rng;
+        let mut rng = StdRng::seed_from_u64(42);
+        let response: Vec<u8> = (0..50000).map(|_| rng.r#gen()).collect();
+
+        let svc_a = a.add_service("client", &[], &id(1));
+        let svc_b = b.add_service("server", &["test"], &id(2));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let now = Instant::now();
+
+        // Establish link
+        b.announce(svc_b);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        a.link(addr_b, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        // Request and respond
+        a.request(svc_a, addr_b, "test", b"", now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        let events = b.poll(now);
+        let req_id = events
+            .iter()
+            .find_map(|e| match e {
+                ServiceEvent::Request { request_id, .. } => Some(*request_id),
+                _ => None,
+            })
+            .unwrap();
+        b.respond(req_id, &response);
+        b.poll(now);
+
+        // Transfer advertisement
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        // Now B has parts queued. Transfer ALL of them at once to A.
+        let parts_transferred = b.interfaces[0].transport.outbox.len();
+        transfer(&mut b, 0, &mut a, 0);
+
+        // Single poll should process all parts but only send ONE ResourceReq
+        a.poll(now);
+
+        let resource_req_count = a.interfaces[0]
+            .transport
+            .outbox
+            .iter()
+            .filter(|pkt| {
+                Packet::from_bytes(pkt)
+                    .map(|p| {
+                        matches!(
+                            p,
+                            Packet::LinkData {
+                                context: LinkContext::ResourceReq,
+                                ..
+                            }
+                        )
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
+
+        // Key assertion: even though multiple parts arrived, at most 1 ResourceReq
+        assert!(
+            resource_req_count <= 1,
+            "Expected at most 1 ResourceReq after batch of {} parts, got {}",
+            parts_transferred,
+            resource_req_count
         );
     }
 }
