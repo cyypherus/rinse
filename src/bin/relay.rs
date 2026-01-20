@@ -19,9 +19,10 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, Paragraph},
 };
 use rinse::config::{Config, InterfaceConfig, data_dir, load_or_generate_identity};
-use rinse::{AsyncNode, StatsSnapshot};
+use rinse::{AsyncNode, AsyncTcpTransport, Interface, StatsSnapshot};
 use serde::{Deserialize, Serialize};
 use simplelog::{Config as LogConfig, LevelFilter, SharedLogger, WriteLogger};
+use tokio::net::TcpListener;
 
 const BANNER: &str = r#"    ____  _
    / __ \(_)___  ________
@@ -658,7 +659,7 @@ async fn main() {
         StatsSnapshot::format_uptime(persisted.total_uptime_secs)
     );
 
-    let mut node = AsyncNode::new(true);
+    let mut node: AsyncNode<AsyncTcpTransport> = AsyncNode::new(true);
     let service = node.add_service("relay.stats", &[], &identity);
 
     let enabled_interfaces = config.enabled_interfaces();
@@ -687,10 +688,14 @@ async fn main() {
             } => {
                 let addr = format!("{}:{}", target_host, target_port);
                 log::info!("Connecting to {} ({})", name, addr);
-                if let Err(e) = node.connect(&addr).await {
-                    log::warn!("Failed to connect to {}: {}", addr, e);
-                } else {
-                    upstreams.push(addr);
+                match AsyncTcpTransport::connect(&addr).await {
+                    Ok(transport) => {
+                        node.add_interface(Interface::new(transport));
+                        upstreams.push(addr);
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to connect to {}: {}", addr, e);
+                    }
                 }
             }
             InterfaceConfig::TCPServerInterface {
@@ -700,8 +705,30 @@ async fn main() {
             } => {
                 let addr = format!("{}:{}", listen_ip, listen_port);
                 log::info!("Listening on {} ({})", name, addr);
-                if let Err(e) = node.listen(&addr).await {
-                    log::warn!("Failed to listen on {}: {}", addr, e);
+                match TcpListener::bind(&addr).await {
+                    Ok(listener) => {
+                        let node_clone = node.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                match listener.accept().await {
+                                    Ok((stream, peer)) => {
+                                        log::info!("Accepted connection from {}", peer);
+                                        if let Ok(transport) =
+                                            AsyncTcpTransport::from_stream(peer.to_string(), stream)
+                                        {
+                                            node_clone.add_interface(Interface::new(transport));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Accept error: {}", e);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to listen on {}: {}", addr, e);
+                    }
                 }
             }
         }
@@ -716,6 +743,7 @@ async fn main() {
     let mut last_save = std::time::Instant::now();
     let mut achievements: Vec<String> = Vec::new();
 
+    let node_handle = node.clone();
     tokio::spawn(async move {
         node.run().await;
     });
@@ -729,11 +757,11 @@ async fn main() {
     loop {
         tokio::select! {
             _ = announce_tick.tick() => {
-                service.announce();
+                node_handle.announce(service);
                 log::debug!("Announced relay");
             }
             _ = tick.tick() => {
-                let session_stats = service.stats().await;
+                let session_stats = node_handle.stats().await;
                 let combined = persisted.combined(&session_stats);
 
                 let new_achievements = RelayTui::check_milestones(&mut persisted, &combined);
@@ -765,7 +793,7 @@ async fn main() {
                     && key.code == KeyCode::Char('c')
                     && key.modifiers.contains(KeyModifiers::CONTROL)
                 {
-                    let session_stats = service.stats().await;
+                    let session_stats = node_handle.stats().await;
                     persisted.merge(&session_stats);
                     persisted.save(&stats_file);
 

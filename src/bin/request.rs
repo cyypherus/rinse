@@ -1,4 +1,4 @@
-use rinse::{AsyncNode, Identity};
+use rinse::{AsyncNode, AsyncTcpTransport, Identity, Interface, RequestError};
 
 #[tokio::main]
 async fn main() {
@@ -72,12 +72,12 @@ async fn main() {
     let identity = Identity::generate(&mut rand::thread_rng());
 
     let service = node.add_service("nomadnetwork.node", &[], &identity);
-    let requester = service.requester();
 
     log::info!("Connecting to {}", connect_addr);
-    node.connect(&connect_addr)
+    let transport = AsyncTcpTransport::connect(&connect_addr)
         .await
         .expect("failed to connect");
+    node.add_interface(Interface::new(transport));
 
     log::info!(
         "Requesting path '{}' from node {}",
@@ -85,11 +85,13 @@ async fn main() {
         hex::encode(node_id)
     );
 
+    let node_clone = node.clone();
     let node_task = tokio::spawn(async move {
         node.run().await;
     });
 
-    let response = requester.request(node_id, &path, &[]).await;
+    let response: Result<Vec<u8>, RequestError> =
+        node_clone.request(service, node_id, &path, &[]).await;
 
     match response {
         Ok(data) => {

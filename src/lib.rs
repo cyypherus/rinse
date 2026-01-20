@@ -33,7 +33,7 @@ pub(crate) use request::WireRequestId;
 pub use stats::StatsSnapshot;
 
 #[cfg(feature = "tokio")]
-pub use async_io::{
-    AsyncNode, AsyncTransport, ConnectRequest, Destination as AsyncDestination, IncomingRaw,
-    IncomingRequest, Requester, ServiceHandle,
-};
+pub use async_io::AsyncNode;
+
+#[cfg(all(feature = "tokio", feature = "tcp"))]
+pub use async_io::AsyncTcpTransport;
