@@ -504,7 +504,9 @@ impl<T: Transport> AsyncNode<T> {
         let services = services.lock().unwrap();
         for event in events {
             match &event {
-                ServiceEvent::Request { service, .. } | ServiceEvent::Raw { service, .. } => {
+                ServiceEvent::Request { service, .. }
+                | ServiceEvent::Raw { service, .. }
+                | ServiceEvent::ResourceProgress { service, .. } => {
                     if let Some(channels) = services.get(service) {
                         let _ = channels.event_tx.send(event);
                     }

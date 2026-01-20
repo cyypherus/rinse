@@ -198,6 +198,7 @@ pub(crate) struct InboundResource {
     waiting_for_hmu: bool,
     consecutive_completed_height: i32,
     bytes_received: usize,
+    total_bytes: usize,
     bytes_at_req_sent: usize,
     fast_rate_rounds: usize,
     very_slow_rate_rounds: usize,
@@ -243,6 +244,7 @@ impl InboundResource {
             waiting_for_hmu: false,
             consecutive_completed_height: -1,
             bytes_received: 0,
+            total_bytes: adv.transfer_size,
             bytes_at_req_sent: 0,
             fast_rate_rounds: 0,
             very_slow_rate_rounds: 0,
@@ -387,6 +389,14 @@ impl InboundResource {
 
     pub fn num_parts(&self) -> usize {
         self.num_parts
+    }
+
+    pub fn bytes_received(&self) -> usize {
+        self.bytes_received
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
     }
 
     pub fn assemble(&self, link: &EstablishedLink) -> Option<(Vec<u8>, [u8; 32])> {

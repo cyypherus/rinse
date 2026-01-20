@@ -10,6 +10,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use log::LevelFilter;
 use ratatui::{
     Frame, Terminal,
     layout::{Constraint, Layout, Rect},
@@ -21,7 +22,7 @@ use ratatui::{
 use rinse::config::{Config, InterfaceConfig, data_dir, load_or_generate_identity};
 use rinse::{AsyncNode, AsyncTcpTransport, Interface, StatsSnapshot};
 use serde::{Deserialize, Serialize};
-use simplelog::{Config as LogConfig, LevelFilter, SharedLogger, WriteLogger};
+use simplelog::{Config as LogConfig, SharedLogger, WriteLogger};
 use tokio::net::TcpListener;
 
 const BANNER: &str = r#"    ____  _
@@ -636,18 +637,9 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
 }
 
 fn log_level_from_env() -> LevelFilter {
-    std::env::var("RUST_LOG")
-        .ok()
-        .and_then(|s| match s.to_lowercase().as_str() {
-            "trace" => Some(LevelFilter::Trace),
-            "debug" => Some(LevelFilter::Debug),
-            "info" => Some(LevelFilter::Info),
-            "warn" | "warning" => Some(LevelFilter::Warn),
-            "error" => Some(LevelFilter::Error),
-            "off" => Some(LevelFilter::Off),
-            _ => None,
-        })
-        .unwrap_or(LevelFilter::Info)
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .build()
+        .filter()
 }
 
 #[tokio::main]

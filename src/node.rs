@@ -2391,6 +2391,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 );
                 let mut completed = None;
                 let mut need_more = None;
+                let mut progress_event = None;
                 for (hash, (res_link_id, resource)) in &mut self.inbound_resources {
                     if *res_link_id == link_id {
                         let accepted = resource.receive_part(plaintext.to_vec());
@@ -2401,19 +2402,65 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                             resource.is_complete(),
                             resource.outstanding_parts()
                         );
-                        if accepted && resource.is_complete() {
-                            completed = Some(*hash);
-                        } else if accepted {
-                            // Pipeline: request more parts as soon as we have room
-                            // Don't wait for all outstanding parts to arrive
-                            if resource.batch_complete() {
-                                resource.complete_batch(now);
+                        if accepted {
+                            // Emit progress event if this is a response with a request_id
+                            if resource.is_response {
+                                if let Some(ref req_id_bytes) = resource.request_id {
+                                    if let Some(wire_req_id) = req_id_bytes
+                                        .get(..16)
+                                        .and_then(|b| <[u8; 16]>::try_from(b).ok())
+                                        .map(WireRequestId)
+                                    {
+                                        progress_event = Some((
+                                            wire_req_id,
+                                            resource.received_count(),
+                                            resource.num_parts(),
+                                            resource.bytes_received(),
+                                            resource.total_bytes(),
+                                        ));
+                                    }
+                                }
                             }
-                            need_more = Some(*hash);
+
+                            if resource.is_complete() {
+                                completed = Some(*hash);
+                            } else {
+                                // Pipeline: request more parts as soon as we have room
+                                if resource.batch_complete() {
+                                    resource.complete_batch(now);
+                                }
+                                need_more = Some(*hash);
+                            }
                         }
                         break;
                     }
                 }
+
+                // Emit progress event
+                if let Some((
+                    wire_req_id,
+                    received_parts,
+                    total_parts,
+                    received_bytes,
+                    total_bytes,
+                )) = progress_event
+                {
+                    if let Some(link) = self.established_links.get(&link_id) {
+                        if let Some(&(service, local_request_id)) =
+                            link.pending_requests.get(&wire_req_id)
+                        {
+                            self.pending_events.push(ServiceEvent::ResourceProgress {
+                                service,
+                                request_id: local_request_id,
+                                received_parts,
+                                total_parts,
+                                received_bytes,
+                                total_bytes,
+                            });
+                        }
+                    }
+                }
+
                 if let Some(hash) = completed {
                     self.complete_resource(link_id, hash, now);
                 } else if let Some(hash) = need_more {
@@ -5021,6 +5068,107 @@ mod tests {
             "Expected at most 1 ResourceReq after batch of {} parts, got {}",
             parts_transferred,
             resource_req_count
+        );
+    }
+
+    #[test]
+    fn resource_progress_events() {
+        use rand::Rng;
+
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let mut rng = StdRng::seed_from_u64(99);
+        let response: Vec<u8> = (0..10000).map(|_| rng.r#gen()).collect();
+
+        let svc_a = a.add_service("client", &[], &id(1));
+        let svc_b = b.add_service("server", &["test"], &id(2));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let now = Instant::now();
+
+        // Establish link
+        b.announce(svc_b);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        a.link(addr_b, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        // Request
+        let local_req_id = a.request(svc_a, addr_b, "test", b"", now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        let events = b.poll(now);
+        let server_req_id = events
+            .iter()
+            .find_map(|e| match e {
+                ServiceEvent::Request { request_id, .. } => Some(*request_id),
+                _ => None,
+            })
+            .unwrap();
+        b.respond(server_req_id, &response);
+        b.poll(now);
+
+        // Track progress events
+        let mut progress_events = Vec::new();
+        let mut completed = false;
+
+        for _ in 0..100 {
+            transfer(&mut b, 0, &mut a, 0);
+            let events = a.poll(now);
+
+            for event in &events {
+                match event {
+                    ServiceEvent::ResourceProgress {
+                        request_id,
+                        received_parts,
+                        total_parts,
+                        ..
+                    } => {
+                        assert_eq!(*request_id, local_req_id);
+                        progress_events.push((*received_parts, *total_parts));
+                    }
+                    ServiceEvent::RequestResult { request_id, .. } => {
+                        assert_eq!(*request_id, local_req_id);
+                        completed = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            transfer(&mut a, 0, &mut b, 0);
+            b.poll(now);
+
+            if completed {
+                break;
+            }
+        }
+
+        assert!(completed, "Transfer should complete");
+        assert!(
+            !progress_events.is_empty(),
+            "Should have received progress events"
+        );
+
+        // Progress should be monotonically increasing
+        for i in 1..progress_events.len() {
+            assert!(
+                progress_events[i].0 >= progress_events[i - 1].0,
+                "Progress should be monotonic"
+            );
+        }
+
+        // Last progress should be close to or at total
+        let (last_received, total) = progress_events.last().unwrap();
+        assert!(
+            *last_received > 0 && *total > 0,
+            "Should have non-zero parts"
         );
     }
 }

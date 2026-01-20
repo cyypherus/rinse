@@ -46,6 +46,14 @@ pub enum ServiceEvent {
         request_id: RequestId,
         result: Result<(), RespondError>,
     },
+    ResourceProgress {
+        service: ServiceId,
+        request_id: RequestId,
+        received_parts: usize,
+        total_parts: usize,
+        received_bytes: usize,
+        total_bytes: usize,
+    },
     Raw {
         service: ServiceId,
         data: Vec<u8>,
