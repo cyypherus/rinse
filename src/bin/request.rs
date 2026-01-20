@@ -1,4 +1,4 @@
-use rinse::{AsyncNode, AsyncTcpTransport, Identity, Interface, RequestError};
+use rinse::{AsyncNode, AsyncTcpTransport, Identity, Interface, RequestError, ServiceEvent};
 
 #[tokio::main]
 async fn main() {
@@ -90,11 +90,40 @@ async fn main() {
         node.run().await;
     });
 
-    let response: Result<Vec<u8>, RequestError> =
-        node_clone.request(service, node_id, &path, &[]).await;
+    let node_for_progress = node_clone.clone();
+    let progress_task = tokio::spawn(async move {
+        loop {
+            match node_for_progress.receive(service).await {
+                Some(ServiceEvent::ResourceProgress {
+                    received_bytes,
+                    total_bytes,
+                    ..
+                }) => {
+                    let pct = if total_bytes > 0 {
+                        (received_bytes as f64 / total_bytes as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    eprint!(
+                        "\rProgress: {}/{} bytes ({:.1}%)    ",
+                        received_bytes, total_bytes, pct
+                    );
+                }
+                Some(ServiceEvent::RequestResult { .. }) => {
+                    eprintln!();
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let response = node_clone.request(service, node_id, &path, &[]).await;
+
+    progress_task.abort();
 
     match response {
-        Ok(data) => {
+        Ok((data, _metadata)) => {
             log::info!("Received {} bytes", data.len());
             if let Some(output_path) = output_file {
                 tokio::fs::write(&output_path, &data)

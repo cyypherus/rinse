@@ -39,7 +39,7 @@ pub enum ServiceEvent {
     RequestResult {
         service: ServiceId,
         request_id: RequestId,
-        result: Result<(Address, Vec<u8>), RequestError>,
+        result: Result<(Address, Vec<u8>, Option<Vec<u8>>), RequestError>,
     },
     RespondResult {
         service: ServiceId,

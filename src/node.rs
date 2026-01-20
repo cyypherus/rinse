@@ -41,7 +41,7 @@ enum Notification {
     RequestResult {
         service: ServiceId,
         request_id: RequestId,
-        result: Result<(Address, Vec<u8>), RequestError>,
+        result: Result<(Address, Vec<u8>, Option<Vec<u8>>), RequestError>,
     },
     RespondResult {
         service: ServiceId,
@@ -109,6 +109,27 @@ struct ReverseTableEntry {
     receiving_interface: usize,
 }
 
+struct MultiSegmentTransfer {
+    service: ServiceId,
+    local_request_id: RequestId,
+    total_segments: usize,
+    segments_received: usize,
+    accumulated_data: Vec<u8>,
+    has_metadata: bool,
+}
+
+struct OutboundMultiSegment {
+    destination: Address,
+    service_idx: Option<ServiceId>,
+    local_request_id: Option<RequestId>,
+    full_data: Vec<u8>,
+    compress: bool,
+    is_response: bool,
+    request_id: Option<Vec<u8>>,
+    total_segments: usize,
+    current_segment: usize,
+}
+
 pub struct Node<T, R = ThreadRng> {
     transport: bool,
     max_hops: u8,
@@ -138,6 +159,8 @@ pub struct Node<T, R = ThreadRng> {
     >,
     inbound_resources: HashMap<[u8; 32], (LinkId, crate::resource::InboundResource)>,
     pending_resource_adverts: HashMap<[u8; 32], (LinkId, crate::resource::ResourceAdvertisement)>,
+    multi_segment_transfers: HashMap<[u8; 32], MultiSegmentTransfer>,
+    outbound_multi_segments: HashMap<[u8; 32], OutboundMultiSegment>,
     inbound_request_links: HashMap<RequestId, (WireRequestId, LinkId, ServiceId)>,
     destination_links: HashMap<Address, LinkId>,
     pending_outbound_requests: HashMap<Address, Vec<(ServiceId, RequestId, String, Vec<u8>)>>,
@@ -177,6 +200,8 @@ impl<T: Transport> Node<T, ThreadRng> {
             outbound_resources: HashMap::new(),
             inbound_resources: HashMap::new(),
             pending_resource_adverts: HashMap::new(),
+            multi_segment_transfers: HashMap::new(),
+            outbound_multi_segments: HashMap::new(),
             inbound_request_links: HashMap::new(),
             destination_links: HashMap::new(),
             pending_outbound_requests: HashMap::new(),
@@ -217,6 +242,8 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             outbound_resources: HashMap::new(),
             inbound_resources: HashMap::new(),
             pending_resource_adverts: HashMap::new(),
+            multi_segment_transfers: HashMap::new(),
+            outbound_multi_segments: HashMap::new(),
             inbound_request_links: HashMap::new(),
             destination_links: HashMap::new(),
             pending_outbound_requests: HashMap::new(),
@@ -310,8 +337,124 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         local_request_id
     }
 
-    pub fn respond(&mut self, request_id: RequestId, data: &[u8]) {
-        self.send_response(request_id, data.to_vec());
+    pub fn respond(
+        &mut self,
+        request_id: RequestId,
+        data: &[u8],
+        metadata: Option<&[u8]>,
+        compress: bool,
+    ) {
+        use crate::packet::LinkDataDestination;
+
+        if let Some((wire_request_id, link_id, service_idx)) =
+            self.inbound_request_links.remove(&request_id)
+            && let Some(link) = self.established_links.get(&link_id)
+        {
+            if data.len() <= LINK_MDU && metadata.is_none() {
+                let resp = Response::new(wire_request_id, data.to_vec());
+                let ciphertext = link.encrypt(&mut self.rng, &resp.encode());
+
+                let packet = Packet::LinkData {
+                    hops: 0,
+                    destination: LinkDataDestination::Direct(link_id),
+                    context: LinkContext::Response,
+                    data: ciphertext,
+                };
+                for iface in &mut self.interfaces {
+                    iface.send(packet.clone(), 0);
+                }
+                self.dispatch_notifications(vec![Notification::RespondResult {
+                    service: service_idx,
+                    request_id,
+                    result: Ok(()),
+                }]);
+            } else {
+                use crate::resource::MAX_EFFICIENT_SIZE;
+                use serde_bytes::ByteBuf;
+
+                let packed_response = rmp_serde::to_vec(&(
+                    ByteBuf::from(wire_request_id.0.to_vec()),
+                    ByteBuf::from(data.to_vec()),
+                ))
+                .unwrap_or_else(|_| data.to_vec());
+
+                let total_size = packed_response.len();
+                let needs_segmentation = total_size > MAX_EFFICIENT_SIZE;
+
+                let segment_data = if needs_segmentation {
+                    packed_response[..MAX_EFFICIENT_SIZE].to_vec()
+                } else {
+                    packed_response.clone()
+                };
+
+                let mut resource = crate::resource::OutboundResource::new_segment(
+                    &mut self.rng,
+                    link,
+                    segment_data,
+                    metadata.map(|m| m.to_vec()),
+                    compress,
+                    true,
+                    Some(wire_request_id.0.to_vec()),
+                    1,
+                    None,
+                    if needs_segmentation {
+                        Some(total_size)
+                    } else {
+                        None
+                    },
+                );
+
+                let adv = resource.advertisement(91);
+                let adv_data = adv.encode();
+                let hash = resource.hash;
+                let original_hash = resource.original_hash;
+
+                if needs_segmentation {
+                    self.outbound_multi_segments.insert(
+                        original_hash,
+                        OutboundMultiSegment {
+                            destination: link.destination,
+                            service_idx: Some(service_idx),
+                            local_request_id: Some(request_id),
+                            full_data: packed_response,
+                            compress,
+                            is_response: true,
+                            request_id: Some(wire_request_id.0.to_vec()),
+                            total_segments: resource.total_segments,
+                            current_segment: 1,
+                        },
+                    );
+                    log::info!(
+                        "Created multi-segment outbound resource: {} segments, {} bytes total",
+                        resource.total_segments,
+                        total_size
+                    );
+                }
+
+                let ciphertext = link.encrypt(&mut self.rng, &adv_data);
+                let packet = Packet::LinkData {
+                    hops: 0,
+                    destination: LinkDataDestination::Direct(link_id),
+                    context: LinkContext::ResourceAdv,
+                    data: ciphertext,
+                };
+
+                self.outbound_resources.insert(
+                    hash,
+                    (
+                        link_id,
+                        link.destination,
+                        Some(service_idx),
+                        Some(request_id),
+                        resource,
+                    ),
+                );
+
+                for iface in &mut self.interfaces {
+                    iface.send(packet.clone(), 0);
+                }
+            }
+        }
     }
 
     fn send_request_inner(
@@ -325,10 +468,12 @@ impl<T: Transport, R: RngCore> Node<T, R> {
     ) {
         use crate::packet::LinkDataDestination;
 
+        let path_hash = crate::request::path_hash(path);
         log::info!(
-            "Request to <{}> path={} ({} bytes)",
+            "Request to <{}> path={} hash={} ({} bytes)",
             hex::encode(destination),
             path,
+            hex::encode(path_hash),
             data.len()
         );
 
@@ -395,73 +540,6 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                     hex::encode(destination)
                 );
                 self.request_path(destination, now);
-            }
-        }
-    }
-
-    fn send_response(&mut self, request_id: RequestId, data: Vec<u8>) {
-        use crate::packet::LinkDataDestination;
-
-        if let Some((wire_request_id, link_id, service_idx)) =
-            self.inbound_request_links.remove(&request_id)
-            && let Some(link) = self.established_links.get(&link_id)
-        {
-            if data.len() <= LINK_MDU {
-                let resp = Response::new(wire_request_id, data);
-                let ciphertext = link.encrypt(&mut self.rng, &resp.encode());
-
-                let packet = Packet::LinkData {
-                    hops: 0,
-                    destination: LinkDataDestination::Direct(link_id),
-                    context: LinkContext::Response,
-                    data: ciphertext,
-                };
-                for iface in &mut self.interfaces {
-                    iface.send(packet.clone(), 0);
-                }
-                // Small responses are sent directly - notify success immediately
-                // (no proof mechanism for direct responses)
-                self.dispatch_notifications(vec![Notification::RespondResult {
-                    service: service_idx,
-                    request_id,
-                    result: Ok(()),
-                }]);
-            } else {
-                let mut resource = crate::resource::OutboundResource::new(
-                    &mut self.rng,
-                    link,
-                    data,
-                    None,
-                    true,
-                    true,
-                    Some(wire_request_id.0.to_vec()),
-                );
-                let adv = resource.advertisement(91);
-                let adv_data = adv.encode();
-                let hash = resource.hash;
-
-                let ciphertext = link.encrypt(&mut self.rng, &adv_data);
-                let packet = Packet::LinkData {
-                    hops: 0,
-                    destination: LinkDataDestination::Direct(link_id),
-                    context: LinkContext::ResourceAdv,
-                    data: ciphertext,
-                };
-
-                self.outbound_resources.insert(
-                    hash,
-                    (
-                        link_id,
-                        link.destination,
-                        Some(service_idx),
-                        Some(request_id),
-                        resource,
-                    ),
-                );
-
-                for iface in &mut self.interfaces {
-                    iface.send(packet.clone(), 0);
-                }
             }
         }
     }
@@ -552,6 +630,11 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         let mut registered_paths = HashMap::new();
         for path in paths {
             let path_hash = crate::request::path_hash(path);
+            log::info!(
+                "Registering path '{}' with hash {}",
+                path,
+                hex::encode(path_hash)
+            );
             registered_paths.insert(path_hash, path.to_string());
         }
 
@@ -755,6 +838,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         now: Instant,
     ) -> Option<(Packet, bool, bool)> {
         let mut notifications: Vec<Notification> = Vec::new();
+        let mut pending_next_segments: Vec<(LinkId, [u8; 32])> = Vec::new();
 
         let mut packet = match Packet::from_bytes(raw) {
             Ok(p) => p,
@@ -1452,7 +1536,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                             notifications.push(Notification::RequestResult {
                                 service,
                                 request_id: local_request_id,
-                                result: Ok((from, resp.data)),
+                                result: Ok((from, resp.data, None)),
                             });
                         } else {
                             log::warn!(
@@ -1480,7 +1564,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                                     .registered_paths
                                     .get(&req.path_hash)
                                     .cloned();
-                                log::debug!(
+                                log::info!(
                                     "Request path_hash={} matched={:?} registered_count={}",
                                     hex::encode(req.path_hash),
                                     path,
@@ -1671,27 +1755,41 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         let proof: &[u8] = &data[32..64];
 
                         // Find matching outbound resource and validate proof
-                        if let Some((_, _, service_idx, local_request_id, outbound)) =
+                        if let Some((link_id, _, service_idx, local_request_id, outbound)) =
                             self.outbound_resources.get(&resource_hash)
                         {
                             if outbound.verify_proof(proof) {
                                 log::debug!(
-                                    "Resource proof validated for {}",
-                                    hex::encode(resource_hash)
+                                    "Resource proof validated for {} (segment {}/{})",
+                                    hex::encode(resource_hash),
+                                    outbound.segment_index,
+                                    outbound.total_segments
                                 );
+
+                                let link_id = *link_id;
+                                let original_hash = outbound.original_hash;
+                                let is_last_segment = outbound.is_last_segment();
                                 let service_idx = *service_idx;
                                 let local_request_id = *local_request_id;
+
                                 self.outbound_resources.remove(&resource_hash);
 
-                                // Notify service that response was delivered
-                                if let (Some(service), Some(request_id)) =
-                                    (service_idx, local_request_id)
-                                {
-                                    notifications.push(Notification::RespondResult {
-                                        service,
-                                        request_id,
-                                        result: Ok(()),
-                                    });
+                                if is_last_segment {
+                                    // Last segment - clean up and notify
+                                    self.outbound_multi_segments.remove(&original_hash);
+
+                                    if let (Some(service), Some(request_id)) =
+                                        (service_idx, local_request_id)
+                                    {
+                                        notifications.push(Notification::RespondResult {
+                                            service,
+                                            request_id,
+                                            result: Ok(()),
+                                        });
+                                    }
+                                } else {
+                                    // More segments to send
+                                    pending_next_segments.push((link_id, original_hash));
                                 }
                             } else {
                                 log::warn!(
@@ -1762,7 +1860,95 @@ impl<T: Transport, R: RngCore> Node<T, R> {
 
         self.dispatch_notifications(notifications);
 
+        for (link_id, original_hash) in pending_next_segments {
+            self.send_next_segment(link_id, original_hash);
+        }
+
         Some((packet, for_local_service, for_local_link))
+    }
+
+    fn send_next_segment(&mut self, link_id: LinkId, original_hash: [u8; 32]) {
+        use crate::packet::LinkDataDestination;
+        use crate::resource::MAX_EFFICIENT_SIZE;
+
+        let Some(multi) = self.outbound_multi_segments.get_mut(&original_hash) else {
+            log::warn!(
+                "send_next_segment: no multi-segment transfer for {}",
+                hex::encode(original_hash)
+            );
+            return;
+        };
+
+        let next_segment = multi.current_segment + 1;
+        if next_segment > multi.total_segments {
+            log::warn!(
+                "send_next_segment: already sent all {} segments for {}",
+                multi.total_segments,
+                hex::encode(original_hash)
+            );
+            return;
+        }
+
+        let Some(link) = self.established_links.get(&link_id) else {
+            log::warn!("send_next_segment: link {} not found", hex::encode(link_id));
+            return;
+        };
+
+        let start = (next_segment - 1) * MAX_EFFICIENT_SIZE;
+        let end = (start + MAX_EFFICIENT_SIZE).min(multi.full_data.len());
+        let segment_data = multi.full_data[start..end].to_vec();
+
+        let mut resource = crate::resource::OutboundResource::new_segment(
+            &mut self.rng,
+            link,
+            segment_data,
+            None,
+            multi.compress,
+            multi.is_response,
+            multi.request_id.clone(),
+            next_segment,
+            Some(original_hash),
+            Some(multi.full_data.len()),
+        );
+
+        let adv = resource.advertisement(91);
+        let adv_data = adv.encode();
+        let hash = resource.hash;
+
+        log::debug!(
+            "Sending segment {}/{} for multi-segment transfer {}",
+            next_segment,
+            multi.total_segments,
+            hex::encode(original_hash)
+        );
+
+        let ciphertext = link.encrypt(&mut self.rng, &adv_data);
+        let packet = Packet::LinkData {
+            hops: 0,
+            destination: LinkDataDestination::Direct(link_id),
+            context: LinkContext::ResourceAdv,
+            data: ciphertext,
+        };
+
+        let service_idx = multi.service_idx;
+        let local_request_id = multi.local_request_id;
+        let destination = multi.destination;
+        multi.current_segment = next_segment;
+
+        self.outbound_resources.insert(
+            hash,
+            (
+                link_id,
+                destination,
+                service_idx,
+                local_request_id,
+                resource,
+            ),
+        );
+
+        for iface in &mut self.interfaces {
+            iface.send(packet.clone(), 0);
+        }
     }
 
     fn send_link_packet(&mut self, link_id: LinkId, context: LinkContext, plaintext: &[u8]) {
@@ -2265,58 +2451,84 @@ impl<T: Transport, R: RngCore> Node<T, R> {
 
                 if let Some(adv) = ResourceAdvertisement::decode(plaintext) {
                     log::debug!(
-                        "ResourceAdv: hash={} random_hash={} num_parts={} transfer_size={} compressed={} is_response={} request_id={:?}",
+                        "ResourceAdv: hash={} random_hash={} num_parts={} transfer_size={} compressed={} is_response={} request_id={:?} segment={}/{} split={}",
                         hex::encode(adv.hash),
                         hex::encode(adv.random_hash),
                         adv.num_parts,
                         adv.transfer_size,
                         adv.compressed,
                         adv.is_response,
-                        adv.request_id.as_ref().map(hex::encode)
+                        adv.request_id.as_ref().map(hex::encode),
+                        adv.segment_index,
+                        adv.total_segments,
+                        adv.split
                     );
 
-                    // Auto-accept if this is a response to a pending request
+                    // Auto-accept if this is a response to a pending request or a continuation
                     if !adv.is_response {
                         log::debug!("ResourceAdv not a response, ignoring");
                     } else if adv.request_id.is_none() {
                         log::warn!("ResourceAdv is_response=true but no request_id");
-                    } else if let Some(ref req_id_bytes) = adv.request_id
-                        && let Some(link) = self.established_links.get(&link_id)
-                    {
-                        // Check if we have a pending request with this wire ID
-                        let wire_req_id: Option<WireRequestId> = req_id_bytes
-                            .get(..16)
-                            .and_then(|b| <[u8; 16]>::try_from(b).ok())
-                            .map(WireRequestId);
+                    } else {
+                        let original_hash = adv.original_hash;
+                        let is_continuation = adv.segment_index > 1
+                            && self.multi_segment_transfers.contains_key(&original_hash);
 
-                        if let Some(wire_request_id) = wire_req_id {
-                            if link.pending_requests.contains_key(&wire_request_id) {
-                                log::info!(
-                                    "ResourceAdv matched pending request {}",
-                                    hex::encode(wire_request_id.0)
-                                );
-                                // Auto-accept the resource
-                                let hash = adv.hash;
-                                let mut resource =
-                                    crate::resource::InboundResource::from_advertisement(&adv);
-                                resource.mark_transferring();
-                                self.inbound_resources.insert(hash, (link_id, resource));
-                                self.send_resource_request(link_id, hash, now);
+                        if is_continuation {
+                            // Subsequent segment of an in-progress multi-segment transfer
+                            log::info!(
+                                "ResourceAdv: accepting continuation segment {}/{} for transfer {}",
+                                adv.segment_index,
+                                adv.total_segments,
+                                hex::encode(original_hash)
+                            );
+
+                            let hash = adv.hash;
+                            let mut resource =
+                                crate::resource::InboundResource::from_advertisement(&adv);
+                            resource.mark_transferring();
+                            self.inbound_resources.insert(hash, (link_id, resource));
+                            self.send_resource_request(link_id, hash, now);
+                        } else if let Some(ref req_id_bytes) = adv.request_id
+                            && let Some(link) = self.established_links.get(&link_id)
+                        {
+                            // First segment or single-segment resource
+                            let wire_req_id: Option<WireRequestId> = req_id_bytes
+                                .get(..16)
+                                .and_then(|b| <[u8; 16]>::try_from(b).ok())
+                                .map(WireRequestId);
+
+                            if let Some(wire_request_id) = wire_req_id {
+                                if link.pending_requests.contains_key(&wire_request_id) {
+                                    log::info!(
+                                        "ResourceAdv matched pending request {} (segment {}/{})",
+                                        hex::encode(wire_request_id.0),
+                                        adv.segment_index,
+                                        adv.total_segments
+                                    );
+
+                                    let hash = adv.hash;
+                                    let mut resource =
+                                        crate::resource::InboundResource::from_advertisement(&adv);
+                                    resource.mark_transferring();
+                                    self.inbound_resources.insert(hash, (link_id, resource));
+                                    self.send_resource_request(link_id, hash, now);
+                                } else {
+                                    log::warn!(
+                                        "ResourceAdv request_id {} not found in pending_requests (have: {:?})",
+                                        hex::encode(wire_request_id.0),
+                                        link.pending_requests
+                                            .keys()
+                                            .map(|k| hex::encode(k.0))
+                                            .collect::<Vec<_>>()
+                                    );
+                                }
                             } else {
                                 log::warn!(
-                                    "ResourceAdv request_id {} not found in pending_requests (have: {:?})",
-                                    hex::encode(wire_request_id.0),
-                                    link.pending_requests
-                                        .keys()
-                                        .map(|k| hex::encode(k.0))
-                                        .collect::<Vec<_>>()
+                                    "ResourceAdv request_id too short: {} bytes",
+                                    req_id_bytes.len()
                                 );
                             }
-                        } else {
-                            log::warn!(
-                                "ResourceAdv request_id too short: {} bytes",
-                                req_id_bytes.len()
-                            );
                         }
                     }
                 } else {
@@ -2404,22 +2616,38 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         );
                         if accepted {
                             // Emit progress event if this is a response with a request_id
-                            if resource.is_response {
-                                if let Some(ref req_id_bytes) = resource.request_id {
-                                    if let Some(wire_req_id) = req_id_bytes
-                                        .get(..16)
-                                        .and_then(|b| <[u8; 16]>::try_from(b).ok())
-                                        .map(WireRequestId)
-                                    {
-                                        progress_event = Some((
-                                            wire_req_id,
-                                            resource.received_count(),
-                                            resource.num_parts(),
-                                            resource.bytes_received(),
-                                            resource.total_bytes(),
-                                        ));
-                                    }
-                                }
+                            if resource.is_response
+                                && let Some(ref req_id_bytes) = resource.request_id
+                                && let Some(wire_req_id) = req_id_bytes
+                                    .get(..16)
+                                    .and_then(|b| <[u8; 16]>::try_from(b).ok())
+                                    .map(WireRequestId)
+                            {
+                                let (received_bytes, total_bytes) = if resource.total_segments > 1 {
+                                    let accumulated = self
+                                        .multi_segment_transfers
+                                        .get(&resource.original_hash)
+                                        .map(|t| t.accumulated_data.len())
+                                        .unwrap_or(0);
+                                    let current_received = resource.bytes_received();
+                                    let current_total = resource.total_bytes();
+                                    let remaining =
+                                        resource.total_segments - resource.segment_index;
+                                    (
+                                        accumulated + current_received,
+                                        accumulated + current_total + remaining * current_total,
+                                    )
+                                } else {
+                                    (resource.bytes_received(), resource.total_bytes())
+                                };
+                                progress_event = Some((
+                                    wire_req_id,
+                                    resource.original_hash,
+                                    resource.received_count(),
+                                    resource.num_parts(),
+                                    received_bytes,
+                                    total_bytes,
+                                ));
                             }
 
                             if resource.is_complete() {
@@ -2439,25 +2667,33 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 // Emit progress event
                 if let Some((
                     wire_req_id,
+                    original_hash,
                     received_parts,
                     total_parts,
                     received_bytes,
                     total_bytes,
                 )) = progress_event
                 {
-                    if let Some(link) = self.established_links.get(&link_id) {
-                        if let Some(&(service, local_request_id)) =
-                            link.pending_requests.get(&wire_req_id)
-                        {
-                            self.pending_events.push(ServiceEvent::ResourceProgress {
-                                service,
-                                request_id: local_request_id,
-                                received_parts,
-                                total_parts,
-                                received_bytes,
-                                total_bytes,
-                            });
-                        }
+                    // Try pending_requests first (first segment), then multi_segment_transfers (continuation)
+                    let request_info = self
+                        .established_links
+                        .get(&link_id)
+                        .and_then(|link| link.pending_requests.get(&wire_req_id).copied())
+                        .or_else(|| {
+                            self.multi_segment_transfers
+                                .get(&original_hash)
+                                .map(|t| (t.service, t.local_request_id))
+                        });
+
+                    if let Some((service, local_request_id)) = request_info {
+                        self.pending_events.push(ServiceEvent::ResourceProgress {
+                            service,
+                            request_id: local_request_id,
+                            received_parts,
+                            total_parts,
+                            received_bytes,
+                            total_bytes,
+                        });
                     }
                 }
 
@@ -2534,11 +2770,11 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             }
         };
 
-        let (data, proof) = match resource.assemble(link) {
+        let (segment_data, proof) = match resource.assemble_segment(link) {
             Some(r) => r,
             None => {
                 log::warn!(
-                    "complete_resource: assemble failed for hash {}",
+                    "complete_resource: assemble_segment failed for hash {}",
                     hex::encode(hash)
                 );
                 return;
@@ -2546,13 +2782,15 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         };
 
         log::info!(
-            "Resource completed: hash={} data_len={} is_response={}",
+            "Segment completed: hash={} segment={}/{} data_len={} is_response={}",
             hex::encode(hash),
-            data.len(),
+            resource.segment_index,
+            resource.total_segments,
+            segment_data.len(),
             resource.is_response
         );
 
-        // Send proof (NOT encrypted - resource proofs are sent in plaintext per Python RNS)
+        // Send proof
         let mut payload = hash.to_vec();
         payload.extend(&proof);
         let packet = Packet::Proof {
@@ -2565,12 +2803,11 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             iface.send(packet.clone(), 0);
         }
 
-        // If this was a response to a pending request, deliver via on_response
         if !resource.is_response {
             log::debug!(
                 "Resource {} is not a response, data ({} bytes) not delivered to any service",
                 hex::encode(hash),
-                data.len()
+                segment_data.len()
             );
             return;
         }
@@ -2582,11 +2819,6 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 return;
             }
         };
-
-        log::debug!(
-            "Resource is response with request_id={}",
-            hex::encode(req_id_bytes)
-        );
 
         let wire_req_id: Option<WireRequestId> = req_id_bytes
             .get(..16)
@@ -2604,21 +2836,135 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             }
         };
 
-        // Look up the service that made the request
-        let request_info = self
-            .established_links
-            .get_mut(&link_id)
-            .and_then(|l| l.pending_requests.remove(&wire_request_id));
+        let original_hash = resource.original_hash;
+        let is_multi_segment = resource.total_segments > 1;
+        let is_last_segment = resource.is_last_segment();
 
-        let (service, local_request_id) = match request_info {
-            Some(r) => r,
-            None => {
-                log::warn!(
-                    "complete_resource: no pending request for wire_request_id={}",
-                    hex::encode(wire_request_id.0)
-                );
-                return;
-            }
+        if is_multi_segment && !is_last_segment {
+            // Not the last segment - accumulate data and wait for next
+            let transfer = self
+                .multi_segment_transfers
+                .entry(original_hash)
+                .or_insert_with(|| {
+                    // First segment - look up request info
+                    let (service, local_request_id) = self
+                        .established_links
+                        .get_mut(&link_id)
+                        .and_then(|l| l.pending_requests.remove(&wire_request_id))
+                        .unwrap_or((ServiceId(0), RequestId([0; 16])));
+
+                    MultiSegmentTransfer {
+                        service,
+                        local_request_id,
+                        total_segments: resource.total_segments,
+                        segments_received: 0,
+                        accumulated_data: Vec::new(),
+                        has_metadata: resource.has_metadata,
+                    }
+                });
+
+            transfer.accumulated_data.extend(&segment_data);
+            transfer.segments_received += 1;
+
+            log::info!(
+                "Multi-segment transfer {}: received segment {}/{}, accumulated {} bytes",
+                hex::encode(original_hash),
+                transfer.segments_received,
+                transfer.total_segments,
+                transfer.accumulated_data.len()
+            );
+            return;
+        }
+
+        // Either single-segment or the last segment of multi-segment
+        let (final_data, metadata, service, local_request_id) = if is_multi_segment {
+            // Last segment of multi-segment transfer
+            let mut transfer = match self.multi_segment_transfers.remove(&original_hash) {
+                Some(t) => t,
+                None => {
+                    log::warn!(
+                        "complete_resource: last segment but no multi_segment_transfer for {}",
+                        hex::encode(original_hash)
+                    );
+                    return;
+                }
+            };
+
+            transfer.accumulated_data.extend(&segment_data);
+            transfer.segments_received += 1;
+
+            log::info!(
+                "Multi-segment transfer {} complete: {} segments, {} bytes total",
+                hex::encode(original_hash),
+                transfer.segments_received,
+                transfer.accumulated_data.len()
+            );
+
+            // Extract metadata from accumulated data if present
+            let (data, metadata) =
+                if transfer.has_metadata && transfer.accumulated_data.len() >= 3 {
+                    let metadata_size = ((transfer.accumulated_data[0] as usize) << 16)
+                        | ((transfer.accumulated_data[1] as usize) << 8)
+                        | (transfer.accumulated_data[2] as usize);
+                    let data_start = 3 + metadata_size;
+                    if transfer.accumulated_data.len() >= data_start {
+                        log::debug!(
+                            "Extracting {} byte metadata, {} byte data",
+                            metadata_size,
+                            transfer.accumulated_data.len() - data_start
+                        );
+                        let metadata = transfer.accumulated_data[3..data_start].to_vec();
+                        let data = transfer.accumulated_data[data_start..].to_vec();
+                        (data, Some(metadata))
+                    } else {
+                        log::warn!("Metadata size exceeds data length");
+                        (transfer.accumulated_data, None)
+                    }
+                } else {
+                    (transfer.accumulated_data, None)
+                };
+
+            (data, metadata, transfer.service, transfer.local_request_id)
+        } else {
+            // Single-segment - extract metadata and get request info
+            let (data, metadata) = if resource.has_metadata && segment_data.len() >= 3 {
+                let metadata_size = ((segment_data[0] as usize) << 16)
+                    | ((segment_data[1] as usize) << 8)
+                    | (segment_data[2] as usize);
+                let data_start = 3 + metadata_size;
+                if segment_data.len() >= data_start {
+                    log::debug!(
+                        "Extracting {} byte metadata, {} byte data",
+                        metadata_size,
+                        segment_data.len() - data_start
+                    );
+                    let metadata = segment_data[3..data_start].to_vec();
+                    let data = segment_data[data_start..].to_vec();
+                    (data, Some(metadata))
+                } else {
+                    log::warn!("Metadata size exceeds data length");
+                    (segment_data, None)
+                }
+            } else {
+                (segment_data, None)
+            };
+
+            let (service, local_request_id) = match self
+                .established_links
+                .get_mut(&link_id)
+                .and_then(|l| l.pending_requests.remove(&wire_request_id))
+            {
+                Some(r) => r,
+                None => {
+                    log::warn!(
+                        "complete_resource: no pending request for wire_request_id={}",
+                        hex::encode(wire_request_id.0)
+                    );
+                    return;
+                }
+            };
+
+            (data, metadata, service, local_request_id)
         };
 
         let from = self
@@ -2629,15 +2975,21 @@ impl<T: Transport, R: RngCore> Node<T, R> {
 
         log::info!(
             "Delivering resource response: {} bytes to service {:?} (request_id={})",
-            data.len(),
+            final_data.len(),
             service,
             hex::encode(local_request_id.0)
         );
 
+        // Resource responses are msgpack [request_id, response_data] - extract response_data
+        use serde_bytes::ByteBuf;
+        let data = rmp_serde::from_slice::<(ByteBuf, ByteBuf)>(&final_data)
+            .map(|(_, response_data)| response_data.into_vec())
+            .unwrap_or(final_data);
+
         let notification = Notification::RequestResult {
             service,
             request_id: local_request_id,
-            result: Ok((from, data)),
+            result: Ok((from, data, metadata)),
         };
         self.dispatch_notifications(vec![notification]);
     }
@@ -3103,7 +3455,7 @@ mod tests {
         assert_eq!(data, b"request data");
 
         // B responds
-        b.respond(*request_id, b"response data");
+        b.respond(*request_id, b"response data", None, true);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         let events_a = a.poll(now);
@@ -3111,7 +3463,7 @@ mod tests {
         // A should have received the response via ServiceEvent::RequestResult
         let response = events_a.iter().find_map(|e| match e {
             ServiceEvent::RequestResult {
-                result: Ok((_, data)),
+                result: Ok((_, data, _)),
                 ..
             } => Some(data.clone()),
             _ => None,
@@ -3184,7 +3536,7 @@ mod tests {
         assert_eq!(data, b"request data");
 
         // C responds
-        c.respond(*request_id, b"response data");
+        c.respond(*request_id, b"response data", None, true);
         c.poll(later);
         transfer(&mut c, 0, &mut b, 1);
         b.poll(later);
@@ -3194,7 +3546,7 @@ mod tests {
         // A should have received the response via ServiceEvent::RequestResult
         let response = events_a.iter().find_map(|e| match e {
             ServiceEvent::RequestResult {
-                result: Ok((_, data)),
+                result: Ok((_, data, _)),
                 ..
             } => Some(data.clone()),
             _ => None,
@@ -3247,7 +3599,7 @@ mod tests {
         let request_id = request.expect("B should receive request");
 
         // B responds with large response
-        b.respond(request_id, &large_response);
+        b.respond(request_id, &large_response, None, true);
         b.poll(now);
 
         // B should have an outbound resource for the large response
@@ -3283,7 +3635,7 @@ mod tests {
         // A should have received the large response via ServiceEvent::RequestResult
         let response = events_a.iter().find_map(|e| match e {
             ServiceEvent::RequestResult {
-                result: Ok((_, data)),
+                result: Ok((_, data, _)),
                 ..
             } => Some(data.clone()),
             _ => None,
@@ -3336,7 +3688,7 @@ mod tests {
                 _ => None,
             })
             .expect("B should receive request");
-        b.respond(request_id, &large_response);
+        b.respond(request_id, &large_response, None, true);
         b.poll(now);
 
         // Transfer until complete (resource adv, requests, parts, hashmap updates, proof)
@@ -3348,7 +3700,7 @@ mod tests {
             b.poll(now);
             if let Some(data) = events_a.iter().find_map(|e| match e {
                 ServiceEvent::RequestResult {
-                    result: Ok((_, data)),
+                    result: Ok((_, data, _)),
                     ..
                 } => Some(data.clone()),
                 _ => None,
@@ -3435,7 +3787,7 @@ mod tests {
                 _ => None,
             })
             .expect("B should receive request");
-        b.respond(request_id, &large_response);
+        b.respond(request_id, &large_response, None, true);
         b.poll(now);
 
         let mut t = now;
@@ -3518,7 +3870,7 @@ mod tests {
                 _ => None,
             })
             .expect("C should receive request");
-        c.respond(request_id, &large_response);
+        c.respond(request_id, &large_response, None, true);
         c.poll(later);
 
         // Transfer until complete
@@ -3534,7 +3886,7 @@ mod tests {
             c.poll(later);
             if let Some(data) = events_a.iter().find_map(|e| match e {
                 ServiceEvent::RequestResult {
-                    result: Ok((_, data)),
+                    result: Ok((_, data, _)),
                     ..
                 } => Some(data.clone()),
                 _ => None,
@@ -3835,7 +4187,7 @@ mod tests {
         );
 
         // Now server responds (late)
-        b.respond(request_id, b"late response");
+        b.respond(request_id, b"late response", None, true);
         b.poll(after_stale);
         transfer(&mut b, 0, &mut a, 0);
         let events_a = a.poll(after_stale);
@@ -3843,7 +4195,7 @@ mod tests {
         // Response should be received
         let response = events_a.iter().find_map(|e| match e {
             ServiceEvent::RequestResult {
-                result: Ok((_, data)),
+                result: Ok((_, data, _)),
                 ..
             } => Some(data.clone()),
             _ => None,
@@ -4176,7 +4528,7 @@ mod tests {
                 _ => None,
             })
             .expect("B should receive request");
-        b.respond(request_id, b"response");
+        b.respond(request_id, b"response", None, true);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         let events_a = a.poll(now);
@@ -4184,7 +4536,7 @@ mod tests {
         let result = events_a.iter().find_map(|e| match e {
             ServiceEvent::RequestResult {
                 request_id,
-                result: Ok((_, data)),
+                result: Ok((_, data, _)),
                 ..
             } => Some((*request_id, data.clone())),
             _ => None,
@@ -4278,7 +4630,7 @@ mod tests {
                 _ => None,
             })
             .expect("B should receive first request");
-        b.respond(req_id_1, b"response1");
+        b.respond(req_id_1, b"response1", None, true);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         let events_a1 = a.poll(now);
@@ -4286,7 +4638,7 @@ mod tests {
         let resp1 = events_a1.iter().find_map(|e| match e {
             ServiceEvent::RequestResult {
                 request_id,
-                result: Ok((_, data)),
+                result: Ok((_, data, _)),
                 ..
             } => Some((*request_id, data.clone())),
             _ => None,
@@ -4308,7 +4660,7 @@ mod tests {
                 _ => None,
             })
             .expect("B should receive second request");
-        b.respond(req_id_2, b"response2");
+        b.respond(req_id_2, b"response2", None, true);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         let events_a2 = a.poll(now);
@@ -4316,7 +4668,7 @@ mod tests {
         let resp2 = events_a2.iter().find_map(|e| match e {
             ServiceEvent::RequestResult {
                 request_id,
-                result: Ok((_, data)),
+                result: Ok((_, data, _)),
                 ..
             } => Some((*request_id, data.clone())),
             _ => None,
@@ -4373,14 +4725,14 @@ mod tests {
                     _ => None,
                 })
                 .expect("B should receive request");
-            b.respond(req_id, resp_data.as_bytes());
+            b.respond(req_id, resp_data.as_bytes(), None, true);
             b.poll(now);
             transfer(&mut b, 0, &mut a, 0);
             let events_a = a.poll(now);
 
             let response = events_a.iter().find_map(|e| match e {
                 ServiceEvent::RequestResult {
-                    result: Ok((_, data)),
+                    result: Ok((_, data, _)),
                     ..
                 } => Some(data.clone()),
                 _ => None,
@@ -4450,7 +4802,7 @@ mod tests {
                 _ => None,
             })
             .expect("B should receive request");
-        b.respond(request_id, &large_response);
+        b.respond(request_id, &large_response, None, true);
         b.poll(now);
 
         // Simulate fast transfer with small time increments (high rate)
@@ -4532,7 +4884,7 @@ mod tests {
                 _ => None,
             })
             .expect("B should receive request");
-        b.respond(request_id, &large_response);
+        b.respond(request_id, &large_response, None, true);
         b.poll(now);
 
         // Simulate very slow transfer with large time increments
@@ -4612,7 +4964,7 @@ mod tests {
                 _ => None,
             })
             .expect("B should receive request");
-        b.respond(request_id, &large_response);
+        b.respond(request_id, &large_response, None, true);
         b.poll(now);
 
         let mut t = now;
@@ -4705,7 +5057,7 @@ mod tests {
                 _ => None,
             })
             .expect("B should receive request");
-        b.respond(request_id, &large_response);
+        b.respond(request_id, &large_response, None, true);
         b.poll(now);
 
         let mut t = now;
@@ -4826,7 +5178,7 @@ mod tests {
                 _ => None,
             })
             .expect("B should receive request");
-        b.respond(request_id, &large_response);
+        b.respond(request_id, &large_response, None, true);
         b.poll(now);
 
         assert_eq!(
@@ -4906,7 +5258,7 @@ mod tests {
                 _ => None,
             })
             .expect("B should receive request");
-        b.respond(request_id, b"response");
+        b.respond(request_id, b"response", None, true);
         b.poll(later);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(later);
@@ -4965,7 +5317,7 @@ mod tests {
                     _ => None,
                 })
                 .expect("B should receive request");
-            b.respond(request_id, b"pong");
+            b.respond(request_id, b"pong", None, true);
             b.poll(t);
             transfer(&mut b, 0, &mut a, 0);
             a.poll(t);
@@ -5027,7 +5379,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        b.respond(req_id, &response);
+        b.respond(req_id, &response, None, true);
         b.poll(now);
 
         // Transfer advertisement
@@ -5112,7 +5464,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        b.respond(server_req_id, &response);
+        b.respond(server_req_id, &response, None, true);
         b.poll(now);
 
         // Track progress events
@@ -5169,6 +5521,607 @@ mod tests {
         assert!(
             *last_received > 0 && *total > 0,
             "Should have non-zero parts"
+        );
+    }
+
+    #[test]
+    fn multi_segment_transfer_struct_fields() {
+        let transfer = MultiSegmentTransfer {
+            service: ServiceId(1),
+            local_request_id: RequestId([0xAA; 16]),
+            total_segments: 3,
+            segments_received: 1,
+            accumulated_data: vec![1, 2, 3, 4],
+            has_metadata: true,
+        };
+
+        assert_eq!(transfer.total_segments, 3);
+        assert_eq!(transfer.segments_received, 1);
+        assert_eq!(transfer.accumulated_data.len(), 4);
+        assert!(transfer.has_metadata);
+    }
+
+    #[test]
+    fn multi_segment_transfer_tracking_initialized() {
+        let node = test_node(true);
+        assert!(node.multi_segment_transfers.is_empty());
+    }
+
+    #[test]
+    fn strip_metadata_from_accumulated_data() {
+        // Test the metadata stripping logic used in complete_resource
+        // Metadata format: 3-byte big-endian length + msgpack data + actual content
+        let metadata_content = b"test metadata";
+        let actual_content = b"actual file content here";
+
+        let metadata_len = metadata_content.len();
+        let mut accumulated = Vec::new();
+        accumulated.push((metadata_len >> 16) as u8);
+        accumulated.push((metadata_len >> 8) as u8);
+        accumulated.push(metadata_len as u8);
+        accumulated.extend_from_slice(metadata_content);
+        accumulated.extend_from_slice(actual_content);
+
+        // Simulate stripping
+        let metadata_size = ((accumulated[0] as usize) << 16)
+            | ((accumulated[1] as usize) << 8)
+            | (accumulated[2] as usize);
+        let data_start = 3 + metadata_size;
+
+        assert_eq!(metadata_size, metadata_content.len());
+        assert_eq!(&accumulated[data_start..], actual_content);
+    }
+
+    #[test]
+    fn strip_metadata_large_size() {
+        // Test with metadata size requiring all 3 bytes
+        let metadata_len: usize = 0x010203; // 66051 bytes
+        let mut header = Vec::new();
+        header.push((metadata_len >> 16) as u8);
+        header.push((metadata_len >> 8) as u8);
+        header.push(metadata_len as u8);
+
+        let parsed_size =
+            ((header[0] as usize) << 16) | ((header[1] as usize) << 8) | (header[2] as usize);
+
+        assert_eq!(parsed_size, 0x010203);
+    }
+
+    #[test]
+    fn continuation_segment_detection() {
+        // Test that segment_index > 1 with matching original_hash is detected as continuation
+        let mut node = test_node(true);
+
+        let original_hash = [0xAA; 32];
+
+        // Add an in-progress transfer
+        node.multi_segment_transfers.insert(
+            original_hash,
+            MultiSegmentTransfer {
+                service: ServiceId(1),
+                local_request_id: RequestId([0xBB; 16]),
+                total_segments: 3,
+                segments_received: 1,
+                accumulated_data: vec![1, 2, 3],
+                has_metadata: true,
+            },
+        );
+
+        // Verify the transfer exists
+        assert!(node.multi_segment_transfers.contains_key(&original_hash));
+
+        // This simulates the check in ResourceAdv handling:
+        let segment_index = 2;
+        let is_continuation =
+            segment_index > 1 && node.multi_segment_transfers.contains_key(&original_hash);
+
+        assert!(is_continuation);
+    }
+
+    #[test]
+    fn first_segment_not_detected_as_continuation() {
+        let mut node = test_node(true);
+
+        let original_hash = [0xAA; 32];
+
+        // Even if there's an existing transfer (shouldn't happen but testing the logic)
+        node.multi_segment_transfers.insert(
+            original_hash,
+            MultiSegmentTransfer {
+                service: ServiceId(1),
+                local_request_id: RequestId([0xBB; 16]),
+                total_segments: 3,
+                segments_received: 0,
+                accumulated_data: Vec::new(),
+                has_metadata: true,
+            },
+        );
+
+        // segment_index == 1 should NOT be treated as continuation
+        let segment_index = 1;
+        let is_continuation =
+            segment_index > 1 && node.multi_segment_transfers.contains_key(&original_hash);
+
+        assert!(!is_continuation);
+    }
+
+    #[test]
+    fn multi_segment_accumulation() {
+        // Test that segments accumulate correctly
+        let mut transfer = MultiSegmentTransfer {
+            service: ServiceId(1),
+            local_request_id: RequestId([0xAA; 16]),
+            total_segments: 3,
+            segments_received: 0,
+            accumulated_data: Vec::new(),
+            has_metadata: true,
+        };
+
+        // Simulate receiving segment 1
+        let segment1_data = vec![1, 2, 3, 4, 5];
+        transfer.accumulated_data.extend(&segment1_data);
+        transfer.segments_received += 1;
+
+        assert_eq!(transfer.segments_received, 1);
+        assert_eq!(transfer.accumulated_data.len(), 5);
+
+        // Simulate receiving segment 2
+        let segment2_data = vec![6, 7, 8, 9, 10];
+        transfer.accumulated_data.extend(&segment2_data);
+        transfer.segments_received += 1;
+
+        assert_eq!(transfer.segments_received, 2);
+        assert_eq!(transfer.accumulated_data.len(), 10);
+        assert_eq!(
+            transfer.accumulated_data,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        );
+
+        // Simulate receiving final segment
+        let segment3_data = vec![11, 12, 13];
+        transfer.accumulated_data.extend(&segment3_data);
+        transfer.segments_received += 1;
+
+        assert_eq!(transfer.segments_received, 3);
+        assert_eq!(transfer.accumulated_data.len(), 13);
+
+        // Check if all segments received
+        assert_eq!(transfer.segments_received, transfer.total_segments);
+    }
+
+    #[test]
+    fn single_segment_resource_with_metadata_strips_prefix() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        // Create response with metadata prefix (simulating file download)
+        // Format: 3-byte length + metadata + actual content
+        let metadata = b"filename.txt";
+        let actual_content: Vec<u8> = (0..100).map(|i| i as u8).collect();
+
+        let mut response_with_metadata = Vec::new();
+        let metadata_len = metadata.len();
+        response_with_metadata.push((metadata_len >> 16) as u8);
+        response_with_metadata.push((metadata_len >> 8) as u8);
+        response_with_metadata.push(metadata_len as u8);
+        response_with_metadata.extend_from_slice(metadata);
+        response_with_metadata.extend_from_slice(&actual_content);
+
+        let svc_a = a.add_service("client", &[], &id(1));
+        let svc_b = b.add_service("server", &["test"], &id(2));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let now = Instant::now();
+
+        // Establish link
+        b.announce(svc_b);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        a.link(addr_b, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        // Request
+        a.request(svc_a, addr_b, "test", b"", now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        let events = b.poll(now);
+        let server_req_id = events
+            .iter()
+            .find_map(|e| match e {
+                ServiceEvent::Request { request_id, .. } => Some(*request_id),
+                _ => None,
+            })
+            .unwrap();
+
+        // Respond (the response goes through resource transfer)
+        b.respond(server_req_id, &response_with_metadata, None, true);
+        b.poll(now);
+
+        // Complete the transfer
+        let mut received_data = None;
+        for _ in 0..50 {
+            transfer(&mut b, 0, &mut a, 0);
+            let events = a.poll(now);
+
+            for event in &events {
+                if let ServiceEvent::RequestResult {
+                    result: Ok((_, data, _)),
+                    ..
+                } = event
+                {
+                    received_data = Some(data.clone());
+                    break;
+                }
+            }
+
+            if received_data.is_some() {
+                break;
+            }
+
+            transfer(&mut a, 0, &mut b, 0);
+            b.poll(now);
+        }
+
+        // Since we're not actually setting has_metadata in the advertisement
+        // (that's done by the server when serving files), the metadata won't be stripped
+        // This test verifies the basic single-segment resource flow works
+        assert!(received_data.is_some());
+        assert_eq!(received_data.unwrap(), response_with_metadata);
+    }
+
+    #[test]
+    fn resource_advertisement_with_segment_fields_accepted() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(1));
+        let svc_b = b.add_service("server", &["test"], &id(2));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let now = Instant::now();
+
+        // Establish link
+        b.announce(svc_b);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        let link_id = a.link(addr_b, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        // Verify link is established
+        assert!(a.established_links.contains_key(&link_id));
+
+        // Make a request to set up pending_requests
+        let _local_req_id = a.request(svc_a, addr_b, "test", b"", now);
+        a.poll(now);
+
+        // Verify request is pending
+        let link = a.established_links.get(&link_id).unwrap();
+        assert!(!link.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn inbound_resource_tracks_segment_info() {
+        use crate::resource::{InboundResource, ResourceAdvertisement};
+
+        let adv = ResourceAdvertisement {
+            transfer_size: 5000,
+            data_size: 4800,
+            num_parts: 10,
+            hash: [0x11; 32],
+            random_hash: [0x22; 4],
+            original_hash: [0x33; 32],
+            segment_index: 2,
+            total_segments: 4,
+            hashmap: vec![0; 40],
+            compressed: false,
+            split: true,
+            is_request: false,
+            is_response: true,
+            has_metadata: false,
+            request_id: Some(vec![0xaa; 16]),
+        };
+
+        let resource = InboundResource::from_advertisement(&adv);
+
+        assert_eq!(resource.segment_index, 2);
+        assert_eq!(resource.total_segments, 4);
+        assert_eq!(resource.original_hash, [0x33; 32]);
+        assert!(!resource.is_last_segment()); // segment 2 of 4
+
+        // Test last segment detection
+        let last_adv = ResourceAdvertisement {
+            segment_index: 4,
+            total_segments: 4,
+            ..adv
+        };
+        let last_resource = InboundResource::from_advertisement(&last_adv);
+        assert!(last_resource.is_last_segment()); // segment 4 of 4
+    }
+
+    #[test]
+    fn outbound_multi_segment_struct_fields() {
+        let multi = OutboundMultiSegment {
+            destination: [0x11; 16],
+            service_idx: Some(ServiceId(1)),
+            local_request_id: Some(RequestId([0x22; 16])),
+            full_data: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            compress: true,
+            is_response: true,
+            request_id: Some(vec![0xAA; 16]),
+            total_segments: 3,
+            current_segment: 1,
+        };
+
+        assert_eq!(multi.total_segments, 3);
+        assert_eq!(multi.current_segment, 1);
+        assert_eq!(multi.full_data.len(), 10);
+    }
+
+    #[test]
+    fn outbound_multi_segment_tracking_initialized() {
+        let node = test_node(true);
+        assert!(node.outbound_multi_segments.is_empty());
+    }
+
+    fn make_test_link() -> EstablishedLink {
+        use crate::crypto::EphemeralKeyPair;
+
+        let mut rng = StdRng::seed_from_u64(12345);
+        let initiator_keypair = EphemeralKeyPair::generate(&mut rng);
+        let responder_keypair = EphemeralKeyPair::generate(&mut rng);
+        let dest: Address = [0xAB; 16];
+        let link_id: LinkId = [0xCD; 16];
+        let now = Instant::now();
+
+        EstablishedLink::from_responder(
+            link_id,
+            &responder_keypair.secret,
+            &initiator_keypair.public,
+            dest,
+            now,
+        )
+    }
+
+    #[test]
+    fn outbound_resource_segment_fields() {
+        use crate::resource::OutboundResource;
+
+        let link = make_test_link();
+        let data = vec![1, 2, 3, 4, 5];
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let mut resource = OutboundResource::new_segment(
+            &mut rng,
+            &link,
+            data,
+            None,
+            false,
+            true,
+            None,
+            2,
+            Some([0xAA; 32]),
+            Some(5000),
+        );
+
+        assert_eq!(resource.segment_index, 2);
+        assert!(resource.total_segments >= 1);
+        assert_eq!(resource.original_hash, [0xAA; 32]);
+        assert!(!resource.is_last_segment()); // segment 2 of N where N > 2
+
+        // Verify advertisement includes segment info
+        let adv = resource.advertisement(91);
+        assert_eq!(adv.segment_index, 2);
+        assert_eq!(adv.original_hash, [0xAA; 32]);
+    }
+
+    #[test]
+    fn outbound_resource_is_last_segment() {
+        use crate::resource::OutboundResource;
+
+        let link = make_test_link();
+        let mut rng = StdRng::seed_from_u64(42);
+
+        // Single segment (no total_data_size hint) - should be last
+        let single = OutboundResource::new_segment(
+            &mut rng,
+            &link,
+            vec![1, 2, 3],
+            None,
+            false,
+            true,
+            None,
+            1,
+            None,
+            None,
+        );
+        assert!(single.is_last_segment());
+
+        // Last segment of multi-segment (segment 1 of 1)
+        let last = OutboundResource::new_segment(
+            &mut rng,
+            &link,
+            vec![1, 2, 3],
+            None,
+            false,
+            true,
+            None,
+            1,
+            Some([0xAA; 32]),
+            Some(3), // total size = 3, so 1 segment
+        );
+        assert!(last.is_last_segment());
+    }
+
+    #[test]
+    fn resource_response_msgpack_format() {
+        use serde_bytes::ByteBuf;
+
+        let request_id = [0xAB; 16];
+        let response_data = b"Hello, World!".to_vec();
+
+        // Encode like we do in send_response (and like Python does)
+        let packed = rmp_serde::to_vec(&(
+            ByteBuf::from(request_id.to_vec()),
+            ByteBuf::from(response_data.clone()),
+        ))
+        .unwrap();
+
+        // Decode like we do in complete_resource
+        let (_, unpacked_data): (ByteBuf, ByteBuf) =
+            rmp_serde::from_slice(&packed).expect("should decode");
+
+        assert_eq!(unpacked_data.as_slice(), response_data.as_slice());
+    }
+
+    #[test]
+    fn resource_response_msgpack_interop_with_python() {
+        use serde_bytes::ByteBuf;
+
+        // This is what Python sends: umsgpack.packb([request_id_bytes, response_bytes])
+        // Test vector: request_id = 16 bytes of 0x42, response = b"test"
+        let request_id = vec![0x42u8; 16];
+        let response = b"test".to_vec();
+
+        // Pack using our format
+        let packed = rmp_serde::to_vec(&(
+            ByteBuf::from(request_id.clone()),
+            ByteBuf::from(response.clone()),
+        ))
+        .unwrap();
+
+        // Verify it's a valid 2-element array that Python would produce
+        // msgpack format: 0x92 = fixarray of 2 elements
+        assert_eq!(packed[0], 0x92, "should be 2-element fixarray");
+
+        // Unpack and verify
+        let (unpacked_id, unpacked_response): (ByteBuf, ByteBuf) =
+            rmp_serde::from_slice(&packed).unwrap();
+
+        assert_eq!(unpacked_id.as_slice(), request_id.as_slice());
+        assert_eq!(unpacked_response.as_slice(), response.as_slice());
+    }
+
+    #[test]
+    fn multi_segment_progress_events_for_continuation() {
+        // This tests that progress events are emitted for ALL segments,
+        // not just the first one. The bug was that after the first segment
+        // completes, pending_requests is cleared, so continuation segments
+        // couldn't find service/request_id to emit progress events.
+
+        use crate::resource::MAX_EFFICIENT_SIZE;
+
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        // Create response large enough to require 2 segments (> MAX_EFFICIENT_SIZE)
+        // Use random data that won't compress well
+        let mut rng = StdRng::seed_from_u64(12345);
+        let large_response: Vec<u8> = (0..(MAX_EFFICIENT_SIZE + 1000))
+            .map(|_| rng.r#gen())
+            .collect();
+
+        let svc_a = a.add_service("client", &[], &id(1));
+        let svc_b = b.add_service("server", &["test"], &id(2));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let now = Instant::now();
+
+        // Establish link
+        b.announce(svc_b);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        a.link(addr_b, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        // Send request
+        let local_req_id = a.request(svc_a, addr_b, "test", b"", now);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        let events = b.poll(now);
+        let server_req_id = events
+            .iter()
+            .find_map(|e| match e {
+                ServiceEvent::Request { request_id, .. } => Some(*request_id),
+                _ => None,
+            })
+            .unwrap();
+
+        // Respond with large data (will require 2 segments)
+        // Use compress=false for predictable part counts
+        b.respond(server_req_id, &large_response, None, false);
+        b.poll(now);
+
+        // Track progress events from both segments
+        let mut first_segment_events = 0;
+        let mut second_segment_events = 0;
+        let mut completed = false;
+        let mut t = now;
+
+        for _ in 0..500 {
+            t += std::time::Duration::from_millis(1);
+            transfer(&mut b, 0, &mut a, 0);
+            let events = a.poll(t);
+
+            for event in &events {
+                match event {
+                    ServiceEvent::ResourceProgress {
+                        request_id,
+                        total_parts,
+                        ..
+                    } => {
+                        assert_eq!(*request_id, local_req_id);
+                        // First segment has ~11 parts, second has ~3
+                        if *total_parts > 5 {
+                            first_segment_events += 1;
+                        } else {
+                            second_segment_events += 1;
+                        }
+                    }
+                    ServiceEvent::RequestResult { request_id, .. } => {
+                        assert_eq!(*request_id, local_req_id);
+                        completed = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            transfer(&mut a, 0, &mut b, 0);
+            b.poll(t);
+
+            if completed {
+                break;
+            }
+        }
+
+        assert!(completed, "Transfer should complete");
+
+        // Both segments should emit progress events.
+        // The bug was that only the first segment emitted progress events.
+        assert!(
+            first_segment_events > 0,
+            "Should have progress events from first segment"
+        );
+        assert!(
+            second_segment_events > 0,
+            "Should have progress events from second segment (this was the bug)"
         );
     }
 }

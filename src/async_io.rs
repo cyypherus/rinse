@@ -219,8 +219,9 @@ impl Interface<AsyncTcpTransport> {
     }
 }
 
-type RequestWaiters =
-    Arc<StdMutex<HashMap<RequestId, oneshot::Sender<Result<Vec<u8>, RequestError>>>>>;
+type RequestWaiters = Arc<
+    StdMutex<HashMap<RequestId, oneshot::Sender<Result<(Vec<u8>, Option<Vec<u8>>), RequestError>>>>,
+>;
 type RespondWaiters = Arc<StdMutex<HashMap<RequestId, oneshot::Sender<Result<(), RespondError>>>>>;
 type EventReceiver = Arc<TokioMutex<mpsc::UnboundedReceiver<ServiceEvent>>>;
 
@@ -250,6 +251,8 @@ enum Command<T: Transport> {
     Respond {
         request_id: RequestId,
         data: Vec<u8>,
+        metadata: Option<Vec<u8>>,
+        compress: bool,
     },
     SendRaw {
         dest: Address,
@@ -399,7 +402,7 @@ impl<T: Transport> AsyncNode<T> {
         dest: Address,
         path: &str,
         data: &[u8],
-    ) -> Result<Vec<u8>, RequestError> {
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>), RequestError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.command_tx.send(Command::Request {
             service,
@@ -433,6 +436,8 @@ impl<T: Transport> AsyncNode<T> {
         service: ServiceId,
         request_id: RequestId,
         data: &[u8],
+        metadata: Option<&[u8]>,
+        compress: bool,
     ) -> Result<(), RespondError> {
         let respond_waiters = {
             let services = self.services.lock().unwrap();
@@ -451,6 +456,8 @@ impl<T: Transport> AsyncNode<T> {
         let _ = self.command_tx.send(Command::Respond {
             request_id,
             data: data.to_vec(),
+            metadata: metadata.map(|m| m.to_vec()),
+            compress,
         });
 
         waiter_rx.await.unwrap_or(Err(RespondError::LinkClosed))
@@ -519,7 +526,7 @@ impl<T: Transport> AsyncNode<T> {
                     if let Some(channels) = services.get(service) {
                         let mut waiters = channels.request_waiters.lock().unwrap();
                         if let Some(tx) = waiters.remove(request_id) {
-                            let _ = tx.send(result.clone().map(|(_, data)| data));
+                            let _ = tx.send(result.clone().map(|(_, data, metadata)| (data, metadata)));
                         }
                     }
                 }
@@ -567,8 +574,13 @@ impl<T: Transport> AsyncNode<T> {
                 let request_id = inner.node.request(service, dest, &path, &data, now);
                 let _ = reply.send(request_id);
             }
-            Command::Respond { request_id, data } => {
-                inner.node.respond(request_id, &data);
+            Command::Respond {
+                request_id,
+                data,
+                metadata,
+                compress,
+            } => {
+                inner.node.respond(request_id, &data, metadata.as_deref(), compress);
             }
             Command::SendRaw { dest, data } => {
                 inner.node.send_raw(dest, &data);

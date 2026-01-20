@@ -23,6 +23,8 @@ const RATE_VERY_SLOW: f64 = 250.0; // (2*1000) / 8 bytes/sec
 
 const SDU: usize = 470;
 
+pub(crate) const MAX_EFFICIENT_SIZE: usize = 1024 * 1024 - 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResourceStatus {
     Queued,
@@ -33,11 +35,14 @@ pub(crate) enum ResourceStatus {
 pub(crate) struct OutboundResource {
     pub hash: [u8; 32],
     pub random_hash: [u8; 4],
+    pub original_hash: [u8; 32],
     expected_proof: [u8; 32],
     pub status: ResourceStatus,
     pub metadata: Option<Vec<u8>>,
     pub compressed: bool,
     pub is_response: bool,
+    pub segment_index: usize,
+    pub total_segments: usize,
     pub request_id: Option<Vec<u8>>,
     parts: Vec<Vec<u8>>,
     hashmap: Vec<[u8; MAPHASH_LEN]>,
@@ -45,7 +50,7 @@ pub(crate) struct OutboundResource {
 }
 
 impl OutboundResource {
-    pub fn new<R: RngCore>(
+    pub fn new_segment<R: RngCore>(
         rng: &mut R,
         link: &EstablishedLink,
         data: Vec<u8>,
@@ -53,7 +58,18 @@ impl OutboundResource {
         compress: bool,
         is_response: bool,
         request_id: Option<Vec<u8>>,
+        segment_index: usize,
+        original_hash: Option<[u8; 32]>,
+        total_data_size: Option<usize>,
     ) -> Self {
+        let metadata_size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+        let total_size = total_data_size.unwrap_or(data.len()) + metadata_size;
+        let total_segments = if total_size <= MAX_EFFICIENT_SIZE {
+            1
+        } else {
+            (total_size - 1) / MAX_EFFICIENT_SIZE + 1
+        };
+
         // Compress for transmission if beneficial
         let (to_send, compressed) = if compress {
             if let Some(compressed_data) = bz2_compress(&data) {
@@ -70,6 +86,13 @@ impl OutboundResource {
         rng.fill_bytes(&mut encryption_padding);
 
         let mut plaintext = encryption_padding.to_vec();
+        if let Some(ref meta) = metadata {
+            let len = meta.len();
+            plaintext.push((len >> 16) as u8);
+            plaintext.push((len >> 8) as u8);
+            plaintext.push(len as u8);
+            plaintext.extend(meta);
+        }
         plaintext.extend(&to_send);
 
         let encrypted = link.encrypt(rng, &plaintext);
@@ -83,6 +106,9 @@ impl OutboundResource {
         let mut hash_input = data.clone();
         hash_input.extend(&random_hash);
         let hash: [u8; 32] = sha256(&hash_input);
+
+        // original_hash is the hash of the first segment (used to correlate segments)
+        let original_hash = original_hash.unwrap_or(hash);
 
         // expected_proof = SHA256(original_data + hash) - always over uncompressed original
         let mut proof_input = data;
@@ -102,16 +128,23 @@ impl OutboundResource {
         Self {
             hash,
             random_hash,
+            original_hash,
             expected_proof,
             status: ResourceStatus::Queued,
             metadata,
             compressed,
             is_response,
+            segment_index,
+            total_segments,
             request_id,
             parts,
             hashmap,
             hashmap_sent: 0,
         }
+    }
+
+    pub fn is_last_segment(&self) -> bool {
+        self.segment_index == self.total_segments
     }
 
     pub fn transfer_size(&self) -> usize {
@@ -139,12 +172,12 @@ impl OutboundResource {
             num_parts: self.parts.len(),
             hash: self.hash,
             random_hash: self.random_hash,
-            original_hash: self.hash, // Same as hash for non-segmented resources
-            segment_index: 1,
-            total_segments: 1,
+            original_hash: self.original_hash,
+            segment_index: self.segment_index,
+            total_segments: self.total_segments,
             hashmap: hashmap_chunk,
             compressed: self.compressed,
-            split: false,
+            split: self.total_segments > 1,
             is_request: false,
             is_response: self.is_response,
             has_metadata: self.metadata.is_some(),
@@ -179,9 +212,13 @@ impl OutboundResource {
 pub(crate) struct InboundResource {
     pub hash: [u8; 32],
     pub random_hash: [u8; 4],
+    pub original_hash: [u8; 32],
     pub status: ResourceStatus,
     pub compressed: bool,
     pub is_response: bool,
+    pub has_metadata: bool,
+    pub segment_index: usize,
+    pub total_segments: usize,
     pub request_id: Option<Vec<u8>>,
     num_parts: usize,
     hashmap: Vec<Option<[u8; MAPHASH_LEN]>>,
@@ -225,9 +262,13 @@ impl InboundResource {
         Self {
             hash: adv.hash,
             random_hash: adv.random_hash,
+            original_hash: adv.original_hash,
             status: ResourceStatus::Queued,
             compressed: adv.compressed,
             is_response: adv.is_response,
+            has_metadata: adv.has_metadata,
+            segment_index: adv.segment_index,
+            total_segments: adv.total_segments,
             request_id: adv.request_id.clone(),
             num_parts: adv.num_parts,
             hashmap,
@@ -399,9 +440,13 @@ impl InboundResource {
         self.total_bytes
     }
 
-    pub fn assemble(&self, link: &EstablishedLink) -> Option<(Vec<u8>, [u8; 32])> {
+    pub fn is_last_segment(&self) -> bool {
+        self.segment_index == self.total_segments
+    }
+
+    pub fn assemble_segment(&self, link: &EstablishedLink) -> Option<(Vec<u8>, [u8; 32])> {
         if !self.is_complete() {
-            log::warn!("Resource assemble called but not complete");
+            log::warn!("Resource assemble_segment called but not complete");
             return None;
         }
 
@@ -416,7 +461,7 @@ impl InboundResource {
             Some(p) => p,
             None => {
                 log::warn!(
-                    "Resource assemble: stream decryption failed ({} bytes)",
+                    "Resource assemble_segment: stream decryption failed ({} bytes)",
                     encrypted.len()
                 );
                 return None;
@@ -429,10 +474,9 @@ impl InboundResource {
             &plaintext[..plaintext.len().min(16)]
         );
 
-        // Strip off 4-byte random padding (not verified - just discarded like Python does)
         if plaintext.len() < 4 {
             log::warn!(
-                "Resource assemble: plaintext too short ({})",
+                "Resource assemble_segment: plaintext too short ({})",
                 plaintext.len()
             );
             return None;
@@ -443,7 +487,7 @@ impl InboundResource {
             match bz2_decompress(data) {
                 Some(d) => d,
                 None => {
-                    log::warn!("Resource assemble: bz2 decompression failed");
+                    log::warn!("Resource assemble_segment: bz2 decompression failed");
                     return None;
                 }
             }
@@ -451,26 +495,26 @@ impl InboundResource {
             data.to_vec()
         };
 
-        // Verify hash = SHA256(plaintext + random_hash)
         let mut hash_input = result.clone();
         hash_input.extend(&self.random_hash);
         let calculated_hash = sha256(&hash_input);
         if calculated_hash != self.hash {
             log::warn!(
-                "Resource assemble: hash mismatch (calculated {} expected {})",
+                "Resource assemble_segment: hash mismatch (calculated {} expected {})",
                 hex::encode(calculated_hash),
                 hex::encode(self.hash)
             );
             return None;
         }
 
-        // Compute proof = SHA256(plaintext + hash)
         let mut proof_input = result.clone();
         proof_input.extend(&self.hash);
         let proof = sha256(&proof_input);
 
         log::info!(
-            "Resource assembled successfully: {} bytes decompressed={}",
+            "Segment {}/{} assembled: {} bytes compressed={}",
+            self.segment_index,
+            self.total_segments,
             result.len(),
             self.compressed
         );
@@ -828,5 +872,171 @@ mod tests {
         assert_eq!(resource.hashmap[0], Some([0xAA; 4])); // segment 0
         assert_eq!(resource.hashmap[HASHMAP_MAX_LEN], Some([0xBB; 4])); // segment 1
         assert_eq!(resource.hashmap[segment2_start], Some([0xCC; 4])); // segment 2
+    }
+
+    #[test]
+    fn is_last_segment_single_segment() {
+        let adv = ResourceAdvertisement {
+            transfer_size: 1000,
+            data_size: 950,
+            num_parts: 3,
+            hash: [1u8; 32],
+            random_hash: [2u8; 4],
+            original_hash: [1u8; 32],
+            segment_index: 1,
+            total_segments: 1,
+            hashmap: vec![0; 12],
+            compressed: false,
+            split: false,
+            is_request: false,
+            is_response: true,
+            has_metadata: false,
+            request_id: Some(vec![0xaa; 16]),
+        };
+
+        let resource = InboundResource::from_advertisement(&adv);
+        assert!(resource.is_last_segment());
+        assert_eq!(resource.segment_index, 1);
+        assert_eq!(resource.total_segments, 1);
+    }
+
+    #[test]
+    fn is_last_segment_multi_segment_first() {
+        let adv = ResourceAdvertisement {
+            transfer_size: 1000,
+            data_size: 950,
+            num_parts: 3,
+            hash: [1u8; 32],
+            random_hash: [2u8; 4],
+            original_hash: [0u8; 32],
+            segment_index: 1,
+            total_segments: 3,
+            hashmap: vec![0; 12],
+            compressed: false,
+            split: true,
+            is_request: false,
+            is_response: true,
+            has_metadata: true,
+            request_id: Some(vec![0xaa; 16]),
+        };
+
+        let resource = InboundResource::from_advertisement(&adv);
+        assert!(!resource.is_last_segment());
+        assert_eq!(resource.segment_index, 1);
+        assert_eq!(resource.total_segments, 3);
+        assert!(resource.has_metadata);
+    }
+
+    #[test]
+    fn is_last_segment_multi_segment_middle() {
+        let adv = ResourceAdvertisement {
+            transfer_size: 1000,
+            data_size: 950,
+            num_parts: 3,
+            hash: [2u8; 32],
+            random_hash: [2u8; 4],
+            original_hash: [0u8; 32],
+            segment_index: 2,
+            total_segments: 3,
+            hashmap: vec![0; 12],
+            compressed: false,
+            split: true,
+            is_request: false,
+            is_response: true,
+            has_metadata: false,
+            request_id: Some(vec![0xaa; 16]),
+        };
+
+        let resource = InboundResource::from_advertisement(&adv);
+        assert!(!resource.is_last_segment());
+        assert_eq!(resource.segment_index, 2);
+        assert_eq!(resource.total_segments, 3);
+    }
+
+    #[test]
+    fn is_last_segment_multi_segment_last() {
+        let adv = ResourceAdvertisement {
+            transfer_size: 1000,
+            data_size: 950,
+            num_parts: 3,
+            hash: [3u8; 32],
+            random_hash: [2u8; 4],
+            original_hash: [0u8; 32],
+            segment_index: 3,
+            total_segments: 3,
+            hashmap: vec![0; 12],
+            compressed: false,
+            split: true,
+            is_request: false,
+            is_response: true,
+            has_metadata: false,
+            request_id: Some(vec![0xaa; 16]),
+        };
+
+        let resource = InboundResource::from_advertisement(&adv);
+        assert!(resource.is_last_segment());
+        assert_eq!(resource.segment_index, 3);
+        assert_eq!(resource.total_segments, 3);
+    }
+
+    #[test]
+    fn from_advertisement_copies_segment_fields() {
+        let adv = ResourceAdvertisement {
+            transfer_size: 5000,
+            data_size: 4800,
+            num_parts: 10,
+            hash: [0x11u8; 32],
+            random_hash: [0x22u8; 4],
+            original_hash: [0x33u8; 32],
+            segment_index: 2,
+            total_segments: 5,
+            hashmap: vec![0; 40],
+            compressed: true,
+            split: true,
+            is_request: false,
+            is_response: true,
+            has_metadata: true,
+            request_id: Some(vec![0xbb; 16]),
+        };
+
+        let resource = InboundResource::from_advertisement(&adv);
+        assert_eq!(resource.hash, adv.hash);
+        assert_eq!(resource.random_hash, adv.random_hash);
+        assert_eq!(resource.original_hash, adv.original_hash);
+        assert_eq!(resource.segment_index, 2);
+        assert_eq!(resource.total_segments, 5);
+        assert!(resource.compressed);
+        assert!(resource.is_response);
+        assert!(resource.has_metadata);
+    }
+
+    #[test]
+    fn advertisement_roundtrip_multi_segment() {
+        let adv = ResourceAdvertisement {
+            transfer_size: 2000000,
+            data_size: 1900000,
+            num_parts: 100,
+            hash: [0xAAu8; 32],
+            random_hash: [0xBBu8; 4],
+            original_hash: [0xCCu8; 32],
+            segment_index: 3,
+            total_segments: 5,
+            hashmap: vec![0xDD; 40],
+            compressed: true,
+            split: true,
+            is_request: false,
+            is_response: true,
+            has_metadata: true,
+            request_id: Some(vec![0xEE; 16]),
+        };
+
+        let encoded = adv.encode();
+        let decoded = ResourceAdvertisement::decode(&encoded).unwrap();
+
+        assert_eq!(decoded.segment_index, 3);
+        assert_eq!(decoded.total_segments, 5);
+        assert_eq!(decoded.original_hash, [0xCCu8; 32]);
+        assert!(decoded.split);
+        assert!(decoded.has_metadata);
     }
 }
