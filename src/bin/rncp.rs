@@ -253,7 +253,7 @@ async fn handle_listen_events(
     no_compress: bool,
 ) {
     loop {
-        let Some(event) = node.receive(service).await else {
+        let Some(event) = node.recv(service).await else {
             break;
         };
 
@@ -452,7 +452,7 @@ async fn send(args: Args) {
     let silent_clone = silent;
     let progress_task = tokio::spawn(async move {
         loop {
-            match node_for_progress.receive(service).await {
+            match node_for_progress.recv(service).await {
                 Some(ServiceEvent::ResourceProgress {
                     received_bytes,
                     total_bytes,
@@ -599,7 +599,7 @@ async fn fetch(args: Args) {
     let silent_clone = silent;
     let progress_task = tokio::spawn(async move {
         loop {
-            match node_for_progress.receive(service).await {
+            match node_for_progress.recv(service).await {
                 Some(ServiceEvent::ResourceProgress {
                     received_bytes,
                     total_bytes,

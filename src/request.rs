@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 
 use crate::crypto::sha256;
+use rmpv::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RequestId(pub [u8; 16]);
@@ -36,26 +37,55 @@ impl Request {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        rmp_serde::to_vec(&(
-            self.timestamp,
-            ByteBuf::from(self.path_hash.to_vec()),
-            self.data.as_ref().map(|d| ByteBuf::from(d.clone())),
-        ))
-        .unwrap_or_default()
+        let data_value: Value = match &self.data {
+            Some(d) => {
+                // If data is valid msgpack (e.g. a pre-encoded dict), embed it directly.
+                // Otherwise treat as raw binary (matches Python msgpack behavior).
+                // Must consume entire input to be valid msgpack.
+                let mut cursor = &d[..];
+                match rmpv::decode::read_value(&mut cursor) {
+                    Ok(v) if cursor.is_empty() => v,
+                    _ => Value::Binary(d.clone()),
+                }
+            }
+            None => Value::Nil,
+        };
+        let arr = Value::Array(vec![
+            Value::F64(self.timestamp),
+            Value::Binary(self.path_hash.to_vec()),
+            data_value,
+        ]);
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &arr).unwrap();
+        buf
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let (timestamp, path_hash_buf, data_buf): (f64, ByteBuf, Option<ByteBuf>) =
-            rmp_serde::from_slice(bytes).ok()?;
-        if path_hash_buf.len() != 16 {
+        let value = rmpv::decode::read_value(&mut &bytes[..]).ok()?;
+        let arr = value.as_array()?;
+        if arr.len() != 3 {
+            return None;
+        }
+        let timestamp = arr[0].as_f64()?;
+        let path_hash_bytes = arr[1].as_slice()?;
+        if path_hash_bytes.len() != 16 {
             return None;
         }
         let mut path_hash = [0u8; 16];
-        path_hash.copy_from_slice(&path_hash_buf);
+        path_hash.copy_from_slice(path_hash_bytes);
+        let data = match &arr[2] {
+            Value::Nil => None,
+            Value::Binary(b) => Some(b.clone()),
+            other => {
+                let mut buf = Vec::new();
+                rmpv::encode::write_value(&mut buf, other).ok()?;
+                Some(buf)
+            }
+        };
         Some(Self {
             timestamp,
             path_hash,
-            data: data_buf.map(|b| b.into_vec()),
+            data,
         })
     }
 }
@@ -95,14 +125,31 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
-    fn request_roundtrip() {
-        let req = Request::new("test/path", b"hello".to_vec());
+    fn request_roundtrip_no_data() {
+        let req = Request::new("test/path", vec![]);
         let encoded = req.encode();
         let decoded = Request::decode(&encoded).unwrap();
         assert_eq!(decoded.path_hash, req.path_hash);
-        assert_eq!(decoded.data, Some(b"hello".to_vec()));
+        assert_eq!(decoded.data, None);
+    }
+
+    #[test]
+    fn request_roundtrip_with_dict() {
+        let mut form_data = HashMap::new();
+        form_data.insert("field_username".to_string(), "alice".to_string());
+        let data = rmp_serde::to_vec(&form_data).unwrap();
+
+        let req = Request::new("test/path", data);
+        let encoded = req.encode();
+        let decoded = Request::decode(&encoded).unwrap();
+        assert_eq!(decoded.path_hash, req.path_hash);
+
+        let decoded_form: HashMap<String, String> =
+            rmp_serde::from_slice(&decoded.data.unwrap()).unwrap();
+        assert_eq!(decoded_form.get("field_username").unwrap(), "alice");
     }
 
     #[test]
@@ -123,29 +170,42 @@ mod tests {
 
     #[test]
     fn path_hash_matches_python() {
-        // Python: truncated_hash("test/path".encode('utf-8')).hex() = "b04c3b75c4731c02f72d2ea9afcd7b66"
         let h = path_hash("test/path");
         assert_eq!(hex::encode(h), "b04c3b75c4731c02f72d2ea9afcd7b66");
     }
 
     #[test]
-    fn request_decode_from_python() {
-        // Python output: 93cb41d26580b487df3bc410b04c3b75c4731c02f72d2ea9afcd7b66c40568656c6c6f
-        let python_packed =
-            hex::decode("93cb41d26580b487df3bc410b04c3b75c4731c02f72d2ea9afcd7b66c40568656c6c6f")
-                .unwrap();
-        let req = Request::decode(&python_packed).unwrap();
-        assert!((req.timestamp - 1234567890.123).abs() < 0.001);
+    fn request_no_data_matches_python() {
+        // Python: import umsgpack; umsgpack.packb([1234567890.123, bytes.fromhex("b04c3b75c4731c02f72d2ea9afcd7b66"), None]).hex()
+        // = "93cb41d26580b487df3bc410b04c3b75c4731c02f72d2ea9afcd7b66c0"
+        let mut req = Request::new("test/path", vec![]);
+        req.timestamp = 1234567890.123;
+        let encoded = req.encode();
         assert_eq!(
-            hex::encode(req.path_hash),
-            "b04c3b75c4731c02f72d2ea9afcd7b66"
+            hex::encode(&encoded),
+            "93cb41d26580b487df3bc410b04c3b75c4731c02f72d2ea9afcd7b66c0"
         );
-        assert_eq!(req.data, Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn request_with_dict_matches_python() {
+        // Python: import umsgpack; umsgpack.packb([1234567890.123, bytes.fromhex("b04c3b75c4731c02f72d2ea9afcd7b66"), {"field_username": "alice"}]).hex()
+        // = "93cb41d26580b487df3bc410b04c3b75c4731c02f72d2ea9afcd7b6681ae6669656c645f757365726e616d65a5616c696365"
+        let mut form_data = HashMap::new();
+        form_data.insert("field_username".to_string(), "alice".to_string());
+        let data = rmp_serde::to_vec(&form_data).unwrap();
+
+        let mut req = Request::new("test/path", data);
+        req.timestamp = 1234567890.123;
+        let encoded = req.encode();
+        assert_eq!(
+            hex::encode(&encoded),
+            "93cb41d26580b487df3bc410b04c3b75c4731c02f72d2ea9afcd7b6681ae6669656c645f757365726e616d65a5616c696365"
+        );
     }
 
     #[test]
     fn response_decode_from_python() {
-        // Python output: 92c410ababababababababababababababababc405776f726c64
         let python_packed =
             hex::decode("92c410ababababababababababababababababc405776f726c64").unwrap();
         let resp = Response::decode(&python_packed).unwrap();
@@ -157,22 +217,9 @@ mod tests {
     fn response_encode_matches_python() {
         let resp = Response::new(WireRequestId([0xAB; 16]), b"world".to_vec());
         let encoded = resp.encode();
-        // Python: 92c410ababababababababababababababababc405776f726c64
         assert_eq!(
             hex::encode(&encoded),
             "92c410ababababababababababababababababc405776f726c64"
-        );
-    }
-
-    #[test]
-    fn request_encode_matches_python() {
-        let mut req = Request::new("test/path", b"hello".to_vec());
-        req.timestamp = 1234567890.123;
-        let encoded = req.encode();
-        // Python: 93cb41d26580b487df3bc410b04c3b75c4731c02f72d2ea9afcd7b66c40568656c6c6f
-        assert_eq!(
-            hex::encode(&encoded),
-            "93cb41d26580b487df3bc410b04c3b75c4731c02f72d2ea9afcd7b66c40568656c6c6f"
         );
     }
 }

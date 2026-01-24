@@ -259,10 +259,6 @@ enum Command<T: Transport> {
         dest: Address,
         data: Vec<u8>,
     },
-    HasDestination {
-        dest: Address,
-        reply: oneshot::Sender<bool>,
-    },
     GetDestinations {
         reply: oneshot::Sender<Vec<Destination>>,
     },
@@ -274,10 +270,6 @@ enum Command<T: Transport> {
         destination: Address,
         reply: oneshot::Sender<Option<crate::LinkHandle>>,
     },
-    GetLink {
-        destination: Address,
-        reply: oneshot::Sender<Option<crate::LinkHandle>>,
-    },
     LinkStatus {
         link: crate::LinkHandle,
         reply: oneshot::Sender<crate::LinkStatus>,
@@ -286,40 +278,18 @@ enum Command<T: Transport> {
         link: crate::LinkHandle,
         reply: oneshot::Sender<Option<u64>>,
     },
-    LinkDestination {
-        link: crate::LinkHandle,
-        reply: oneshot::Sender<Option<Address>>,
-    },
-    ActiveLinks {
-        reply: oneshot::Sender<Vec<crate::LinkInfo>>,
-    },
     CloseLink {
         link: crate::LinkHandle,
     },
-    Identify {
+    SelfIdentify {
         link: crate::LinkHandle,
         identity: Box<crate::Identity>,
-    },
-    SendOnLink {
-        link: crate::LinkHandle,
-        data: Vec<u8>,
-        reply: oneshot::Sender<bool>,
     },
     LinkRequest {
         link: crate::LinkHandle,
         path: String,
         data: Vec<u8>,
         reply: oneshot::Sender<Option<RequestId>>,
-    },
-    GetChannel {
-        link: crate::LinkHandle,
-        reply: oneshot::Sender<Option<crate::ChannelHandle>>,
-    },
-    ChannelSend {
-        channel: crate::ChannelHandle,
-        message_type: u16,
-        data: Vec<u8>,
-        reply: oneshot::Sender<bool>,
     },
     AdvertiseResource {
         link: crate::LinkHandle,
@@ -337,9 +307,6 @@ enum Command<T: Transport> {
         packet_data: Vec<u8>,
         reply: oneshot::Sender<bool>,
     },
-    SetAutoIdentify {
-        identity: Option<Box<crate::Identity>>,
-    },
     AwaitLinkActive {
         link: crate::LinkHandle,
         reply: oneshot::Sender<bool>,
@@ -349,8 +316,6 @@ enum Command<T: Transport> {
 struct AsyncNodeInner<T: Transport> {
     node: crate::Node<T, StdRng>,
     command_rx: mpsc::UnboundedReceiver<Command<T>>,
-    auto_identify: Option<crate::Identity>,
-    identified_links: std::collections::HashSet<crate::LinkHandle>,
     link_waiters: LinkWaiters,
 }
 
@@ -384,8 +349,6 @@ impl<T: Transport> AsyncNode<T> {
             inner: Some(AsyncNodeInner {
                 node: crate::Node::with_rng(rng, transport),
                 command_rx,
-                auto_identify: None,
-                identified_links: std::collections::HashSet::new(),
                 link_waiters: HashMap::new(),
             }),
         }
@@ -453,15 +416,6 @@ impl<T: Transport> AsyncNode<T> {
             dest,
             data: data.to_vec(),
         });
-    }
-
-    pub async fn has_destination(&self, dest: &Address) -> bool {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.command_tx.send(Command::HasDestination {
-            dest: *dest,
-            reply: reply_tx,
-        });
-        reply_rx.await.unwrap_or(false)
     }
 
     pub async fn known_destinations(&self) -> Vec<Destination> {
@@ -545,7 +499,7 @@ impl<T: Transport> AsyncNode<T> {
         waiter_rx.await.unwrap_or(Err(RespondError::LinkClosed))
     }
 
-    pub async fn receive(&self, service: ServiceId) -> Option<ServiceEvent> {
+    pub async fn recv(&self, service: ServiceId) -> Option<ServiceEvent> {
         let event_rx = {
             let services = self.services.lock().unwrap();
             let channels = services
@@ -556,7 +510,7 @@ impl<T: Transport> AsyncNode<T> {
         event_rx.lock().await.recv().await
     }
 
-    pub async fn create_link(
+    pub async fn establish_link(
         &self,
         service: ServiceId,
         destination: Address,
@@ -567,16 +521,18 @@ impl<T: Transport> AsyncNode<T> {
             destination,
             reply: reply_tx,
         });
-        reply_rx.await.ok().flatten()
-    }
+        let link = reply_rx.await.ok().flatten()?;
 
-    pub async fn get_link(&self, destination: &Address) -> Option<crate::LinkHandle> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.command_tx.send(Command::GetLink {
-            destination: *destination,
-            reply: reply_tx,
+        let (active_tx, active_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::AwaitLinkActive {
+            link,
+            reply: active_tx,
         });
-        reply_rx.await.ok().flatten()
+        if active_rx.await.unwrap_or(false) {
+            Some(link)
+        } else {
+            None
+        }
     }
 
     pub async fn link_status(&self, link: crate::LinkHandle) -> crate::LinkStatus {
@@ -588,15 +544,6 @@ impl<T: Transport> AsyncNode<T> {
         reply_rx.await.unwrap_or(crate::LinkStatus::Closed)
     }
 
-    pub async fn await_link_active(&self, link: crate::LinkHandle) -> bool {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.command_tx.send(Command::AwaitLinkActive {
-            link,
-            reply: reply_tx,
-        });
-        reply_rx.await.unwrap_or(false)
-    }
-
     pub async fn link_rtt(&self, link: crate::LinkHandle) -> Option<u64> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.command_tx.send(Command::LinkRtt {
@@ -606,48 +553,15 @@ impl<T: Transport> AsyncNode<T> {
         reply_rx.await.ok().flatten()
     }
 
-    pub async fn link_destination(&self, link: crate::LinkHandle) -> Option<Address> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.command_tx.send(Command::LinkDestination {
-            link,
-            reply: reply_tx,
-        });
-        reply_rx.await.ok().flatten()
-    }
-
-    pub async fn active_links(&self) -> Vec<crate::LinkInfo> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self
-            .command_tx
-            .send(Command::ActiveLinks { reply: reply_tx });
-        reply_rx.await.unwrap_or_default()
-    }
-
     pub fn close_link(&self, link: crate::LinkHandle) {
         let _ = self.command_tx.send(Command::CloseLink { link });
     }
 
-    pub fn identify(&self, link: crate::LinkHandle, identity: &crate::Identity) {
-        let _ = self.command_tx.send(Command::Identify {
+    pub fn self_identify(&self, link: crate::LinkHandle, identity: &crate::Identity) {
+        let _ = self.command_tx.send(Command::SelfIdentify {
             link,
             identity: Box::new(identity.clone()),
         });
-    }
-
-    pub fn set_auto_identify(&self, identity: Option<&crate::Identity>) {
-        let _ = self.command_tx.send(Command::SetAutoIdentify {
-            identity: identity.map(|i| Box::new(i.clone())),
-        });
-    }
-
-    pub async fn send_on_link(&self, link: crate::LinkHandle, data: &[u8]) -> bool {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.command_tx.send(Command::SendOnLink {
-            link,
-            data: data.to_vec(),
-            reply: reply_tx,
-        });
-        reply_rx.await.unwrap_or(false)
     }
 
     pub async fn link_request(
@@ -664,31 +578,6 @@ impl<T: Transport> AsyncNode<T> {
             reply: reply_tx,
         });
         reply_rx.await.ok().flatten()
-    }
-
-    pub async fn get_channel(&self, link: crate::LinkHandle) -> Option<crate::ChannelHandle> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.command_tx.send(Command::GetChannel {
-            link,
-            reply: reply_tx,
-        });
-        reply_rx.await.ok().flatten()
-    }
-
-    pub async fn channel_send(
-        &self,
-        channel: crate::ChannelHandle,
-        message_type: u16,
-        data: &[u8],
-    ) -> bool {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.command_tx.send(Command::ChannelSend {
-            channel,
-            message_type,
-            data: data.to_vec(),
-            reply: reply_tx,
-        });
-        reply_rx.await.unwrap_or(false)
     }
 
     pub async fn advertise_resource(
@@ -843,14 +732,6 @@ impl<T: Transport> AsyncNode<T> {
                 data,
                 reply,
             } => {
-                if let Some(ref identity) = inner.auto_identify
-                    && let Some(link) = inner.node.get_link(&dest)
-                    && inner.node.link_status(link) == crate::LinkStatus::Active
-                    && !inner.identified_links.contains(&link)
-                {
-                    inner.node.identify(link, identity);
-                    inner.identified_links.insert(link);
-                }
                 let request_id = inner.node.request(service, dest, &path, &data, now);
                 let _ = reply.send(request_id);
             }
@@ -867,9 +748,6 @@ impl<T: Transport> AsyncNode<T> {
             Command::SendRaw { dest, data } => {
                 inner.node.send_raw(dest, &data);
             }
-            Command::HasDestination { dest, reply } => {
-                let _ = reply.send(inner.node.has_destination(&dest));
-            }
             Command::GetDestinations { reply } => {
                 let _ = reply.send(inner.node.known_destinations());
             }
@@ -883,29 +761,17 @@ impl<T: Transport> AsyncNode<T> {
             } => {
                 let _ = reply.send(inner.node.create_link(service, destination, now));
             }
-            Command::GetLink { destination, reply } => {
-                let _ = reply.send(inner.node.get_link(&destination));
-            }
             Command::LinkStatus { link, reply } => {
                 let _ = reply.send(inner.node.link_status(link));
             }
             Command::LinkRtt { link, reply } => {
                 let _ = reply.send(inner.node.link_rtt(link));
             }
-            Command::LinkDestination { link, reply } => {
-                let _ = reply.send(inner.node.link_destination(link));
-            }
-            Command::ActiveLinks { reply } => {
-                let _ = reply.send(inner.node.active_links());
-            }
             Command::CloseLink { link } => {
                 inner.node.close_link(link);
             }
-            Command::Identify { link, identity } => {
-                inner.node.identify(link, &identity);
-            }
-            Command::SendOnLink { link, data, reply } => {
-                let _ = reply.send(inner.node.send_on_link(link, &data));
+            Command::SelfIdentify { link, identity } => {
+                inner.node.self_identify(link, &identity);
             }
             Command::LinkRequest {
                 link,
@@ -914,17 +780,6 @@ impl<T: Transport> AsyncNode<T> {
                 reply,
             } => {
                 let _ = reply.send(inner.node.link_request(link, &path, &data, now));
-            }
-            Command::GetChannel { link, reply } => {
-                let _ = reply.send(inner.node.get_channel(link));
-            }
-            Command::ChannelSend {
-                channel,
-                message_type,
-                data,
-                reply,
-            } => {
-                let _ = reply.send(inner.node.channel_send(channel, message_type, &data));
             }
             Command::AdvertiseResource {
                 link,
@@ -948,10 +803,6 @@ impl<T: Transport> AsyncNode<T> {
                 reply,
             } => {
                 let _ = reply.send(inner.node.prove_packet(service, &packet_data));
-            }
-            Command::SetAutoIdentify { identity } => {
-                inner.auto_identify = identity.map(|b| *b);
-                inner.identified_links.clear();
             }
             Command::AwaitLinkActive { link, reply } => {
                 if inner.node.link_status(link) == crate::LinkStatus::Active {

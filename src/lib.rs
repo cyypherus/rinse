@@ -27,7 +27,7 @@ pub use aspect::AspectHash;
 pub use handle::{Destination, RequestError, RespondError, ServiceEvent, ServiceId};
 pub use identity::Identity;
 pub use interface::{Interface, Transport};
-pub use link_handle::{ChannelHandle, LinkHandle, LinkInfo, LinkStatus, ResourceHandle};
+pub use link_handle::{LinkHandle, LinkStatus, ResourceHandle};
 pub use node::Node;
 pub use packet::Address;
 pub use request::RequestId;

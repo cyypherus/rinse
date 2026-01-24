@@ -122,7 +122,7 @@ async fn main() {
                     node_clone.announce_with_app_data(service, Some(name_bytes.clone()));
                     log::debug!("Announced service");
                 }
-                event = node_clone.receive(service) => {
+                event = node_clone.recv(service) => {
                     let Some(event) = event else { break };
                     handle_event(&node_clone, service, &dir, event).await;
                 }

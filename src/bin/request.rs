@@ -93,7 +93,7 @@ async fn main() {
     let node_for_progress = node_clone.clone();
     let progress_task = tokio::spawn(async move {
         loop {
-            match node_for_progress.receive(service).await {
+            match node_for_progress.recv(service).await {
                 Some(ServiceEvent::ResourceProgress {
                     received_bytes,
                     total_bytes,

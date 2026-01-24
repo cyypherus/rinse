@@ -70,7 +70,7 @@ struct Receipt {
 }
 
 #[derive(Clone)]
-struct PathEntry {
+pub(crate) struct PathEntry {
     timestamp: Instant,
     next_hop: Address,
     hops: u8,
@@ -136,7 +136,7 @@ pub struct Node<T, R = ThreadRng> {
     retry_delay_ms: u64,
     rng: R,
     transport_id: Address,
-    path_table: HashMap<Address, PathEntry>,
+    pub(crate) path_table: HashMap<Address, PathEntry>,
     pending_announces: Vec<PendingAnnounce>,
     seen_packets: PacketHashlist,
     reverse_table: HashMap<Address, ReverseTableEntry>,
@@ -161,7 +161,7 @@ pub struct Node<T, R = ThreadRng> {
     multi_segment_transfers: HashMap<[u8; 32], MultiSegmentTransfer>,
     outbound_multi_segments: HashMap<[u8; 32], OutboundMultiSegment>,
     inbound_request_links: HashMap<RequestId, (WireRequestId, LinkId, ServiceId)>,
-    destination_links: HashMap<Address, LinkId>,
+    pub(crate) destination_links: HashMap<Address, LinkId>,
     pending_outbound_requests: HashMap<Address, Vec<(ServiceId, RequestId, String, Vec<u8>)>>,
     pending_path_requests: HashMap<Address, Instant>,
     discovery_path_requests: HashMap<Address, usize>,
@@ -602,10 +602,6 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         }
     }
 
-    pub fn has_destination(&self, dest: &Address) -> bool {
-        self.path_table.contains_key(dest)
-    }
-
     pub fn add_service(
         &mut self,
         name: &str,
@@ -734,12 +730,6 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         Some(crate::LinkHandle(link_id))
     }
 
-    pub fn get_link(&self, destination: &Address) -> Option<crate::LinkHandle> {
-        self.destination_links
-            .get(destination)
-            .map(|&id| crate::LinkHandle(id))
-    }
-
     pub fn link_status(&self, link: crate::LinkHandle) -> crate::LinkStatus {
         if self.pending_outbound_links.contains_key(&link.0) {
             return crate::LinkStatus::Pending;
@@ -759,27 +749,6 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         self.established_links.get(&link.0)?.rtt_ms
     }
 
-    pub fn link_destination(&self, link: crate::LinkHandle) -> Option<Address> {
-        self.established_links.get(&link.0).map(|l| l.destination)
-    }
-
-    pub fn active_links(&self) -> Vec<crate::LinkInfo> {
-        self.established_links
-            .iter()
-            .map(|(&id, link)| crate::LinkInfo {
-                handle: crate::LinkHandle(id),
-                destination: link.destination,
-                status: match link.state {
-                    LinkState::Handshake => crate::LinkStatus::Pending,
-                    LinkState::Active => crate::LinkStatus::Active,
-                    LinkState::Stale => crate::LinkStatus::Stale,
-                    LinkState::Closed => crate::LinkStatus::Closed,
-                },
-                rtt_ms: link.rtt_ms,
-            })
-            .collect()
-    }
-
     pub fn close_link(&mut self, link: crate::LinkHandle) {
         if let Some(l) = self.established_links.get(&link.0) {
             let dest = l.destination;
@@ -789,7 +758,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         self.pending_outbound_links.remove(&link.0);
     }
 
-    pub fn identify(&mut self, link: crate::LinkHandle, identity: &crate::Identity) {
+    pub fn self_identify(&mut self, link: crate::LinkHandle, identity: &crate::Identity) {
         use crate::link::LinkIdentify;
 
         if !self.established_links.contains_key(&link.0) {
@@ -798,32 +767,6 @@ impl<T: Transport, R: RngCore> Node<T, R> {
 
         let identify = LinkIdentify::create(&link.0, identity);
         self.send_link_packet(link.0, LinkContext::LinkIdentify, &identify.to_bytes());
-    }
-
-    pub fn send_on_link(&mut self, link: crate::LinkHandle, data: &[u8]) -> bool {
-        use crate::packet::LinkDataDestination;
-
-        let Some(established) = self.established_links.get(&link.0) else {
-            return false;
-        };
-        if established.state != LinkState::Active {
-            return false;
-        }
-
-        let ciphertext = established.encrypt(&mut self.rng, data);
-        let packet = Packet::LinkData {
-            hops: 0,
-            destination: LinkDataDestination::Direct(link.0),
-            context: LinkContext::None,
-            data: ciphertext,
-        };
-
-        for iface in &mut self.interfaces {
-            self.stats.packets_sent += 1;
-            self.stats.bytes_sent += packet.to_bytes().len() as u64;
-            iface.send(packet.clone(), 0);
-        }
-        true
     }
 
     pub fn link_request(
@@ -877,50 +820,6 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         }
 
         Some(local_request_id)
-    }
-
-    pub fn get_channel(&self, link: crate::LinkHandle) -> Option<crate::ChannelHandle> {
-        if !self.established_links.contains_key(&link.0) {
-            return None;
-        }
-        Some(crate::ChannelHandle { link_id: link.0 })
-    }
-
-    pub fn channel_send(
-        &mut self,
-        channel: crate::ChannelHandle,
-        message_type: u16,
-        data: &[u8],
-    ) -> bool {
-        use crate::packet::LinkDataDestination;
-
-        let Some(link) = self.established_links.get(&channel.link_id) else {
-            return false;
-        };
-        if link.state != LinkState::Active {
-            return false;
-        }
-
-        let mut payload = Vec::with_capacity(6 + data.len());
-        payload.extend_from_slice(&message_type.to_be_bytes());
-        payload.extend_from_slice(&0u16.to_be_bytes());
-        payload.extend_from_slice(&(data.len() as u16).to_be_bytes());
-        payload.extend_from_slice(data);
-
-        let ciphertext = link.encrypt(&mut self.rng, &payload);
-        let packet = Packet::LinkData {
-            hops: 0,
-            destination: LinkDataDestination::Direct(channel.link_id),
-            context: LinkContext::Channel,
-            data: ciphertext,
-        };
-
-        for iface in &mut self.interfaces {
-            self.stats.packets_sent += 1;
-            self.stats.bytes_sent += packet.to_bytes().len() as u64;
-            iface.send(packet.clone(), 0);
-        }
-        true
     }
 
     pub fn advertise_resource(
@@ -3543,7 +3442,7 @@ mod tests {
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
 
-        assert!(b.has_destination(&addr_a));
+        assert!(b.path_table.contains_key(&addr_a));
     }
 
     #[test]
@@ -3569,8 +3468,8 @@ mod tests {
         transfer(&mut b, 1, &mut c, 0);
         c.poll(later);
 
-        assert!(b.has_destination(&addr_a));
-        assert!(c.has_destination(&addr_a));
+        assert!(b.path_table.contains_key(&addr_a));
+        assert!(c.path_table.contains_key(&addr_a));
     }
 
     #[test]
@@ -3770,7 +3669,7 @@ mod tests {
         a.poll(now);
 
         // A should know about B's destination
-        assert!(a.has_destination(&addr_b));
+        assert!(a.path_table.contains_key(&addr_b));
 
         let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
@@ -3845,7 +3744,7 @@ mod tests {
         a.poll(later);
 
         // A should know about C's destination (via B as transport)
-        assert!(a.has_destination(&addr_c));
+        assert!(a.path_table.contains_key(&addr_c));
 
         let link_id = a.link(None, addr_c, later).unwrap();
         a.poll(later);
@@ -4634,7 +4533,7 @@ mod tests {
     }
 
     fn make_ifac_interface(ifac_identity: [u8; 32], ifac_key: Vec<u8>) -> Interface<MockTransport> {
-        Interface::new(MockTransport::new()).with_ifac(ifac_identity, ifac_key, 8)
+        Interface::new(MockTransport::new()).with_access_codes(ifac_identity, ifac_key, 8)
     }
 
     #[test]
@@ -4672,7 +4571,7 @@ mod tests {
 
         // A should have learned about B
         assert!(
-            a.has_destination(&addr_b),
+            a.path_table.contains_key(&addr_b),
             "A should know about B after IFAC-protected announce"
         );
 
@@ -4723,7 +4622,7 @@ mod tests {
         rng_a.fill_bytes(&mut ifac_identity_a);
         let ifac_key_a = vec![0xAA; 32];
         let iface_a =
-            Interface::new(MockTransport::new()).with_ifac(ifac_identity_a, ifac_key_a, 8);
+            Interface::new(MockTransport::new()).with_access_codes(ifac_identity_a, ifac_key_a, 8);
         a.add_interface(iface_a);
 
         // B uses different IFAC key
@@ -4732,7 +4631,7 @@ mod tests {
         rng_b.fill_bytes(&mut ifac_identity_b);
         let ifac_key_b = vec![0xBB; 32];
         let iface_b =
-            Interface::new(MockTransport::new()).with_ifac(ifac_identity_b, ifac_key_b, 8);
+            Interface::new(MockTransport::new()).with_access_codes(ifac_identity_b, ifac_key_b, 8);
         b.add_interface(iface_b);
 
         let svc_b = b.add_service("server", &[], &id(1));
@@ -4749,7 +4648,7 @@ mod tests {
 
         // A should NOT know about B (IFAC mismatch)
         assert!(
-            !a.has_destination(&addr_b),
+            !a.path_table.contains_key(&addr_b),
             "A should not learn about B with mismatched IFAC"
         );
     }
@@ -4781,7 +4680,7 @@ mod tests {
         );
 
         // A should know about B
-        assert!(a.has_destination(&addr_b));
+        assert!(a.path_table.contains_key(&addr_b));
 
         // Re-announce should not trigger again (not a new destination)
         b.announce(svc_b);
@@ -5045,7 +4944,7 @@ mod tests {
         a.poll(now);
 
         // A should know about B now
-        assert!(a.has_destination(&addr_b));
+        assert!(a.path_table.contains_key(&addr_b));
 
         // Establish link
         let link_id = a.link(None, addr_b, now).unwrap();
@@ -6495,9 +6394,9 @@ mod tests {
         let handle = b.create_link(svc_b, addr_a, t);
         assert!(handle.is_some());
 
-        let handle2 = b.get_link(&addr_a);
-        assert!(handle2.is_some());
-        assert_eq!(handle.unwrap().0, handle2.unwrap().0);
+        let link_id = b.destination_links.get(&addr_a);
+        assert!(link_id.is_some());
+        assert_eq!(handle.unwrap().0, *link_id.unwrap());
     }
 
     #[test]
@@ -6527,67 +6426,6 @@ mod tests {
         b.poll(t);
 
         assert_eq!(b.link_status(handle), crate::LinkStatus::Active);
-    }
-
-    #[test]
-    fn send_on_link_transmits_data() {
-        let mut a = test_node(true);
-        let mut b = test_node(true);
-        a.add_interface(test_interface());
-        b.add_interface(test_interface());
-
-        let svc_a = a.add_service("server", &[], &id(0));
-        let svc_b = b.add_service("client", &[], &id(1));
-        let addr_a = a.service_address(svc_a).unwrap();
-        let t = Instant::now();
-
-        a.announce(svc_a);
-        a.poll(t);
-        transfer(&mut a, 0, &mut b, 0);
-        b.poll(t);
-
-        let handle = b.create_link(svc_b, addr_a, t).unwrap();
-        b.poll(t);
-        transfer(&mut b, 0, &mut a, 0);
-        a.poll(t);
-        transfer(&mut a, 0, &mut b, 0);
-        b.poll(t);
-
-        assert!(b.send_on_link(handle, b"hello"));
-
-        transfer(&mut b, 0, &mut a, 0);
-        a.poll(t);
-    }
-
-    #[test]
-    fn channel_send_transmits_message() {
-        let mut a = test_node(true);
-        let mut b = test_node(true);
-        a.add_interface(test_interface());
-        b.add_interface(test_interface());
-
-        let svc_a = a.add_service("server", &[], &id(0));
-        let svc_b = b.add_service("client", &[], &id(1));
-        let addr_a = a.service_address(svc_a).unwrap();
-        let t = Instant::now();
-
-        a.announce(svc_a);
-        a.poll(t);
-        transfer(&mut a, 0, &mut b, 0);
-        b.poll(t);
-
-        let handle = b.create_link(svc_b, addr_a, t).unwrap();
-        b.poll(t);
-        transfer(&mut b, 0, &mut a, 0);
-        a.poll(t);
-        transfer(&mut a, 0, &mut b, 0);
-        b.poll(t);
-
-        let channel = b.get_channel(handle).unwrap();
-        assert!(b.channel_send(channel, 42, b"test message"));
-
-        transfer(&mut b, 0, &mut a, 0);
-        a.poll(t);
     }
 
     #[test]
@@ -6628,38 +6466,6 @@ mod tests {
     }
 
     #[test]
-    fn active_links_returns_established() {
-        let mut a = test_node(true);
-        let mut b = test_node(true);
-        a.add_interface(test_interface());
-        b.add_interface(test_interface());
-
-        let svc_a = a.add_service("server", &[], &id(0));
-        let svc_b = b.add_service("client", &[], &id(1));
-        let addr_a = a.service_address(svc_a).unwrap();
-        let t = Instant::now();
-
-        assert!(b.active_links().is_empty());
-
-        a.announce(svc_a);
-        a.poll(t);
-        transfer(&mut a, 0, &mut b, 0);
-        b.poll(t);
-
-        let _handle = b.create_link(svc_b, addr_a, t).unwrap();
-        b.poll(t);
-        transfer(&mut b, 0, &mut a, 0);
-        a.poll(t);
-        transfer(&mut a, 0, &mut b, 0);
-        b.poll(t);
-
-        let links = b.active_links();
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].destination, addr_a);
-        assert_eq!(links[0].status, crate::LinkStatus::Active);
-    }
-
-    #[test]
     fn close_link_removes_link() {
         let mut a = test_node(true);
         let mut b = test_node(true);
@@ -6683,11 +6489,10 @@ mod tests {
         transfer(&mut a, 0, &mut b, 0);
         b.poll(t);
 
-        assert_eq!(b.active_links().len(), 1);
+        assert_eq!(b.link_status(handle), crate::LinkStatus::Active);
 
         b.close_link(handle);
 
-        assert!(b.active_links().is_empty());
         assert_eq!(b.link_status(handle), crate::LinkStatus::Closed);
     }
 
@@ -6718,33 +6523,6 @@ mod tests {
         b.poll(t);
 
         assert!(b.link_rtt(handle).is_some());
-    }
-
-    #[test]
-    fn link_destination_returns_remote_address() {
-        let mut a = test_node(true);
-        let mut b = test_node(true);
-        a.add_interface(test_interface());
-        b.add_interface(test_interface());
-
-        let svc_a = a.add_service("server", &[], &id(0));
-        let svc_b = b.add_service("client", &[], &id(1));
-        let addr_a = a.service_address(svc_a).unwrap();
-        let t = Instant::now();
-
-        a.announce(svc_a);
-        a.poll(t);
-        transfer(&mut a, 0, &mut b, 0);
-        b.poll(t);
-
-        let handle = b.create_link(svc_b, addr_a, t).unwrap();
-        b.poll(t);
-        transfer(&mut b, 0, &mut a, 0);
-        a.poll(t);
-        transfer(&mut a, 0, &mut b, 0);
-        b.poll(t);
-
-        assert_eq!(b.link_destination(handle), Some(addr_a));
     }
 
     #[test]
@@ -6783,7 +6561,7 @@ mod tests {
                 .is_none()
         );
 
-        b.identify(handle, &client_id);
+        b.self_identify(handle, &client_id);
         b.poll(t);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(t);
@@ -6818,7 +6596,7 @@ mod tests {
         transfer(&mut a, 0, &mut b, 0);
         b.poll(t);
 
-        b.identify(handle, &client_id);
+        b.self_identify(handle, &client_id);
         b.poll(t);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(t);
@@ -6872,7 +6650,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(t2);
 
-        assert!(a.has_destination(&addr_d));
+        assert!(a.path_table.contains_key(&addr_d));
 
         let link_id = a.link(Some(svc_a), addr_d, t2).unwrap();
         a.poll(t2);
@@ -7335,7 +7113,7 @@ mod tests {
         let unknown_dest: Address = [0xAB; 16];
         let t = Instant::now();
 
-        assert!(!a.has_destination(&unknown_dest));
+        assert!(!a.path_table.contains_key(&unknown_dest));
 
         a.request_path(unknown_dest, t);
         a.poll(t);
@@ -7366,7 +7144,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(t1);
 
-        assert!(a.has_destination(&addr_c));
+        assert!(a.path_table.contains_key(&addr_c));
     }
 
     #[test]
@@ -7434,7 +7212,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(t1);
 
-        assert!(a.has_destination(&addr_c));
+        assert!(a.path_table.contains_key(&addr_c));
     }
 
     // Multi-hop Routing
@@ -7729,7 +7507,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(t1);
 
-        assert!(a.has_destination(&addr_c));
+        assert!(a.path_table.contains_key(&addr_c));
     }
 
     #[test]
