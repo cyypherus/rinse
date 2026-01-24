@@ -1,4 +1,4 @@
-use rinse::{AsyncNode, AsyncTcpTransport, Identity, Interface, RequestError, ServiceEvent};
+use rinse::{AsyncNode, AsyncTcpTransport, Identity, Interface, ServiceEvent};
 
 #[tokio::main]
 async fn main() {

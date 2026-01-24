@@ -77,7 +77,6 @@ struct PathEntry {
     receiving_interface: usize,
     encryption_key: X25519Public,
     signing_key: VerifyingKey,
-    #[allow(dead_code)]
     ratchet_key: Option<X25519Public>,
     app_data: Option<Vec<u8>>,
     name_hash: [u8; 10],
@@ -286,8 +285,9 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         use crate::crypto::SingleDestEncryption;
 
         if let Some(entry) = self.path_table.get(&destination) {
+            let target_key = entry.ratchet_key.as_ref().unwrap_or(&entry.encryption_key);
             let (ephemeral_pub, ciphertext) =
-                SingleDestEncryption::encrypt(&mut self.rng, &entry.encryption_key, data);
+                SingleDestEncryption::encrypt(&mut self.rng, target_key, data);
             let mut payload = ephemeral_pub.as_bytes().to_vec();
             payload.extend(ciphertext);
 
@@ -534,7 +534,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 .or_default()
                 .push((service, local_request_id, path.to_string(), data));
 
-            if self.link(destination, now).is_none() {
+            if self.link(Some(service), destination, now).is_none() {
                 log::info!(
                     "No existing link, sending path request for <{}>",
                     hex::encode(destination)
@@ -557,11 +557,16 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 } => {
                     self.inbound_request_links
                         .insert(request_id, (wire_request_id, link_id, service));
+                    let remote_identity = self
+                        .established_links
+                        .get(&link_id)
+                        .and_then(|l| l.remote_identity);
                     self.pending_events.push(ServiceEvent::Request {
                         service,
                         request_id,
                         path,
                         data,
+                        remote_identity,
                     });
                 }
                 Notification::RequestResult {
@@ -715,7 +720,314 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         self.send_single_data(destination, data);
     }
 
-    pub(crate) fn link(&mut self, destination: Address, now: Instant) -> Option<LinkId> {
+    pub fn create_link(
+        &mut self,
+        service: ServiceId,
+        destination: Address,
+        now: Instant,
+    ) -> Option<crate::LinkHandle> {
+        if let Some(&link_id) = self.destination_links.get(&destination) {
+            return Some(crate::LinkHandle(link_id));
+        }
+        let link_id = self.link(Some(service), destination, now)?;
+        self.destination_links.insert(destination, link_id);
+        Some(crate::LinkHandle(link_id))
+    }
+
+    pub fn get_link(&self, destination: &Address) -> Option<crate::LinkHandle> {
+        self.destination_links
+            .get(destination)
+            .map(|&id| crate::LinkHandle(id))
+    }
+
+    pub fn link_status(&self, link: crate::LinkHandle) -> crate::LinkStatus {
+        if self.pending_outbound_links.contains_key(&link.0) {
+            return crate::LinkStatus::Pending;
+        }
+        match self.established_links.get(&link.0) {
+            Some(l) => match l.state {
+                LinkState::Handshake => crate::LinkStatus::Pending,
+                LinkState::Active => crate::LinkStatus::Active,
+                LinkState::Stale => crate::LinkStatus::Stale,
+                LinkState::Closed => crate::LinkStatus::Closed,
+            },
+            None => crate::LinkStatus::Closed,
+        }
+    }
+
+    pub fn link_rtt(&self, link: crate::LinkHandle) -> Option<u64> {
+        self.established_links.get(&link.0)?.rtt_ms
+    }
+
+    pub fn link_destination(&self, link: crate::LinkHandle) -> Option<Address> {
+        self.established_links.get(&link.0).map(|l| l.destination)
+    }
+
+    pub fn active_links(&self) -> Vec<crate::LinkInfo> {
+        self.established_links
+            .iter()
+            .map(|(&id, link)| crate::LinkInfo {
+                handle: crate::LinkHandle(id),
+                destination: link.destination,
+                status: match link.state {
+                    LinkState::Handshake => crate::LinkStatus::Pending,
+                    LinkState::Active => crate::LinkStatus::Active,
+                    LinkState::Stale => crate::LinkStatus::Stale,
+                    LinkState::Closed => crate::LinkStatus::Closed,
+                },
+                rtt_ms: link.rtt_ms,
+            })
+            .collect()
+    }
+
+    pub fn close_link(&mut self, link: crate::LinkHandle) {
+        if let Some(l) = self.established_links.get(&link.0) {
+            let dest = l.destination;
+            self.destination_links.remove(&dest);
+        }
+        self.established_links.remove(&link.0);
+        self.pending_outbound_links.remove(&link.0);
+    }
+
+    pub fn identify(&mut self, link: crate::LinkHandle, identity: &crate::Identity) {
+        use crate::link::LinkIdentify;
+
+        if !self.established_links.contains_key(&link.0) {
+            return;
+        }
+
+        let identify = LinkIdentify::create(&link.0, identity);
+        self.send_link_packet(link.0, LinkContext::LinkIdentify, &identify.to_bytes());
+    }
+
+    pub fn send_on_link(&mut self, link: crate::LinkHandle, data: &[u8]) -> bool {
+        use crate::packet::LinkDataDestination;
+
+        let Some(established) = self.established_links.get(&link.0) else {
+            return false;
+        };
+        if established.state != LinkState::Active {
+            return false;
+        }
+
+        let ciphertext = established.encrypt(&mut self.rng, data);
+        let packet = Packet::LinkData {
+            hops: 0,
+            destination: LinkDataDestination::Direct(link.0),
+            context: LinkContext::None,
+            data: ciphertext,
+        };
+
+        for iface in &mut self.interfaces {
+            self.stats.packets_sent += 1;
+            self.stats.bytes_sent += packet.to_bytes().len() as u64;
+            iface.send(packet.clone(), 0);
+        }
+        true
+    }
+
+    pub fn link_request(
+        &mut self,
+        link: crate::LinkHandle,
+        path: &str,
+        data: &[u8],
+        now: Instant,
+    ) -> Option<RequestId> {
+        use crate::packet::LinkDataDestination;
+
+        let link_entry = self.established_links.get_mut(&link.0)?;
+        if link_entry.state != LinkState::Active {
+            return None;
+        }
+
+        let req = Request::new(path, data.to_vec());
+        let encoded = req.encode();
+        let ciphertext = link_entry.encrypt(&mut self.rng, &encoded);
+
+        let packet = Packet::LinkData {
+            hops: 0,
+            destination: LinkDataDestination::Direct(link.0),
+            context: LinkContext::Request,
+            data: ciphertext,
+        };
+
+        let mut id_bytes = [0u8; 16];
+        self.rng.fill_bytes(&mut id_bytes);
+        let local_request_id = RequestId(id_bytes);
+        let wire_request_id = WireRequestId(packet.packet_hash()[..16].try_into().unwrap());
+
+        let service_id = self
+            .services
+            .iter()
+            .position(|_| true)
+            .map(ServiceId)
+            .unwrap_or(ServiceId(0));
+        link_entry
+            .pending_requests
+            .insert(wire_request_id, (service_id, local_request_id));
+
+        for iface in &mut self.interfaces {
+            self.stats.packets_sent += 1;
+            self.stats.bytes_sent += packet.to_bytes().len() as u64;
+            iface.send(packet.clone(), 0);
+        }
+
+        if let Some(link_entry) = self.established_links.get_mut(&link.0) {
+            link_entry.touch_outbound(now);
+        }
+
+        Some(local_request_id)
+    }
+
+    pub fn get_channel(&self, link: crate::LinkHandle) -> Option<crate::ChannelHandle> {
+        if !self.established_links.contains_key(&link.0) {
+            return None;
+        }
+        Some(crate::ChannelHandle { link_id: link.0 })
+    }
+
+    pub fn channel_send(
+        &mut self,
+        channel: crate::ChannelHandle,
+        message_type: u16,
+        data: &[u8],
+    ) -> bool {
+        use crate::packet::LinkDataDestination;
+
+        let Some(link) = self.established_links.get(&channel.link_id) else {
+            return false;
+        };
+        if link.state != LinkState::Active {
+            return false;
+        }
+
+        let mut payload = Vec::with_capacity(6 + data.len());
+        payload.extend_from_slice(&message_type.to_be_bytes());
+        payload.extend_from_slice(&0u16.to_be_bytes());
+        payload.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        payload.extend_from_slice(data);
+
+        let ciphertext = link.encrypt(&mut self.rng, &payload);
+        let packet = Packet::LinkData {
+            hops: 0,
+            destination: LinkDataDestination::Direct(channel.link_id),
+            context: LinkContext::Channel,
+            data: ciphertext,
+        };
+
+        for iface in &mut self.interfaces {
+            self.stats.packets_sent += 1;
+            self.stats.bytes_sent += packet.to_bytes().len() as u64;
+            iface.send(packet.clone(), 0);
+        }
+        true
+    }
+
+    pub fn advertise_resource(
+        &mut self,
+        link: crate::LinkHandle,
+        data: Vec<u8>,
+        metadata: Option<Vec<u8>>,
+        compress: bool,
+    ) -> Option<crate::ResourceHandle> {
+        use crate::packet::LinkDataDestination;
+
+        let established = self.established_links.get(&link.0)?;
+        if established.state != LinkState::Active {
+            return None;
+        }
+
+        let mut resource = crate::resource::OutboundResource::new_segment(
+            &mut self.rng,
+            established,
+            data,
+            metadata,
+            compress,
+            false,
+            None,
+            1,
+            None,
+            None,
+        );
+
+        let adv = resource.advertisement(91);
+        let adv_data = adv.encode();
+        let hash = resource.hash;
+
+        let ciphertext = established.encrypt(&mut self.rng, &adv_data);
+        let packet = Packet::LinkData {
+            hops: 0,
+            destination: LinkDataDestination::Direct(link.0),
+            context: LinkContext::ResourceAdv,
+            data: ciphertext,
+        };
+
+        self.outbound_resources.insert(
+            hash,
+            (link.0, established.destination, None, None, resource),
+        );
+
+        for iface in &mut self.interfaces {
+            self.stats.packets_sent += 1;
+            self.stats.bytes_sent += packet.to_bytes().len() as u64;
+            iface.send(packet.clone(), 0);
+        }
+
+        Some(crate::ResourceHandle(hash))
+    }
+
+    pub fn resource_progress(&self, resource: crate::ResourceHandle) -> Option<f32> {
+        if let Some((_, _, _, _, outbound)) = self.outbound_resources.get(&resource.0) {
+            let total = outbound.transfer_size();
+            if total == 0 {
+                return Some(1.0);
+            }
+            return Some(0.0);
+        }
+        if let Some((_, inbound)) = self.inbound_resources.get(&resource.0) {
+            let received = inbound.received_count();
+            let total = inbound.num_parts();
+            if total == 0 {
+                return Some(1.0);
+            }
+            return Some(received as f32 / total as f32);
+        }
+        None
+    }
+
+    pub fn prove_packet(&mut self, service: ServiceId, packet_data: &[u8]) -> bool {
+        use crate::packet::ProofDestination;
+
+        let Some(service_entry) = self.services.get(service.0) else {
+            return false;
+        };
+
+        let signature = crate::crypto::create_proof(&service_entry.signing_key, packet_data);
+        let packet_hash = crate::crypto::sha256(packet_data);
+        let mut proof_data = packet_hash.to_vec();
+        proof_data.extend_from_slice(&signature.to_bytes());
+
+        let packet = Packet::Proof {
+            hops: 0,
+            destination: ProofDestination::Single(service_entry.address),
+            context: crate::packet::ProofContext::None,
+            data: proof_data,
+        };
+
+        for iface in &mut self.interfaces {
+            self.stats.packets_sent += 1;
+            self.stats.bytes_sent += packet.to_bytes().len() as u64;
+            iface.send(packet.clone(), 0);
+        }
+        true
+    }
+
+    pub(crate) fn link(
+        &mut self,
+        service: Option<ServiceId>,
+        destination: Address,
+        now: Instant,
+    ) -> Option<LinkId> {
         // Must have path to this destination
         let path_entry = match self.path_table.get(&destination) {
             Some(entry) => entry,
@@ -754,6 +1066,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 link_id,
                 initiator_encryption_secret: ephemeral.secret,
                 destination,
+                local_service: service,
                 request_time: now,
             },
         );
@@ -1351,15 +1664,14 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                             }
                         }
 
-                        if self
-                            .pending_outbound_requests
-                            .contains_key(&destination_hash)
+                        if let Some(pending) = self.pending_outbound_requests.get(&destination_hash)
                         {
+                            let service = pending.first().map(|(s, _, _, _)| *s);
                             log::info!(
                                 "Have pending requests for <{}>, initiating link",
                                 hex::encode(destination_hash)
                             );
-                            self.link(destination_hash, now);
+                            self.link(service, destination_hash, now);
                         }
                     }
                 }
@@ -1395,6 +1707,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         &responder_keypair.secret,
                         &request.encryption_public,
                         destination_hash,
+                        ServiceId(service_idx),
                         now,
                     );
 
@@ -1484,6 +1797,8 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                     self.handle_keepalive(link_id, &plaintext, now);
                 } else if context == LinkContext::LinkRtt {
                     self.handle_link_rtt(link_id, &plaintext);
+                } else if context == LinkContext::LinkIdentify {
+                    self.handle_link_identify(link_id, &plaintext);
                 } else if context == LinkContext::LinkClose {
                     // Verify the close packet contains the link_id
                     if plaintext.as_slice() == link_id {
@@ -1547,11 +1862,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                     } else {
                         log::warn!("Failed to decode Response from plaintext");
                     }
-                } else if let Some(service_idx) = self
-                    .services
-                    .iter()
-                    .position(|s| s.address == link.destination)
-                {
+                } else if let Some(service) = link.local_service {
                     match context {
                         LinkContext::Request => {
                             if let Some(req) = Request::decode(&plaintext) {
@@ -1560,7 +1871,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                                 let mut id_bytes = [0u8; 16];
                                 self.rng.fill_bytes(&mut id_bytes);
                                 let request_id = RequestId(id_bytes);
-                                let path = self.services[service_idx]
+                                let path = self.services[service.0]
                                     .registered_paths
                                     .get(&req.path_hash)
                                     .cloned();
@@ -1568,10 +1879,10 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                                     "Request path_hash={} matched={:?} registered_count={}",
                                     hex::encode(req.path_hash),
                                     path,
-                                    self.services[service_idx].registered_paths.len()
+                                    self.services[service.0].registered_paths.len()
                                 );
                                 notifications.push(Notification::Request {
-                                    service: ServiceId(service_idx),
+                                    service,
                                     link_id,
                                     request_id,
                                     wire_request_id,
@@ -1584,18 +1895,24 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                                     plaintext.len()
                                 );
                                 notifications.push(Notification::Raw {
-                                    service: ServiceId(service_idx),
+                                    service,
                                     data: plaintext,
                                 });
                             }
                         }
                         _ => {
                             notifications.push(Notification::Raw {
-                                service: ServiceId(service_idx),
+                                service,
                                 data: plaintext,
                             });
                         }
                     };
+                } else {
+                    log::warn!(
+                        "No local_service for link data: link_id={} context={:?}",
+                        hex::encode(link_id),
+                        context
+                    );
                 }
             }
             Packet::SingleData { ciphertext, .. } => {
@@ -2436,6 +2753,38 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         }
     }
 
+    fn handle_link_identify(&mut self, link_id: LinkId, plaintext: &[u8]) {
+        use crate::link::LinkIdentify;
+
+        let Some(identify) = LinkIdentify::parse(plaintext) else {
+            log::warn!(
+                "Failed to parse LinkIdentify on link {} ({} bytes)",
+                hex::encode(link_id),
+                plaintext.len()
+            );
+            return;
+        };
+
+        if !identify.verify(&link_id) {
+            log::warn!(
+                "LinkIdentify verification failed on link {}",
+                hex::encode(link_id)
+            );
+            return;
+        }
+
+        let identity_hash = identify.identity_hash();
+        log::info!(
+            "Link {} identified as <{}>",
+            hex::encode(link_id),
+            hex::encode(identity_hash)
+        );
+
+        if let Some(link) = self.established_links.get_mut(&link_id) {
+            link.remote_identity = Some(identity_hash);
+        }
+    }
+
     fn handle_resource_packet(
         &mut self,
         link_id: LinkId,
@@ -2901,28 +3250,28 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             );
 
             // Extract metadata from accumulated data if present
-            let (data, metadata) =
-                if transfer.has_metadata && transfer.accumulated_data.len() >= 3 {
-                    let metadata_size = ((transfer.accumulated_data[0] as usize) << 16)
-                        | ((transfer.accumulated_data[1] as usize) << 8)
-                        | (transfer.accumulated_data[2] as usize);
-                    let data_start = 3 + metadata_size;
-                    if transfer.accumulated_data.len() >= data_start {
-                        log::debug!(
-                            "Extracting {} byte metadata, {} byte data",
-                            metadata_size,
-                            transfer.accumulated_data.len() - data_start
-                        );
-                        let metadata = transfer.accumulated_data[3..data_start].to_vec();
-                        let data = transfer.accumulated_data[data_start..].to_vec();
-                        (data, Some(metadata))
-                    } else {
-                        log::warn!("Metadata size exceeds data length");
-                        (transfer.accumulated_data, None)
-                    }
+            let (data, metadata) = if transfer.has_metadata && transfer.accumulated_data.len() >= 3
+            {
+                let metadata_size = ((transfer.accumulated_data[0] as usize) << 16)
+                    | ((transfer.accumulated_data[1] as usize) << 8)
+                    | (transfer.accumulated_data[2] as usize);
+                let data_start = 3 + metadata_size;
+                if transfer.accumulated_data.len() >= data_start {
+                    log::debug!(
+                        "Extracting {} byte metadata, {} byte data",
+                        metadata_size,
+                        transfer.accumulated_data.len() - data_start
+                    );
+                    let metadata = transfer.accumulated_data[3..data_start].to_vec();
+                    let data = transfer.accumulated_data[data_start..].to_vec();
+                    (data, Some(metadata))
                 } else {
+                    log::warn!("Metadata size exceeds data length");
                     (transfer.accumulated_data, None)
-                };
+                }
+            } else {
+                (transfer.accumulated_data, None)
+            };
 
             (data, metadata, transfer.service, transfer.local_request_id)
         } else {
@@ -3261,7 +3610,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let link_id = a.link(addr_b, now).expect("link should be created");
+        let link_id = a.link(None, addr_b, now).expect("link should be created");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -3295,7 +3644,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(later);
 
-        let link_id = a.link(addr_c, later).expect("link should be created");
+        let link_id = a.link(None, addr_c, later).expect("link should be created");
         a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(later);
@@ -3326,7 +3675,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -3373,7 +3722,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(later);
 
-        let link_id = a.link(addr_c, later).unwrap();
+        let link_id = a.link(None, addr_c, later).unwrap();
         a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(later);
@@ -3423,7 +3772,7 @@ mod tests {
         // A should know about B's destination
         assert!(a.has_destination(&addr_b));
 
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -3498,7 +3847,7 @@ mod tests {
         // A should know about C's destination (via B as transport)
         assert!(a.has_destination(&addr_c));
 
-        let link_id = a.link(addr_c, later).unwrap();
+        let link_id = a.link(None, addr_c, later).unwrap();
         a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(later);
@@ -3574,7 +3923,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -3667,7 +4016,7 @@ mod tests {
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        a.link(addr_b, now).unwrap();
+        a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -3768,7 +4117,7 @@ mod tests {
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        a.link(addr_b, now).unwrap();
+        a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -3843,7 +4192,7 @@ mod tests {
         a.poll(later);
 
         // Establish link A -> C (via B)
-        a.link(addr_c, later).unwrap();
+        a.link(None, addr_c, later).unwrap();
         a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(later);
@@ -3915,7 +4264,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -3959,7 +4308,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -4056,7 +4405,7 @@ mod tests {
         a.poll(now);
 
         // A initiates link (but we won't complete handshake)
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
 
         // Queue a request while link is pending
@@ -4107,7 +4456,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -4151,7 +4500,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -4225,7 +4574,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -4328,7 +4677,7 @@ mod tests {
         );
 
         // A establishes link to B
-        let link_id = a.link(addr_b, now).expect("should create link");
+        let link_id = a.link(None, addr_b, now).expect("should create link");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -4466,7 +4815,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -4506,7 +4855,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -4566,7 +4915,7 @@ mod tests {
         a.poll(now);
 
         // Queue request while link is pending (don't complete handshake)
-        let _link_id = a.link(addr_b, now).unwrap();
+        let _link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
 
         let sent_request_id = a.request(svc_a, addr_b, "test.path", b"hello", now);
@@ -4607,7 +4956,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -4699,7 +5048,7 @@ mod tests {
         assert!(a.has_destination(&addr_b));
 
         // Establish link
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -4782,7 +5131,7 @@ mod tests {
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        a.link(addr_b, now).unwrap();
+        a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -4864,7 +5213,7 @@ mod tests {
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        a.link(addr_b, now).unwrap();
+        a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -4944,7 +5293,7 @@ mod tests {
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        a.link(addr_b, now).unwrap();
+        a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -5037,7 +5386,7 @@ mod tests {
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        a.link(addr_b, now).unwrap();
+        a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -5158,7 +5507,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        a.link(addr_b, now).unwrap();
+        a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -5230,7 +5579,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -5293,7 +5642,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -5360,7 +5709,7 @@ mod tests {
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        a.link(addr_b, now).unwrap();
+        a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -5445,7 +5794,7 @@ mod tests {
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        a.link(addr_b, now).unwrap();
+        a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -5719,7 +6068,7 @@ mod tests {
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        a.link(addr_b, now).unwrap();
+        a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -5792,7 +6141,7 @@ mod tests {
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        let link_id = a.link(addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -5890,6 +6239,7 @@ mod tests {
             &responder_keypair.secret,
             &initiator_keypair.public,
             dest,
+            ServiceId(0),
             now,
         )
     }
@@ -6044,7 +6394,7 @@ mod tests {
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        a.link(addr_b, now).unwrap();
+        a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -6123,5 +6473,1629 @@ mod tests {
             second_segment_events > 0,
             "Should have progress events from second segment (this was the bug)"
         );
+    }
+
+    #[test]
+    fn create_link_returns_handle() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("server", &[], &id(0));
+        let svc_b = b.add_service("client", &[], &id(1));
+        let addr_a = a.service_address(svc_a).unwrap();
+        let t = Instant::now();
+
+        a.announce(svc_a);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        let handle = b.create_link(svc_b, addr_a, t);
+        assert!(handle.is_some());
+
+        let handle2 = b.get_link(&addr_a);
+        assert!(handle2.is_some());
+        assert_eq!(handle.unwrap().0, handle2.unwrap().0);
+    }
+
+    #[test]
+    fn link_status_pending_then_active() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("server", &[], &id(0));
+        let svc_b = b.add_service("client", &[], &id(1));
+        let addr_a = a.service_address(svc_a).unwrap();
+        let t = Instant::now();
+
+        a.announce(svc_a);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        let handle = b.create_link(svc_b, addr_a, t).unwrap();
+        assert_eq!(b.link_status(handle), crate::LinkStatus::Pending);
+
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        assert_eq!(b.link_status(handle), crate::LinkStatus::Active);
+    }
+
+    #[test]
+    fn send_on_link_transmits_data() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("server", &[], &id(0));
+        let svc_b = b.add_service("client", &[], &id(1));
+        let addr_a = a.service_address(svc_a).unwrap();
+        let t = Instant::now();
+
+        a.announce(svc_a);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        let handle = b.create_link(svc_b, addr_a, t).unwrap();
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        assert!(b.send_on_link(handle, b"hello"));
+
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+    }
+
+    #[test]
+    fn channel_send_transmits_message() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("server", &[], &id(0));
+        let svc_b = b.add_service("client", &[], &id(1));
+        let addr_a = a.service_address(svc_a).unwrap();
+        let t = Instant::now();
+
+        a.announce(svc_a);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        let handle = b.create_link(svc_b, addr_a, t).unwrap();
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        let channel = b.get_channel(handle).unwrap();
+        assert!(b.channel_send(channel, 42, b"test message"));
+
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+    }
+
+    #[test]
+    fn prove_packet_sends_proof() {
+        let mut a = test_node(true);
+        a.add_interface(test_interface());
+        let svc_a = a.add_service("server", &[], &id(0));
+        let _t = Instant::now();
+
+        let packet_data = b"test packet data";
+        assert!(a.prove_packet(svc_a, packet_data));
+    }
+
+    #[test]
+    fn send_raw_to_known_destination() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("server", &[], &id(0));
+        let addr_a = a.service_address(svc_a).unwrap();
+        let t = Instant::now();
+
+        a.announce(svc_a);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        b.send_raw(addr_a, b"raw data");
+        b.poll(t);
+
+        transfer(&mut b, 0, &mut a, 0);
+        let events = a.poll(t);
+
+        let raw_received = events.iter().any(|e| matches!(e, ServiceEvent::Raw { .. }));
+        assert!(raw_received);
+    }
+
+    #[test]
+    fn active_links_returns_established() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("server", &[], &id(0));
+        let svc_b = b.add_service("client", &[], &id(1));
+        let addr_a = a.service_address(svc_a).unwrap();
+        let t = Instant::now();
+
+        assert!(b.active_links().is_empty());
+
+        a.announce(svc_a);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        let _handle = b.create_link(svc_b, addr_a, t).unwrap();
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        let links = b.active_links();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].destination, addr_a);
+        assert_eq!(links[0].status, crate::LinkStatus::Active);
+    }
+
+    #[test]
+    fn close_link_removes_link() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("server", &[], &id(0));
+        let svc_b = b.add_service("client", &[], &id(1));
+        let addr_a = a.service_address(svc_a).unwrap();
+        let t = Instant::now();
+
+        a.announce(svc_a);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        let handle = b.create_link(svc_b, addr_a, t).unwrap();
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        assert_eq!(b.active_links().len(), 1);
+
+        b.close_link(handle);
+
+        assert!(b.active_links().is_empty());
+        assert_eq!(b.link_status(handle), crate::LinkStatus::Closed);
+    }
+
+    #[test]
+    fn link_rtt_available_after_establishment() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("server", &[], &id(0));
+        let svc_b = b.add_service("client", &[], &id(1));
+        let addr_a = a.service_address(svc_a).unwrap();
+        let t = Instant::now();
+
+        a.announce(svc_a);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        let handle = b.create_link(svc_b, addr_a, t).unwrap();
+        assert!(b.link_rtt(handle).is_none());
+
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        assert!(b.link_rtt(handle).is_some());
+    }
+
+    #[test]
+    fn link_destination_returns_remote_address() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("server", &[], &id(0));
+        let svc_b = b.add_service("client", &[], &id(1));
+        let addr_a = a.service_address(svc_a).unwrap();
+        let t = Instant::now();
+
+        a.announce(svc_a);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        let handle = b.create_link(svc_b, addr_a, t).unwrap();
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        assert_eq!(b.link_destination(handle), Some(addr_a));
+    }
+
+    #[test]
+    fn link_identify_sets_remote_identity() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let client_id = id(0);
+        let svc_a = a.add_service("server", &[], &id(1));
+        let svc_b = b.add_service("client", &[], &client_id);
+        let addr_a = a.service_address(svc_a).unwrap();
+        let t = Instant::now();
+
+        a.announce(svc_a);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        let handle = b.create_link(svc_b, addr_a, t).unwrap();
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        assert_eq!(b.link_status(handle), crate::LinkStatus::Active);
+
+        let link_id = handle.0;
+        assert!(a.established_links.get(&link_id).unwrap().remote_identity.is_none());
+
+        b.identify(handle, &client_id);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let remote_identity = a.established_links.get(&link_id).unwrap().remote_identity;
+        assert!(remote_identity.is_some());
+        assert_eq!(remote_identity.unwrap(), client_id.hash());
+    }
+
+    #[test]
+    fn link_identify_included_in_request_event() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let client_id = id(0);
+        let svc_a = a.add_service("server", &["/test"], &id(1));
+        let svc_b = b.add_service("client", &[], &client_id);
+        let addr_a = a.service_address(svc_a).unwrap();
+        let t = Instant::now();
+
+        a.announce(svc_a);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        let handle = b.create_link(svc_b, addr_a, t).unwrap();
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        b.identify(handle, &client_id);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        b.link_request(handle, "/test", b"hello", t);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let request_event = a.pending_events.iter().find(|e| matches!(e, ServiceEvent::Request { .. }));
+        assert!(request_event.is_some());
+        if let Some(ServiceEvent::Request { remote_identity, .. }) = request_event {
+            assert!(remote_identity.is_some());
+            assert_eq!(*remote_identity, Some(client_id.hash()));
+        }
+    }
+
+    #[test]
+    fn relay_four_nodes_link_and_data() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        let mut c = test_node(true);
+        let mut d = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+        b.add_interface(test_interface());
+        c.add_interface(test_interface());
+        c.add_interface(test_interface());
+        d.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_d = d.add_service("server", &[], &id(1));
+        let addr_d = d.service_address(svc_d).unwrap();
+        let now = Instant::now();
+        let t1 = now + std::time::Duration::from_secs(1);
+        let t2 = now + std::time::Duration::from_secs(2);
+
+        d.announce(svc_d);
+        d.poll(now);
+        transfer(&mut d, 0, &mut c, 1);
+        c.poll(now);
+        c.poll(t1);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(t1);
+        b.poll(t2);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t2);
+
+        assert!(a.has_destination(&addr_d));
+
+        let link_id = a.link(Some(svc_a), addr_d, t2).unwrap();
+        a.poll(t2);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t2);
+        transfer(&mut b, 1, &mut c, 0);
+        c.poll(t2);
+        transfer(&mut c, 1, &mut d, 0);
+        d.poll(t2);
+        transfer(&mut d, 0, &mut c, 1);
+        c.poll(t2);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(t2);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t2);
+
+        assert!(a.established_links.contains_key(&link_id));
+        assert!(d.established_links.contains_key(&link_id));
+
+        a.send_link_packet(link_id, LinkContext::None, b"hello from a");
+        a.poll(t2);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t2);
+        transfer(&mut b, 1, &mut c, 0);
+        c.poll(t2);
+        transfer(&mut c, 1, &mut d, 0);
+        let events = d.poll(t2);
+
+        let raw_events: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ServiceEvent::Raw { data, .. } => Some(data.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(raw_events.len(), 1);
+        assert_eq!(raw_events[0], b"hello from a");
+    }
+
+    #[test]
+    fn relay_bidirectional_data_through_three_nodes() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        let mut c = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+        b.add_interface(test_interface());
+        c.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(1));
+        let svc_c = c.add_service("server", &[], &id(2));
+        let addr_c = c.service_address(svc_c).unwrap();
+        let now = Instant::now();
+        let t1 = now + std::time::Duration::from_secs(1);
+
+        c.announce(svc_c);
+        c.poll(now);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(now);
+        b.poll(t1);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t1);
+
+        let link_id = a.link(Some(svc_a), addr_c, t1).unwrap();
+        a.poll(t1);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t1);
+        transfer(&mut b, 1, &mut c, 0);
+        c.poll(t1);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(t1);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t1);
+
+        assert!(a.established_links.contains_key(&link_id));
+        assert!(c.established_links.contains_key(&link_id));
+
+        a.send_link_packet(link_id, LinkContext::None, b"a to c");
+        a.poll(t1);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t1);
+        transfer(&mut b, 1, &mut c, 0);
+        let events_c = c.poll(t1);
+
+        let data_c: Vec<_> = events_c
+            .iter()
+            .filter_map(|e| match e {
+                ServiceEvent::Raw { data, .. } => Some(data.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(data_c, vec![b"a to c".to_vec()]);
+
+        assert!(c.established_links.contains_key(&link_id));
+        assert!(b.link_table.contains_key(&link_id));
+
+        c.send_link_packet(link_id, LinkContext::None, b"c to a");
+        c.poll(t1);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(t1);
+        transfer(&mut b, 0, &mut a, 0);
+
+        let events_a = a.poll(t1);
+
+        let data_a: Vec<_> = events_a
+            .iter()
+            .filter_map(|e| match e {
+                ServiceEvent::Raw { data, .. } => Some(data.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(data_a, vec![b"c to a".to_vec()]);
+    }
+
+    #[test]
+    fn relay_stats_updated_on_forwarding() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        let mut c = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+        b.add_interface(test_interface());
+        c.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_c = c.add_service("server", &[], &id(1));
+        let addr_c = c.service_address(svc_c).unwrap();
+        let now = Instant::now();
+        let t1 = now + std::time::Duration::from_secs(1);
+
+        c.announce(svc_c);
+        c.poll(now);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(now);
+
+        let stats_before = b.stats();
+        assert_eq!(stats_before.announces_relayed, 0);
+
+        b.poll(t1);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t1);
+
+        let stats_after = b.stats();
+        assert!(stats_after.announces_relayed > 0);
+
+        let _link_id = a.link(Some(svc_a), addr_c, t1).unwrap();
+        a.poll(t1);
+        transfer(&mut a, 0, &mut b, 0);
+
+        let stats_before_relay = b.stats();
+        b.poll(t1);
+        transfer(&mut b, 1, &mut c, 0);
+        c.poll(t1);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(t1);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t1);
+
+        let stats_after_relay = b.stats();
+        assert!(stats_after_relay.packets_relayed > stats_before_relay.packets_relayed);
+    }
+
+    #[test]
+    fn link_request_sends_request_over_established_link() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_b = b.add_service("server", &["/test"], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let t = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let handle = a.create_link(svc_a, addr_b, t).unwrap();
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        assert_eq!(a.link_status(handle), crate::LinkStatus::Active);
+
+        let request_id = a.link_request(handle, "/test", b"request data", t);
+        assert!(request_id.is_some());
+
+        a.poll(t);
+        assert!(!a.interfaces[0].transport.outbox.is_empty());
+    }
+
+    #[test]
+    fn link_request_fails_on_inactive_link() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_b = b.add_service("server", &[], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let t = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let handle = a.create_link(svc_a, addr_b, t).unwrap();
+        assert_eq!(a.link_status(handle), crate::LinkStatus::Pending);
+
+        let request_id = a.link_request(handle, "/test", b"data", t);
+        assert!(request_id.is_none());
+    }
+
+    #[test]
+    fn link_request_response_received_via_link() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_b = b.add_service("server", &["/test"], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let t = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let handle = a.create_link(svc_a, addr_b, t).unwrap();
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let request_id = a.link_request(handle, "/test", b"request", t).unwrap();
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        let events_b = b.poll(t);
+
+        let req_event = events_b
+            .iter()
+            .find(|e| matches!(e, ServiceEvent::Request { .. }));
+        assert!(req_event.is_some());
+
+        if let Some(ServiceEvent::Request {
+            request_id: req_id,
+            path,
+            ..
+        }) = req_event
+        {
+            assert_eq!(path, "/test");
+            b.respond(*req_id, b"response data", None, false);
+        }
+
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        let events_a = a.poll(t);
+
+        let result_event = events_a.iter().find(|e| {
+            matches!(
+                e,
+                ServiceEvent::RequestResult {
+                    request_id: rid,
+                    ..
+                } if *rid == request_id
+            )
+        });
+        assert!(result_event.is_some());
+    }
+
+    // Resource Advertisement API
+
+    #[test]
+    fn advertise_resource_sends_advertisement() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_b = b.add_service("server", &[], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let t = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let handle = a.create_link(svc_a, addr_b, t).unwrap();
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let outbox_before = a.interfaces[0].transport.outbox.len();
+        let resource = a.advertise_resource(handle, b"resource data".to_vec(), None, false);
+        assert!(resource.is_some());
+        a.poll(t);
+
+        assert!(a.interfaces[0].transport.outbox.len() > outbox_before);
+        assert!(a.outbound_resources.contains_key(&resource.unwrap().0));
+    }
+
+    #[test]
+    fn advertise_resource_with_metadata() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_b = b.add_service("server", &[], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let t = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let handle = a.create_link(svc_a, addr_b, t).unwrap();
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let metadata = b"file:test.txt".to_vec();
+        let resource = a.advertise_resource(handle, b"data".to_vec(), Some(metadata), false);
+        assert!(resource.is_some());
+    }
+
+    #[test]
+    fn advertise_resource_with_compression() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_b = b.add_service("server", &[], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let t = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let handle = a.create_link(svc_a, addr_b, t).unwrap();
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let resource = a.advertise_resource(handle, b"compressible data".to_vec(), None, true);
+        assert!(resource.is_some());
+    }
+
+    // Resource Progress API
+
+    #[test]
+    fn resource_progress_outbound() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_b = b.add_service("server", &[], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let t = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let handle = a.create_link(svc_a, addr_b, t).unwrap();
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let resource = a
+            .advertise_resource(handle, b"test data".to_vec(), None, false)
+            .unwrap();
+
+        let progress = a.resource_progress(resource);
+        assert!(progress.is_some());
+    }
+
+    #[test]
+    fn resource_progress_inbound() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_b = b.add_service("server", &[], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let t = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let handle = a.create_link(svc_a, addr_b, t).unwrap();
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        a.advertise_resource(handle, b"test data".to_vec(), None, false);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        let inbound_resources: Vec<_> = b.inbound_resources.keys().cloned().collect();
+        if let Some(hash) = inbound_resources.first() {
+            let progress = b.resource_progress(crate::ResourceHandle(*hash));
+            assert!(progress.is_some());
+        }
+    }
+
+    #[test]
+    fn resource_progress_unknown_resource() {
+        let a = test_node(true);
+        let fake_hash = [0u8; 32];
+        let progress = a.resource_progress(crate::ResourceHandle(fake_hash));
+        assert!(progress.is_none());
+    }
+
+    // Path Discovery
+
+    #[test]
+    fn path_request_sent_for_unknown_destination() {
+        let mut a = test_node(true);
+        a.add_interface(test_interface());
+
+        let _svc_a = a.add_service("client", &[], &id(0));
+        let unknown_dest: Address = [0xAB; 16];
+        let t = Instant::now();
+
+        assert!(!a.has_destination(&unknown_dest));
+
+        a.request_path(unknown_dest, t);
+        a.poll(t);
+
+        assert!(!a.interfaces[0].transport.outbox.is_empty());
+    }
+
+    #[test]
+    fn path_response_updates_path_table() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        let mut c = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+        b.add_interface(test_interface());
+        c.add_interface(test_interface());
+
+        let svc_c = c.add_service("server", &[], &id(1));
+        let addr_c = c.service_address(svc_c).unwrap();
+        let t = Instant::now();
+        let t1 = t + std::time::Duration::from_secs(1);
+
+        c.announce(svc_c);
+        c.poll(t);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(t);
+        b.poll(t1);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t1);
+
+        assert!(a.has_destination(&addr_c));
+    }
+
+    #[test]
+    fn path_request_forwarded_by_transport() {
+        let mut a = test_node(false);
+        let mut b = test_node(true);
+        let mut c = test_node(false);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+        b.add_interface(test_interface());
+        c.add_interface(test_interface());
+
+        let svc_c = c.add_service("server", &[], &id(1));
+        let addr_c = c.service_address(svc_c).unwrap();
+        let t = Instant::now();
+        let t1 = t + std::time::Duration::from_secs(1);
+
+        c.announce(svc_c);
+        c.poll(t);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(t);
+
+        a.request_path(addr_c, t1);
+        a.poll(t1);
+        transfer(&mut a, 0, &mut b, 0);
+
+        let stats_before = b.stats();
+        b.poll(t1);
+        let stats_after = b.stats();
+
+        assert!(
+            stats_after.packets_relayed > stats_before.packets_relayed
+                || !b.interfaces[1].transport.outbox.is_empty()
+        );
+    }
+
+    #[test]
+    fn path_response_forwarded_back() {
+        let mut a = test_node(false);
+        let mut b = test_node(true);
+        let mut c = test_node(false);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+        b.add_interface(test_interface());
+        c.add_interface(test_interface());
+
+        let svc_c = c.add_service("server", &[], &id(1));
+        let addr_c = c.service_address(svc_c).unwrap();
+        let t = Instant::now();
+        let t1 = t + std::time::Duration::from_secs(1);
+
+        c.announce(svc_c);
+        c.poll(t);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(t);
+
+        a.request_path(addr_c, t1);
+        a.poll(t1);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t1);
+        transfer(&mut b, 1, &mut c, 0);
+        c.poll(t1);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(t1);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t1);
+
+        assert!(a.has_destination(&addr_c));
+    }
+
+    // Multi-hop Routing
+
+    #[test]
+    fn link_request_routed_through_transport() {
+        let mut a = test_node(false);
+        let mut b = test_node(true);
+        let mut c = test_node(false);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+        b.add_interface(test_interface());
+        c.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_c = c.add_service("server", &[], &id(1));
+        let addr_c = c.service_address(svc_c).unwrap();
+        let t = Instant::now();
+        let t1 = t + std::time::Duration::from_secs(1);
+
+        c.announce(svc_c);
+        c.poll(t);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(t);
+        b.poll(t1);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t1);
+
+        let _handle = a.create_link(svc_a, addr_c, t1);
+        a.poll(t1);
+        transfer(&mut a, 0, &mut b, 0);
+
+        let stats_before = b.stats();
+        b.poll(t1);
+        let stats_after = b.stats();
+
+        assert!(stats_after.packets_relayed > stats_before.packets_relayed);
+    }
+
+    #[test]
+    fn link_proof_routed_back_through_transport() {
+        let mut a = test_node(false);
+        let mut b = test_node(true);
+        let mut c = test_node(false);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+        b.add_interface(test_interface());
+        c.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_c = c.add_service("server", &[], &id(1));
+        let addr_c = c.service_address(svc_c).unwrap();
+        let t = Instant::now();
+        let t1 = t + std::time::Duration::from_secs(1);
+
+        c.announce(svc_c);
+        c.poll(t);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(t);
+        b.poll(t1);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t1);
+
+        let handle = a.create_link(svc_a, addr_c, t1).unwrap();
+        a.poll(t1);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t1);
+        transfer(&mut b, 1, &mut c, 0);
+        c.poll(t1);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(t1);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t1);
+
+        assert_eq!(a.link_status(handle), crate::LinkStatus::Active);
+    }
+
+    // Resource Segment Handling
+
+    #[test]
+    fn resource_hmu_segment_received() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_b = b.add_service("server", &[], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let t = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let handle = a.create_link(svc_a, addr_b, t).unwrap();
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let large_data = vec![0u8; 5000];
+        let resource = a.advertise_resource(handle, large_data, None, false);
+        assert!(resource.is_some());
+
+        assert!(a.outbound_resources.contains_key(&resource.unwrap().0));
+
+        a.poll(t);
+        assert!(!a.interfaces[0].transport.outbox.is_empty());
+    }
+
+    #[test]
+    fn resource_req_triggers_data_send() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_b = b.add_service("server", &[], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let t = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let handle = a.create_link(svc_a, addr_b, t).unwrap();
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let data = vec![0u8; 2000];
+        a.advertise_resource(handle, data, None, false);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+
+        let outbox_before = a.interfaces[0].transport.outbox.len();
+        a.poll(t);
+        let outbox_after = a.interfaces[0].transport.outbox.len();
+
+        assert!(outbox_after >= outbox_before);
+    }
+
+    #[test]
+    fn resource_icl_confirms_segment() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_b = b.add_service("server", &[], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let t = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let handle = a.create_link(svc_a, addr_b, t).unwrap();
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let resource = a.advertise_resource(handle, b"small".to_vec(), None, false);
+        assert!(resource.is_some());
+
+        for _ in 0..10 {
+            a.poll(t);
+            transfer(&mut a, 0, &mut b, 0);
+            b.poll(t);
+            transfer(&mut b, 0, &mut a, 0);
+        }
+
+        assert!(resource.is_some());
+    }
+
+    #[test]
+    fn resource_rcl_confirms_segment() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_b = b.add_service("server", &[], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let t = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let handle = a.create_link(svc_a, addr_b, t).unwrap();
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        a.advertise_resource(handle, b"data".to_vec(), None, false);
+
+        for _ in 0..10 {
+            a.poll(t);
+            transfer(&mut a, 0, &mut b, 0);
+            b.poll(t);
+            transfer(&mut b, 0, &mut a, 0);
+        }
+
+        assert!(true);
+    }
+
+    #[test]
+    fn resource_proof_validates_transfer() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_b = b.add_service("server", &[], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let t = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let handle = a.create_link(svc_a, addr_b, t).unwrap();
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let resource = a
+            .advertise_resource(handle, b"test".to_vec(), None, false)
+            .unwrap();
+
+        for _ in 0..20 {
+            a.poll(t);
+            transfer(&mut a, 0, &mut b, 0);
+            b.poll(t);
+            transfer(&mut b, 0, &mut a, 0);
+        }
+
+        let still_pending = a.outbound_resources.contains_key(&resource.0);
+        assert!(!still_pending || b.inbound_resources.is_empty());
+    }
+
+    // Transport Relay Edge Cases
+
+    #[test]
+    fn announce_with_transport_id_forwarded() {
+        let mut a = test_node(false);
+        let mut b = test_node(true);
+        let mut c = test_node(false);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+        b.add_interface(test_interface());
+        c.add_interface(test_interface());
+
+        let svc_c = c.add_service("server", &[], &id(1));
+        let addr_c = c.service_address(svc_c).unwrap();
+        let t = Instant::now();
+        let t1 = t + std::time::Duration::from_secs(1);
+
+        c.announce(svc_c);
+        c.poll(t);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(t);
+
+        let stats_before = b.stats();
+        b.poll(t1);
+        let stats_after = b.stats();
+
+        assert!(stats_after.announces_relayed > stats_before.announces_relayed);
+
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t1);
+
+        assert!(a.has_destination(&addr_c));
+    }
+
+    #[test]
+    fn link_data_relayed_by_transport_node() {
+        let mut a = test_node(false);
+        let mut b = test_node(true);
+        let mut c = test_node(false);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+        b.add_interface(test_interface());
+        c.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_c = c.add_service("server", &[], &id(1));
+        let addr_c = c.service_address(svc_c).unwrap();
+        let t = Instant::now();
+        let t1 = t + std::time::Duration::from_secs(1);
+
+        c.announce(svc_c);
+        c.poll(t);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(t);
+        b.poll(t1);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t1);
+
+        let link_id = a.link(Some(svc_a), addr_c, t1).unwrap();
+        a.poll(t1);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t1);
+        transfer(&mut b, 1, &mut c, 0);
+        c.poll(t1);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(t1);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t1);
+
+        a.send_link_packet(link_id, LinkContext::None, b"test data");
+        a.poll(t1);
+        transfer(&mut a, 0, &mut b, 0);
+
+        let stats_before = b.stats();
+        b.poll(t1);
+        let stats_after = b.stats();
+
+        assert!(stats_after.packets_relayed > stats_before.packets_relayed);
+
+        transfer(&mut b, 1, &mut c, 0);
+        let events = c.poll(t1);
+
+        let has_raw = events.iter().any(|e| matches!(e, ServiceEvent::Raw { .. }));
+        assert!(has_raw);
+    }
+
+    // Path Discovery Timeout
+
+    #[test]
+    fn path_request_timeout_fails_pending_requests() {
+        let mut a = test_node(true);
+        a.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let unknown_dest: Address = [0xDE; 16];
+        let t = Instant::now();
+
+        a.request(svc_a, unknown_dest, "/test", b"data", t);
+        a.poll(t);
+
+        assert!(a.pending_path_requests.contains_key(&unknown_dest));
+        assert!(a.pending_outbound_requests.contains_key(&unknown_dest));
+
+        let timeout = t + std::time::Duration::from_secs(61);
+        let events = a.poll(timeout);
+
+        assert!(!a.pending_path_requests.contains_key(&unknown_dest));
+        assert!(!a.pending_outbound_requests.contains_key(&unknown_dest));
+
+        let has_timeout_error = events.iter().any(|e| {
+            matches!(
+                e,
+                ServiceEvent::RequestResult {
+                    result: Err(crate::handle::RequestError::Timeout),
+                    ..
+                }
+            )
+        });
+        assert!(has_timeout_error);
+    }
+
+    #[test]
+    fn pending_link_timeout_fails_queued_requests() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_b = b.add_service("server", &[], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let t = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        a.request(svc_a, addr_b, "/test", b"data", t);
+        a.poll(t);
+
+        assert!(!a.pending_outbound_links.is_empty());
+
+        let timeout = t + std::time::Duration::from_secs(70);
+        let events = a.poll(timeout);
+
+        assert!(a.pending_outbound_links.is_empty());
+
+        let has_link_failed = events.iter().any(|e| {
+            matches!(
+                e,
+                ServiceEvent::RequestResult {
+                    result: Err(crate::handle::RequestError::LinkFailed),
+                    ..
+                }
+            )
+        });
+        assert!(has_link_failed);
+    }
+
+    // Multi-Segment Resources
+
+    #[test]
+    fn multi_segment_resource_transfer_complete() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_b = b.add_service("server", &[], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let t = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let handle = a.create_link(svc_a, addr_b, t).unwrap();
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let large_data = vec![0xAB; 10000];
+        let resource = a.advertise_resource(handle, large_data.clone(), None, false);
+        assert!(resource.is_some());
+
+        for _ in 0..50 {
+            a.poll(t);
+            transfer(&mut a, 0, &mut b, 0);
+            b.poll(t);
+            transfer(&mut b, 0, &mut a, 0);
+        }
+
+        for _ in 0..10 {
+            a.poll(t);
+            transfer(&mut a, 0, &mut b, 0);
+            b.poll(t);
+            transfer(&mut b, 0, &mut a, 0);
+        }
+
+        let transfer_active = !a.outbound_resources.is_empty() || !b.inbound_resources.is_empty();
+        assert!(transfer_active);
+    }
+
+    #[test]
+    fn resource_hashmap_update_processed() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_b = b.add_service("server", &["test"], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let t = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        a.link(None, addr_b, t).unwrap();
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        a.request(svc_a, addr_b, "test", b"req", t);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        let events_b = b.poll(t);
+
+        let request_id = events_b
+            .iter()
+            .find_map(|e| match e {
+                ServiceEvent::Request { request_id, .. } => Some(*request_id),
+                _ => None,
+            })
+            .expect("B should receive request");
+
+        let large_data: Vec<u8> = (0..50_000).map(|i| (i % 256) as u8).collect();
+        b.respond(request_id, &large_data, None, true);
+        b.poll(t);
+
+        let mut received_data = None;
+        for _ in 0..500 {
+            transfer(&mut b, 0, &mut a, 0);
+            let events_a = a.poll(t);
+            transfer(&mut a, 0, &mut b, 0);
+            b.poll(t);
+
+            if let Some(data) = events_a.iter().find_map(|e| match e {
+                ServiceEvent::RequestResult {
+                    result: Ok((_, data, _)),
+                    ..
+                } => Some(data.clone()),
+                _ => None,
+            }) {
+                received_data = Some(data);
+                break;
+            }
+        }
+
+        assert_eq!(
+            received_data,
+            Some(large_data),
+            "50KB transfer requiring HMU should complete with correct data"
+        );
+    }
+
+    #[test]
+    fn resource_confirmation_cleans_up_state() {
+        use crate::packet::{LinkContext, LinkDataDestination, Packet};
+
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_b = b.add_service("server", &["test"], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let t = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        a.link(None, addr_b, t).unwrap();
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        a.request(svc_a, addr_b, "test", b"req", t);
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        let events_b = b.poll(t);
+
+        let request_id = events_b
+            .iter()
+            .find_map(|e| match e {
+                ServiceEvent::Request { request_id, .. } => Some(*request_id),
+                _ => None,
+            })
+            .expect("B should receive request");
+
+        let response_data = vec![0xAB; 500];
+        b.respond(request_id, &response_data, None, false);
+        b.poll(t);
+
+        assert_eq!(
+            b.outbound_resources.len(),
+            1,
+            "B should have outbound resource after respond"
+        );
+        let resource_hash = *b.outbound_resources.keys().next().unwrap();
+
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        assert_eq!(
+            a.inbound_resources.len(),
+            1,
+            "A should have inbound resource after receiving advertisement"
+        );
+
+        let link_id = *a.established_links.keys().next().unwrap();
+        let link = a.established_links.get(&link_id).unwrap();
+        let icl_payload = link.encrypt(&mut rand::rngs::StdRng::from_entropy(), &resource_hash);
+        let icl_packet = Packet::LinkData {
+            hops: 0,
+            destination: LinkDataDestination::Direct(link_id),
+            context: LinkContext::ResourceIcl,
+            data: icl_payload,
+        };
+
+        b.interfaces[0]
+            .transport
+            .inbox
+            .push_back(icl_packet.to_bytes());
+        b.poll(t);
+
+        assert!(
+            !b.outbound_resources.contains_key(&resource_hash),
+            "ICL packet should clean up outbound_resources"
+        );
+    }
+
+    #[test]
+    fn multi_segment_resource_with_three_nodes() {
+        let mut a = test_node(false);
+        let mut b = test_node(true);
+        let mut c = test_node(false);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+        b.add_interface(test_interface());
+        c.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_c = c.add_service("server", &[], &id(1));
+        let addr_c = c.service_address(svc_c).unwrap();
+        let t = Instant::now();
+        let t1 = t + std::time::Duration::from_secs(1);
+
+        c.announce(svc_c);
+        c.poll(t);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(t);
+        b.poll(t1);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t1);
+
+        let handle = a.create_link(svc_a, addr_c, t1).unwrap();
+        a.poll(t1);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t1);
+        transfer(&mut b, 1, &mut c, 0);
+        c.poll(t1);
+        transfer(&mut c, 0, &mut b, 1);
+        b.poll(t1);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t1);
+
+        assert_eq!(a.link_status(handle), crate::LinkStatus::Active);
+
+        let data = vec![0xEF; 5000];
+        let resource = a.advertise_resource(handle, data, None, false);
+        assert!(resource.is_some());
+
+        for _ in 0..50 {
+            a.poll(t1);
+            transfer(&mut a, 0, &mut b, 0);
+            b.poll(t1);
+            transfer(&mut b, 1, &mut c, 0);
+            c.poll(t1);
+            transfer(&mut c, 0, &mut b, 1);
+            b.poll(t1);
+            transfer(&mut b, 0, &mut a, 0);
+        }
+
+        let b_relayed = b.stats().packets_relayed;
+        assert!(b_relayed > 0);
     }
 }

@@ -35,6 +35,7 @@ pub enum ServiceEvent {
         request_id: RequestId,
         path: String,
         data: Vec<u8>,
+        remote_identity: Option<Address>,
     },
     RequestResult {
         service: ServiceId,

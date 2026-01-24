@@ -9,6 +9,7 @@ tcp = []
 tokio = ["dep:tokio", "dep:env_logger", "tcp"]
 config = ["dep:toml"]
 relay = ["tokio", "config", "dep:serde_json", "dep:simplelog", "dep:ratatui", "dep:crossterm"]
+iroh = ["dep:iroh", "dep:tokio"]
 
 [dependencies]
 aes = "0.8.4"
@@ -33,6 +34,7 @@ toml = { version = "0.8", optional = true }
 simplelog = { version = "0.12", optional = true }
 ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.29", optional = true }
+iroh = { version = "0.32", optional = true }
 
 [[bin]]
 name = "rinse-serve"
@@ -49,10 +51,10 @@ name = "rinse-request"
 path = "src/bin/request.rs"
 required-features = ["tokio"]
 
-# [[bin]]
-# name = "rinse-cp"
-# path = "src/bin/cp.rs"
-# required-features = ["tokio"]
+[[bin]]
+name = "rncp"
+path = "src/bin/rncp.rs"
+required-features = ["tokio"]
 
 [dev-dependencies]
 env_logger = "0.11"

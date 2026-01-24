@@ -4,7 +4,7 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use rand::RngCore;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
-use crate::crypto::{LinkEncryption, LinkKeys, sha256, sign, verify};
+use crate::crypto::{sha256, sign, verify, LinkEncryption, LinkKeys};
 use crate::handle::ServiceId;
 use crate::packet::Address;
 
@@ -125,6 +125,60 @@ impl LinkProof {
     }
 }
 
+pub(crate) struct LinkIdentify {
+    pub public_keys: [u8; 64],
+    pub signature: Signature,
+}
+
+impl LinkIdentify {
+    pub fn create(link_id: &LinkId, identity: &crate::Identity) -> Self {
+        let public_keys = identity.public_key();
+        let mut sign_data = Vec::with_capacity(80);
+        sign_data.extend_from_slice(link_id);
+        sign_data.extend_from_slice(&public_keys);
+        let signature = sign(&identity.signing_key, &sign_data);
+        Self {
+            public_keys,
+            signature,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(128);
+        out.extend_from_slice(&self.public_keys);
+        out.extend_from_slice(&self.signature.to_bytes());
+        out
+    }
+
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() < 128 {
+            return None;
+        }
+        let public_keys: [u8; 64] = data[..64].try_into().ok()?;
+        let signature = Signature::from_bytes(&data[64..128].try_into().ok()?);
+        Some(Self {
+            public_keys,
+            signature,
+        })
+    }
+
+    pub fn verify(&self, link_id: &LinkId) -> bool {
+        let signing_public: [u8; 32] = self.public_keys[32..64].try_into().unwrap();
+        let verifying_key = match VerifyingKey::from_bytes(&signing_public) {
+            Ok(k) => k,
+            Err(_) => return false,
+        };
+        let mut sign_data = Vec::with_capacity(80);
+        sign_data.extend_from_slice(link_id);
+        sign_data.extend_from_slice(&self.public_keys);
+        verify(&verifying_key, &sign_data, &self.signature)
+    }
+
+    pub fn identity_hash(&self) -> [u8; 16] {
+        sha256(&self.public_keys)[..16].try_into().unwrap()
+    }
+}
+
 pub(crate) const KEEPALIVE_REQUEST: u8 = 0xFF;
 pub(crate) const KEEPALIVE_RESPONSE: u8 = 0xFE;
 
@@ -153,6 +207,7 @@ pub(crate) struct PendingLink {
     pub link_id: LinkId,
     pub initiator_encryption_secret: StaticSecret,
     pub destination: Address,
+    pub local_service: Option<ServiceId>,
     pub request_time: Instant,
 }
 
@@ -166,6 +221,7 @@ pub(crate) enum LinkState {
 
 pub(crate) struct EstablishedLink {
     pub destination: Address,
+    pub local_service: Option<ServiceId>,
     pub is_initiator: bool,
     pub state: LinkState,
     pub activated_at: Option<Instant>,
@@ -173,6 +229,7 @@ pub(crate) struct EstablishedLink {
     pub last_outbound: Instant,
     pub last_keepalive_sent: Option<Instant>,
     pub rtt_ms: Option<u64>,
+    pub remote_identity: Option<Address>,
     keys: LinkKeys,
     pub(crate) pending_requests:
         std::collections::HashMap<crate::WireRequestId, (ServiceId, crate::RequestId)>,
@@ -202,6 +259,7 @@ impl EstablishedLink {
         let rtt_ms = now.duration_since(pending.request_time).as_millis() as u64;
         Self {
             destination: pending.destination,
+            local_service: pending.local_service,
             is_initiator: true,
             state: LinkState::Active,
             activated_at: Some(now),
@@ -209,6 +267,7 @@ impl EstablishedLink {
             last_outbound: now,
             last_keepalive_sent: None,
             rtt_ms: Some(rtt_ms),
+            remote_identity: None,
             keys,
             pending_requests: std::collections::HashMap::new(),
         }
@@ -219,6 +278,7 @@ impl EstablishedLink {
         responder_secret: &StaticSecret,
         initiator_public: &X25519Public,
         destination: Address,
+        local_service: ServiceId,
         now: Instant,
     ) -> Self {
         let shared_key = responder_secret.diffie_hellman(initiator_public).to_bytes();
@@ -231,6 +291,7 @@ impl EstablishedLink {
         let keys = LinkEncryption::derive_keys(&shared_key, &link_id);
         Self {
             destination,
+            local_service: Some(local_service),
             is_initiator: false,
             state: LinkState::Handshake,
             activated_at: None,
@@ -238,6 +299,7 @@ impl EstablishedLink {
             last_outbound: now,
             last_keepalive_sent: None,
             rtt_ms: None,
+            remote_identity: None,
             keys,
             pending_requests: std::collections::HashMap::new(),
         }
@@ -290,8 +352,8 @@ impl EstablishedLink {
 mod tests {
     use super::*;
     use crate::crypto::EphemeralKeyPair;
-    use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     fn test_rng() -> StdRng {
         StdRng::seed_from_u64(42)
@@ -369,6 +431,7 @@ mod tests {
             link_id,
             initiator_encryption_secret: initiator_keypair.secret,
             destination: dest,
+            local_service: None,
             request_time: now,
         };
 
@@ -379,6 +442,7 @@ mod tests {
             &responder_keypair.secret,
             &initiator_keypair.public,
             dest,
+            ServiceId(0),
             now,
         );
 
@@ -428,6 +492,7 @@ mod tests {
             link_id,
             initiator_encryption_secret: initiator_enc.secret,
             destination: dest,
+            local_service: None,
             request_time: now,
         };
         let initiator_link = EstablishedLink::from_initiator(pending, &responder_enc.public, now);
@@ -437,6 +502,7 @@ mod tests {
             &responder_enc.secret,
             &initiator_enc.public,
             dest,
+            ServiceId(0),
             now,
         );
 
@@ -487,6 +553,7 @@ mod tests {
             link_id,
             initiator_encryption_secret: initiator_keypair.secret,
             destination: dest,
+            local_service: None,
             request_time,
         };
 
@@ -509,6 +576,7 @@ mod tests {
             link_id,
             initiator_encryption_secret: initiator_keypair.secret,
             destination: dest,
+            local_service: None,
             request_time: now,
         };
 

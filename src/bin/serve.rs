@@ -191,7 +191,10 @@ async fn handle_event(
         }
     };
 
-    if let Err(e) = node.respond(service, request_id, &response, None, true).await {
+    if let Err(e) = node
+        .respond(service, request_id, &response, None, true)
+        .await
+    {
         log::warn!("Failed to respond: {:?}", e);
     }
 }
