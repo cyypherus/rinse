@@ -6775,7 +6775,13 @@ mod tests {
         assert_eq!(b.link_status(handle), crate::LinkStatus::Active);
 
         let link_id = handle.0;
-        assert!(a.established_links.get(&link_id).unwrap().remote_identity.is_none());
+        assert!(
+            a.established_links
+                .get(&link_id)
+                .unwrap()
+                .remote_identity
+                .is_none()
+        );
 
         b.identify(handle, &client_id);
         b.poll(t);
@@ -6820,12 +6826,17 @@ mod tests {
         b.link_request(handle, "/test", b"hello", t);
         b.poll(t);
         transfer(&mut b, 0, &mut a, 0);
-        a.poll(t);
+        let events_a = a.poll(t);
 
-        let request_event = a.pending_events.iter().find(|e| matches!(e, ServiceEvent::Request { .. }));
-        assert!(request_event.is_some());
-        if let Some(ServiceEvent::Request { remote_identity, .. }) = request_event {
-            assert!(remote_identity.is_some());
+        let request_event = events_a
+            .iter()
+            .find(|e| matches!(e, ServiceEvent::Request { .. }));
+        assert!(request_event.is_some(), "Request event should be emitted");
+        if let Some(ServiceEvent::Request {
+            remote_identity, ..
+        }) = request_event
+        {
+            assert!(remote_identity.is_some(), "remote_identity should be set");
             assert_eq!(*remote_identity, Some(client_id.hash()));
         }
     }

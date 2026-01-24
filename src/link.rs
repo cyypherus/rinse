@@ -4,7 +4,7 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use rand::RngCore;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
-use crate::crypto::{sha256, sign, verify, LinkEncryption, LinkKeys};
+use crate::crypto::{LinkEncryption, LinkKeys, sha256, sign, verify};
 use crate::handle::ServiceId;
 use crate::packet::Address;
 
@@ -352,8 +352,8 @@ impl EstablishedLink {
 mod tests {
     use super::*;
     use crate::crypto::EphemeralKeyPair;
-    use rand::rngs::StdRng;
     use rand::SeedableRng;
+    use rand::rngs::StdRng;
 
     fn test_rng() -> StdRng {
         StdRng::seed_from_u64(42)

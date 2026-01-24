@@ -223,6 +223,7 @@ type RequestWaiters = Arc<
     StdMutex<HashMap<RequestId, oneshot::Sender<Result<(Vec<u8>, Option<Vec<u8>>), RequestError>>>>,
 >;
 type RespondWaiters = Arc<StdMutex<HashMap<RequestId, oneshot::Sender<Result<(), RespondError>>>>>;
+type LinkWaiters = HashMap<crate::LinkHandle, Vec<oneshot::Sender<bool>>>;
 type EventReceiver = Arc<TokioMutex<mpsc::UnboundedReceiver<ServiceEvent>>>;
 
 #[derive(Clone)]
@@ -336,11 +337,21 @@ enum Command<T: Transport> {
         packet_data: Vec<u8>,
         reply: oneshot::Sender<bool>,
     },
+    SetAutoIdentify {
+        identity: Option<Box<crate::Identity>>,
+    },
+    AwaitLinkActive {
+        link: crate::LinkHandle,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 struct AsyncNodeInner<T: Transport> {
     node: crate::Node<T, StdRng>,
     command_rx: mpsc::UnboundedReceiver<Command<T>>,
+    auto_identify: Option<crate::Identity>,
+    identified_links: std::collections::HashSet<crate::LinkHandle>,
+    link_waiters: LinkWaiters,
 }
 
 pub struct AsyncNode<T: Transport> {
@@ -373,6 +384,9 @@ impl<T: Transport> AsyncNode<T> {
             inner: Some(AsyncNodeInner {
                 node: crate::Node::with_rng(rng, transport),
                 command_rx,
+                auto_identify: None,
+                identified_links: std::collections::HashSet::new(),
+                link_waiters: HashMap::new(),
             }),
         }
     }
@@ -574,6 +588,15 @@ impl<T: Transport> AsyncNode<T> {
         reply_rx.await.unwrap_or(crate::LinkStatus::Closed)
     }
 
+    pub async fn await_link_active(&self, link: crate::LinkHandle) -> bool {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::AwaitLinkActive {
+            link,
+            reply: reply_tx,
+        });
+        reply_rx.await.unwrap_or(false)
+    }
+
     pub async fn link_rtt(&self, link: crate::LinkHandle) -> Option<u64> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.command_tx.send(Command::LinkRtt {
@@ -608,6 +631,12 @@ impl<T: Transport> AsyncNode<T> {
         let _ = self.command_tx.send(Command::Identify {
             link,
             identity: Box::new(identity.clone()),
+        });
+    }
+
+    pub fn set_auto_identify(&self, identity: Option<&crate::Identity>) {
+        let _ = self.command_tx.send(Command::SetAutoIdentify {
+            identity: identity.map(|i| Box::new(i.clone())),
         });
     }
 
@@ -727,6 +756,23 @@ impl<T: Transport> AsyncNode<T> {
         let now = Instant::now();
         let events = inner.node.poll(now);
         Self::dispatch_events(services, events);
+
+        inner.link_waiters.retain(|link, waiters| {
+            let status = inner.node.link_status(*link);
+            if status == crate::LinkStatus::Active {
+                for tx in waiters.drain(..) {
+                    let _ = tx.send(true);
+                }
+                false
+            } else if status == crate::LinkStatus::Closed {
+                for tx in waiters.drain(..) {
+                    let _ = tx.send(false);
+                }
+                false
+            } else {
+                true
+            }
+        });
     }
 
     fn dispatch_events(
@@ -797,6 +843,14 @@ impl<T: Transport> AsyncNode<T> {
                 data,
                 reply,
             } => {
+                if let Some(ref identity) = inner.auto_identify
+                    && let Some(link) = inner.node.get_link(&dest)
+                    && inner.node.link_status(link) == crate::LinkStatus::Active
+                    && !inner.identified_links.contains(&link)
+                {
+                    inner.node.identify(link, identity);
+                    inner.identified_links.insert(link);
+                }
                 let request_id = inner.node.request(service, dest, &path, &data, now);
                 let _ = reply.send(request_id);
             }
@@ -894,6 +948,19 @@ impl<T: Transport> AsyncNode<T> {
                 reply,
             } => {
                 let _ = reply.send(inner.node.prove_packet(service, &packet_data));
+            }
+            Command::SetAutoIdentify { identity } => {
+                inner.auto_identify = identity.map(|b| *b);
+                inner.identified_links.clear();
+            }
+            Command::AwaitLinkActive { link, reply } => {
+                if inner.node.link_status(link) == crate::LinkStatus::Active {
+                    let _ = reply.send(true);
+                } else if inner.node.link_status(link) == crate::LinkStatus::Closed {
+                    let _ = reply.send(false);
+                } else {
+                    inner.link_waiters.entry(link).or_default().push(reply);
+                }
             }
         }
         Self::poll(inner, services);
