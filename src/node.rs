@@ -3767,7 +3767,7 @@ mod tests {
         assert!(b.established_links.contains_key(&link_id));
 
         // Send request from A to B
-        a.request(svc_a, addr_b, "test.path", b"request data", now);
+        a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"request data");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events_b = b.poll(now);
@@ -3846,7 +3846,7 @@ mod tests {
         assert!(c.established_links.contains_key(&link_id));
 
         // Send request from A to C (via B)
-        a.request(svc_a, addr_c, "test.path", b"request data", later);
+        a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"request data");
         a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(later);
@@ -3918,7 +3918,7 @@ mod tests {
         assert!(b.established_links.contains_key(&link_id));
 
         // Send request from A to B
-        a.request(svc_a, addr_b, "test.path", b"request", now);
+        a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"request");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events_b = b.poll(now);
@@ -3999,7 +3999,7 @@ mod tests {
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        a.link(None, addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -4007,7 +4007,7 @@ mod tests {
         a.poll(now);
 
         // Send request
-        a.request(svc_a, addr_b, "test.path", b"req", now);
+        a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"req");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events_b = b.poll(now);
@@ -4100,14 +4100,14 @@ mod tests {
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        a.link(None, addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        a.request(svc_a, addr_b, "test", b"", now);
+        a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events_b = b.poll(now);
@@ -4175,7 +4175,7 @@ mod tests {
         a.poll(later);
 
         // Establish link A -> C (via B)
-        a.link(None, addr_c, later).unwrap();
+        let link_id = a.link(None, addr_c, later).unwrap();
         a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(later);
@@ -4187,7 +4187,7 @@ mod tests {
         a.poll(later);
 
         // Send request
-        a.request(svc_a, addr_c, "test.path", b"req", later);
+        a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"req");
         a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(later);
@@ -4368,16 +4368,14 @@ mod tests {
     }
 
     #[test]
-    fn pending_link_timeout() {
-        use std::time::Duration;
-
+    fn request_on_pending_link_returns_none() {
         let mut a = test_node(true);
         let mut b = test_node(true);
         a.add_interface(test_interface());
         b.add_interface(test_interface());
 
         let svc_a = a.add_service("client", &[], &id(1));
-        let svc_b = b.add_service("server", &["test.path"], &id(2));
+        let svc_b = b.add_service("server", &[], &id(2));
         let addr_b = b.service_address(svc_b).unwrap();
         let now = Instant::now();
 
@@ -4391,34 +4389,12 @@ mod tests {
         let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
 
-        // Queue a request while link is pending
-        a.request(svc_a, addr_b, "test.path", b"data", now);
-        a.poll(now);
-
         // Verify link is pending
         assert!(a.pending_outbound_links.contains_key(&link_id));
-        assert!(a.pending_outbound_requests.contains_key(&addr_b));
 
-        // Time passes beyond establishment timeout (base 60s + 6s per hop, 1 hop = 66s)
-        let timeout = now + Duration::from_secs(67);
-        a.poll(timeout);
-
-        // Pending link should be removed
-        assert!(
-            !a.pending_outbound_links.contains_key(&link_id),
-            "pending link should be removed after timeout"
-        );
-
-        // Pending requests should be removed
-        assert!(
-            !a.pending_outbound_requests.contains_key(&addr_b),
-            "pending requests should be removed after timeout"
-        );
-
-        // Service should receive failure notification
-        // Note: The notification includes a generated request_id since the original
-        // request was never sent, so we just check that we got a failure
-        // (The current implementation generates a random request_id for failed queued requests)
+        // Request on pending link returns None
+        let result = a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"data");
+        assert!(result.is_none(), "request on pending link should return None");
     }
 
     #[test]
@@ -4493,7 +4469,7 @@ mod tests {
         b.poll(now);
 
         // Send a request
-        a.request(svc_a, addr_b, "test", b"request", now);
+        a.request(svc_a, crate::LinkHandle(link_id), "test", b"request");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events_b = b.poll(now);
@@ -4807,7 +4783,7 @@ mod tests {
 
         assert!(a.established_links.contains_key(&link_id));
 
-        a.request(svc_a, addr_b, "test.path", b"hello", now);
+        a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"hello");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events_b = b.poll(now);
@@ -4847,7 +4823,7 @@ mod tests {
 
         assert!(a.established_links.contains_key(&link_id));
 
-        let sent_request_id = a.request(svc_a, addr_b, "test.path", b"hello", now);
+        let sent_request_id = a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"hello").unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events_b = b.poll(now);
@@ -4879,7 +4855,7 @@ mod tests {
     }
 
     #[test]
-    fn request_result_event_on_link_failure() {
+    fn pending_link_timeout_closes_link_status() {
         use std::time::Duration;
 
         let mut a = test_node(true);
@@ -4897,28 +4873,19 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        // Queue request while link is pending (don't complete handshake)
-        let _link_id = a.link(None, addr_b, now).unwrap();
+        // Create link but don't complete handshake
+        let link = a.create_link(svc_a, addr_b, now).unwrap();
         a.poll(now);
 
-        let sent_request_id = a.request(svc_a, addr_b, "test.path", b"hello", now);
-        a.poll(now);
+        // Link should be pending
+        assert_eq!(a.link_status(link), crate::LinkStatus::Pending);
 
         // Time out the link (base 60s + 6s per hop)
         let timeout = now + Duration::from_secs(67);
-        let events_a = a.poll(timeout);
+        a.poll(timeout);
 
-        let failure = events_a.iter().find_map(|e| match e {
-            ServiceEvent::RequestResult {
-                request_id,
-                result: Err(err),
-                ..
-            } => Some((*request_id, err.clone())),
-            _ => None,
-        });
-        let (recv_request_id, err) = failure.expect("RequestResult with Err should be emitted");
-        assert_eq!(recv_request_id, sent_request_id);
-        assert_eq!(err, crate::handle::RequestError::LinkFailed);
+        // Link should be closed
+        assert_eq!(a.link_status(link), crate::LinkStatus::Closed);
     }
 
     #[test]
@@ -4949,7 +4916,7 @@ mod tests {
         assert!(a.established_links.contains_key(&link_id));
 
         // First request
-        let request_id_1 = a.request(svc_a, addr_b, "echo", b"first", now);
+        let request_id_1 = a.request(svc_a, crate::LinkHandle(link_id), "echo", b"first").unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events_b1 = b.poll(now);
@@ -4979,7 +4946,7 @@ mod tests {
         assert_eq!(resp1.unwrap().0, request_id_1);
 
         // Second request
-        let request_id_2 = a.request(svc_a, addr_b, "echo", b"second", now);
+        let request_id_2 = a.request(svc_a, crate::LinkHandle(link_id), "echo", b"second").unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events_b2 = b.poll(now);
@@ -5045,7 +5012,7 @@ mod tests {
             let req_data = format!("request{}", i);
             let resp_data = format!("response{}", i);
 
-            a.request(svc_a, addr_b, "echo", req_data.as_bytes(), now);
+            a.request(svc_a, crate::LinkHandle(link_id), "echo", req_data.as_bytes());
             a.poll(now);
             transfer(&mut a, 0, &mut b, 0);
             let events_b = b.poll(now);
@@ -5114,14 +5081,14 @@ mod tests {
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        a.link(None, addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        a.request(svc_a, addr_b, "test", b"", now);
+        a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events_b = b.poll(now);
@@ -5196,14 +5163,14 @@ mod tests {
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        a.link(None, addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        a.request(svc_a, addr_b, "test", b"", now);
+        a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events_b = b.poll(now);
@@ -5276,14 +5243,14 @@ mod tests {
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        a.link(None, addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        a.request(svc_a, addr_b, "test", b"", now);
+        a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events_b = b.poll(now);
@@ -5369,14 +5336,14 @@ mod tests {
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        a.link(None, addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        a.request(svc_a, addr_b, "test", b"", now);
+        a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events_b = b.poll(now);
@@ -5490,14 +5457,14 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        a.link(None, addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        a.request(svc_a, addr_b, "test.path", b"req", now);
+        a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"req");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events_b = b.poll(now);
@@ -5577,7 +5544,7 @@ mod tests {
         let later = now + Duration::from_secs(3);
 
         // Send a request - this will trigger a response from B
-        a.request(svc_a, addr_b, "test.path", b"req", later);
+        a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"req");
         a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
         let events_b = b.poll(later);
@@ -5636,7 +5603,7 @@ mod tests {
         // Send requests every 4s - link should stay active
         for i in 1..=5 {
             let t = now + Duration::from_secs(i * 4);
-            a.request(svc_a, addr_b, "test.path", b"ping", t);
+            a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"ping");
             a.poll(t);
             transfer(&mut a, 0, &mut b, 0);
             let events_b = b.poll(t);
@@ -5692,7 +5659,7 @@ mod tests {
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        a.link(None, addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -5700,7 +5667,7 @@ mod tests {
         a.poll(now);
 
         // Request and respond
-        a.request(svc_a, addr_b, "test", b"", now);
+        a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events = b.poll(now);
@@ -5777,7 +5744,7 @@ mod tests {
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        a.link(None, addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -5785,7 +5752,7 @@ mod tests {
         a.poll(now);
 
         // Request
-        let local_req_id = a.request(svc_a, addr_b, "test", b"", now);
+        let local_req_id = a.request(svc_a, crate::LinkHandle(link_id), "test", b"").unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events = b.poll(now);
@@ -6051,7 +6018,7 @@ mod tests {
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        a.link(None, addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -6059,7 +6026,7 @@ mod tests {
         a.poll(now);
 
         // Request
-        a.request(svc_a, addr_b, "test", b"", now);
+        a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events = b.poll(now);
@@ -6135,7 +6102,7 @@ mod tests {
         assert!(a.established_links.contains_key(&link_id));
 
         // Make a request to set up pending_requests
-        let _local_req_id = a.request(svc_a, addr_b, "test", b"", now);
+        let _local_req_id = a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
 
         // Verify request is pending
@@ -6377,7 +6344,7 @@ mod tests {
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        a.link(None, addr_b, now).unwrap();
+        let link_id = a.link(None, addr_b, now).unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(now);
@@ -6385,7 +6352,7 @@ mod tests {
         a.poll(now);
 
         // Send request
-        let local_req_id = a.request(svc_a, addr_b, "test", b"", now);
+        let local_req_id = a.request(svc_a, crate::LinkHandle(link_id), "test", b"").unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events = b.poll(now);
@@ -7649,40 +7616,38 @@ mod tests {
     // Path Discovery Timeout
 
     #[test]
-    fn path_request_timeout_fails_pending_requests() {
+    fn path_request_timeout_emits_not_found() {
         let mut a = test_node(true);
         a.add_interface(test_interface());
 
-        let svc_a = a.add_service("client", &[], &id(0));
+        let _svc_a = a.add_service("client", &[], &id(0));
         let unknown_dest: Address = [0xDE; 16];
         let t = Instant::now();
 
-        a.request(svc_a, unknown_dest, "/test", b"data", t);
+        a.request_path(unknown_dest, t);
         a.poll(t);
 
         assert!(a.pending_path_requests.contains_key(&unknown_dest));
-        assert!(a.pending_outbound_requests.contains_key(&unknown_dest));
 
         let timeout = t + std::time::Duration::from_secs(61);
         let events = a.poll(timeout);
 
         assert!(!a.pending_path_requests.contains_key(&unknown_dest));
-        assert!(!a.pending_outbound_requests.contains_key(&unknown_dest));
 
-        let has_timeout_error = events.iter().any(|e| {
+        let has_path_not_found = events.iter().any(|e| {
             matches!(
                 e,
-                ServiceEvent::RequestResult {
-                    result: Err(crate::handle::RequestError::Timeout),
-                    ..
-                }
+                ServiceEvent::PathRequestResult {
+                    destination,
+                    found: false,
+                } if *destination == unknown_dest
             )
         });
-        assert!(has_timeout_error);
+        assert!(has_path_not_found);
     }
 
     #[test]
-    fn pending_link_timeout_fails_queued_requests() {
+    fn pending_link_timeout_closes_link() {
         let mut a = test_node(true);
         let mut b = test_node(true);
         a.add_interface(test_interface());
@@ -7698,26 +7663,17 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(t);
 
-        a.request(svc_a, addr_b, "/test", b"data", t);
+        let link = a.create_link(svc_a, addr_b, t);
+        assert!(link.is_some());
         a.poll(t);
 
         assert!(!a.pending_outbound_links.is_empty());
 
         let timeout = t + std::time::Duration::from_secs(70);
-        let events = a.poll(timeout);
+        a.poll(timeout);
 
         assert!(a.pending_outbound_links.is_empty());
-
-        let has_link_failed = events.iter().any(|e| {
-            matches!(
-                e,
-                ServiceEvent::RequestResult {
-                    result: Err(crate::handle::RequestError::LinkFailed),
-                    ..
-                }
-            )
-        });
-        assert!(has_link_failed);
+        assert_eq!(a.link_status(link.unwrap()), crate::LinkStatus::Closed);
     }
 
     // Multi-Segment Resources
@@ -7785,14 +7741,14 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(t);
 
-        a.link(None, addr_b, t).unwrap();
+        let link_id = a.link(None, addr_b, t).unwrap();
         a.poll(t);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(t);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(t);
 
-        a.request(svc_a, addr_b, "test", b"req", t);
+        a.request(svc_a, crate::LinkHandle(link_id), "test", b"req");
         a.poll(t);
         transfer(&mut a, 0, &mut b, 0);
         let events_b = b.poll(t);
@@ -7854,14 +7810,14 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(t);
 
-        a.link(None, addr_b, t).unwrap();
+        let link_id = a.link(None, addr_b, t).unwrap();
         a.poll(t);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(t);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(t);
 
-        a.request(svc_a, addr_b, "test", b"req", t);
+        a.request(svc_a, crate::LinkHandle(link_id), "test", b"req");
         a.poll(t);
         transfer(&mut a, 0, &mut b, 0);
         let events_b = b.poll(t);
