@@ -3767,7 +3767,12 @@ mod tests {
         assert!(b.established_links.contains_key(&link_id));
 
         // Send request from A to B
-        a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"request data");
+        a.request(
+            svc_a,
+            crate::LinkHandle(link_id),
+            "test.path",
+            b"request data",
+        );
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events_b = b.poll(now);
@@ -3846,7 +3851,12 @@ mod tests {
         assert!(c.established_links.contains_key(&link_id));
 
         // Send request from A to C (via B)
-        a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"request data");
+        a.request(
+            svc_a,
+            crate::LinkHandle(link_id),
+            "test.path",
+            b"request data",
+        );
         a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(later);
@@ -4394,7 +4404,10 @@ mod tests {
 
         // Request on pending link returns None
         let result = a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"data");
-        assert!(result.is_none(), "request on pending link should return None");
+        assert!(
+            result.is_none(),
+            "request on pending link should return None"
+        );
     }
 
     #[test]
@@ -4611,7 +4624,7 @@ mod tests {
         let mut a = test_node(false);
         let mut b = test_node(false);
         a.add_interface(make_ifac_interface(
-            shared_ifac_identity.clone(),
+            shared_ifac_identity,
             shared_ifac_key.clone(),
         ));
         b.add_interface(make_ifac_interface(shared_ifac_identity, shared_ifac_key));
@@ -4823,7 +4836,9 @@ mod tests {
 
         assert!(a.established_links.contains_key(&link_id));
 
-        let sent_request_id = a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"hello").unwrap();
+        let sent_request_id = a
+            .request(svc_a, crate::LinkHandle(link_id), "test.path", b"hello")
+            .unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events_b = b.poll(now);
@@ -4916,7 +4931,9 @@ mod tests {
         assert!(a.established_links.contains_key(&link_id));
 
         // First request
-        let request_id_1 = a.request(svc_a, crate::LinkHandle(link_id), "echo", b"first").unwrap();
+        let request_id_1 = a
+            .request(svc_a, crate::LinkHandle(link_id), "echo", b"first")
+            .unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events_b1 = b.poll(now);
@@ -4946,7 +4963,9 @@ mod tests {
         assert_eq!(resp1.unwrap().0, request_id_1);
 
         // Second request
-        let request_id_2 = a.request(svc_a, crate::LinkHandle(link_id), "echo", b"second").unwrap();
+        let request_id_2 = a
+            .request(svc_a, crate::LinkHandle(link_id), "echo", b"second")
+            .unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events_b2 = b.poll(now);
@@ -5012,7 +5031,12 @@ mod tests {
             let req_data = format!("request{}", i);
             let resp_data = format!("response{}", i);
 
-            a.request(svc_a, crate::LinkHandle(link_id), "echo", req_data.as_bytes());
+            a.request(
+                svc_a,
+                crate::LinkHandle(link_id),
+                "echo",
+                req_data.as_bytes(),
+            );
             a.poll(now);
             transfer(&mut a, 0, &mut b, 0);
             let events_b = b.poll(now);
@@ -5752,7 +5776,9 @@ mod tests {
         a.poll(now);
 
         // Request
-        let local_req_id = a.request(svc_a, crate::LinkHandle(link_id), "test", b"").unwrap();
+        let local_req_id = a
+            .request(svc_a, crate::LinkHandle(link_id), "test", b"")
+            .unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events = b.poll(now);
@@ -5875,10 +5901,11 @@ mod tests {
     fn strip_metadata_large_size() {
         // Test with metadata size requiring all 3 bytes
         let metadata_len: usize = 0x010203; // 66051 bytes
-        let mut header = Vec::new();
-        header.push((metadata_len >> 16) as u8);
-        header.push((metadata_len >> 8) as u8);
-        header.push(metadata_len as u8);
+        let header = [
+            (metadata_len >> 16) as u8,
+            (metadata_len >> 8) as u8,
+            metadata_len as u8,
+        ];
 
         let parsed_size =
             ((header[0] as usize) << 16) | ((header[1] as usize) << 8) | (header[2] as usize);
@@ -6352,7 +6379,9 @@ mod tests {
         a.poll(now);
 
         // Send request
-        let local_req_id = a.request(svc_a, crate::LinkHandle(link_id), "test", b"").unwrap();
+        let local_req_id = a
+            .request(svc_a, crate::LinkHandle(link_id), "test", b"")
+            .unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let events = b.poll(now);
@@ -7460,7 +7489,7 @@ mod tests {
         b.add_interface(test_interface());
 
         let svc_a = a.add_service("client", &[], &id(0));
-        let svc_b = b.add_service("server", &[], &id(1));
+        let svc_b = b.add_service("server", &["test"], &id(1));
         let addr_b = b.service_address(svc_b).unwrap();
         let t = Instant::now();
 
@@ -7469,23 +7498,47 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(t);
 
-        let handle = a.create_link(svc_a, addr_b, t).unwrap();
+        let link_id = a.link(None, addr_b, t).unwrap();
         a.poll(t);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(t);
         transfer(&mut b, 0, &mut a, 0);
         a.poll(t);
 
-        a.advertise_resource(handle, b"data".to_vec(), None, false);
+        a.request(svc_a, crate::LinkHandle(link_id), "test", b"req");
+        a.poll(t);
+        transfer(&mut a, 0, &mut b, 0);
+        let events_b = b.poll(t);
 
-        for _ in 0..10 {
+        let request_id = events_b
+            .iter()
+            .find_map(|e| match e {
+                ServiceEvent::Request { request_id, .. } => Some(*request_id),
+                _ => None,
+            })
+            .expect("B should receive request");
+
+        let large_response: Vec<u8> = (0..500).map(|i| (i % 256) as u8).collect();
+        b.respond(request_id, &large_response, None, false);
+        b.poll(t);
+
+        assert_eq!(
+            b.outbound_resources.len(),
+            1,
+            "B should have outbound resource"
+        );
+
+        for _ in 0..20 {
+            transfer(&mut b, 0, &mut a, 0);
             a.poll(t);
             transfer(&mut a, 0, &mut b, 0);
             b.poll(t);
-            transfer(&mut b, 0, &mut a, 0);
         }
 
-        assert!(true);
+        assert!(
+            b.outbound_resources.is_empty(),
+            "outbound resource should be confirmed and removed after RCL proof"
+        );
     }
 
     #[test]

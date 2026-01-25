@@ -2340,6 +2340,7 @@ dependencies = [
 [[package]]
 name = "micronaut"
 version = "0.1.0"
+source = "git+https://github.com/cyypherus/micronaut#f30115479533ba6e9920e34409543bdd75a79db1"
 dependencies = [
  "ratatui",
  "unicode-width",

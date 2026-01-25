@@ -5,7 +5,7 @@ use rinse::{Address, AspectHash, Destination};
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 
 const NODE_ASPECT_NAME: &str = "nomadnetwork.node";
 

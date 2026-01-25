@@ -1,5 +1,4 @@
 mod app;
-mod config;
 mod identity;
 mod network;
 mod tui;
@@ -8,12 +7,12 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::sync::Arc;
 
+use rinse::config::{Config, InterfaceConfig};
 use rinse::{AsyncTcpTransport, Interface, RequestError, ServiceEvent};
 
 use tokio::sync::{mpsc, oneshot};
 
 use app::NomadApp;
-use config::{Config, InterfaceConfig};
 use network::{NetworkClient, NodeRegistry};
 use simplelog::{Config as LogConfig, LevelFilter, WriteLogger};
 use tui::{InterfaceInfo, InterfaceKind, NetworkEvent, TuiApp, TuiCommand};

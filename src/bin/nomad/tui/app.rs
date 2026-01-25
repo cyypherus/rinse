@@ -8,21 +8,21 @@ use crossterm::{
     },
     execute,
     terminal::{
-        disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
-        LeaveAlternateScreen,
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode,
     },
 };
 use ratatui::{
+    Terminal,
     layout::{Constraint, Layout, Rect},
     prelude::{CrosstermBackend, Widget},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
-    Terminal,
 };
 use tokio::sync::mpsc;
-use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
+use tui_input::backend::crossterm::EventHandler;
 
 use super::browser_view::BrowserView;
 use super::discovery::{DiscoveryView, ModalAction};

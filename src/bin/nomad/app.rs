@@ -1,10 +1,10 @@
+use rinse::config::{Config, ConfigError, InterfaceConfig};
 use rinse::{AsyncNode, AsyncTcpTransport, Interface, ServiceId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use crate::config::{Config, ConfigError, InterfaceConfig};
 use crate::identity::{Identity, IdentityError};
 
 #[derive(Error, Debug)]
