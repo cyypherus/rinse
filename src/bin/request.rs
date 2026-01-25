@@ -118,7 +118,11 @@ async fn main() {
         }
     });
 
-    let response = node_clone.request(service, node_id, &path, &[]).await;
+    let link = node_clone
+        .establish_link(service, node_id)
+        .await
+        .expect("Failed to establish link");
+    let response = node_clone.request(service, link, &path, &[]).await;
 
     progress_task.abort();
 

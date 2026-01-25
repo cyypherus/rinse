@@ -224,6 +224,7 @@ type RequestWaiters = Arc<
 >;
 type RespondWaiters = Arc<StdMutex<HashMap<RequestId, oneshot::Sender<Result<(), RespondError>>>>>;
 type LinkWaiters = HashMap<crate::LinkHandle, Vec<oneshot::Sender<bool>>>;
+type PathWaiters = HashMap<Address, Vec<oneshot::Sender<bool>>>;
 type EventReceiver = Arc<TokioMutex<mpsc::UnboundedReceiver<ServiceEvent>>>;
 
 #[derive(Clone)]
@@ -244,7 +245,7 @@ enum Command<T: Transport> {
     },
     Request {
         service: ServiceId,
-        dest: Address,
+        link: crate::LinkHandle,
         path: String,
         data: Vec<u8>,
         reply: oneshot::Sender<RequestId>,
@@ -311,12 +312,17 @@ enum Command<T: Transport> {
         link: crate::LinkHandle,
         reply: oneshot::Sender<bool>,
     },
+    RequestPath {
+        destination: Address,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 struct AsyncNodeInner<T: Transport> {
     node: crate::Node<T, StdRng>,
     command_rx: mpsc::UnboundedReceiver<Command<T>>,
     link_waiters: LinkWaiters,
+    path_waiters: PathWaiters,
 }
 
 pub struct AsyncNode<T: Transport> {
@@ -350,6 +356,7 @@ impl<T: Transport> AsyncNode<T> {
                 node: crate::Node::with_rng(rng, transport),
                 command_rx,
                 link_waiters: HashMap::new(),
+                path_waiters: HashMap::new(),
             }),
         }
     }
@@ -435,14 +442,14 @@ impl<T: Transport> AsyncNode<T> {
     pub async fn request(
         &self,
         service: ServiceId,
-        dest: Address,
+        link: crate::LinkHandle,
         path: &str,
         data: &[u8],
     ) -> Result<(Vec<u8>, Option<Vec<u8>>), RequestError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.command_tx.send(Command::Request {
             service,
-            dest,
+            link,
             path: path.to_string(),
             data: data.to_vec(),
             reply: reply_tx,
@@ -508,6 +515,15 @@ impl<T: Transport> AsyncNode<T> {
             channels.event_rx.clone()
         };
         event_rx.lock().await.recv().await
+    }
+
+    pub async fn request_path(&self, destination: Address) -> bool {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::RequestPath {
+            destination,
+            reply: reply_tx,
+        });
+        reply_rx.await.unwrap_or(false)
     }
 
     pub async fn establish_link(
@@ -644,6 +660,17 @@ impl<T: Transport> AsyncNode<T> {
     ) {
         let now = Instant::now();
         let events = inner.node.poll(now);
+
+        for event in &events {
+            if let ServiceEvent::PathRequestResult { destination, found } = event
+                && let Some(waiters) = inner.path_waiters.remove(destination)
+            {
+                for tx in waiters {
+                    let _ = tx.send(*found);
+                }
+            }
+        }
+
         Self::dispatch_events(services, events);
 
         inner.link_waiters.retain(|link, waiters| {
@@ -703,7 +730,12 @@ impl<T: Transport> AsyncNode<T> {
                         }
                     }
                 }
-                ServiceEvent::DestinationsChanged => {}
+                ServiceEvent::DestinationsChanged => {
+                    for channels in services.values() {
+                        let _ = channels.event_tx.send(ServiceEvent::DestinationsChanged);
+                    }
+                }
+                ServiceEvent::PathRequestResult { .. } => {}
             }
         }
     }
@@ -727,13 +759,14 @@ impl<T: Transport> AsyncNode<T> {
             }
             Command::Request {
                 service,
-                dest,
+                link,
                 path,
                 data,
                 reply,
             } => {
-                let request_id = inner.node.request(service, dest, &path, &data, now);
-                let _ = reply.send(request_id);
+                if let Some(request_id) = inner.node.request(service, link, &path, &data) {
+                    let _ = reply.send(request_id);
+                }
             }
             Command::Respond {
                 request_id,
@@ -811,6 +844,18 @@ impl<T: Transport> AsyncNode<T> {
                     let _ = reply.send(false);
                 } else {
                     inner.link_waiters.entry(link).or_default().push(reply);
+                }
+            }
+            Command::RequestPath { destination, reply } => {
+                if inner.node.path_table.contains_key(&destination) {
+                    let _ = reply.send(true);
+                } else {
+                    inner.node.request_path(destination, now);
+                    inner
+                        .path_waiters
+                        .entry(destination)
+                        .or_default()
+                        .push(reply);
                 }
             }
         }

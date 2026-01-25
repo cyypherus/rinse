@@ -489,9 +489,14 @@ async fn send(args: Args) {
         );
     }
 
+    let Some(link) = node_clone.establish_link(service, dest_hash).await else {
+        eprintln!("Failed to establish link");
+        std::process::exit(1);
+    };
+
     let result = tokio::time::timeout(
         timeout,
-        node_clone.request(service, dest_hash, "receive_file", &file_data),
+        node_clone.request(service, link, "receive_file", &file_data),
     )
     .await;
 
@@ -627,9 +632,14 @@ async fn fetch(args: Args) {
         }
     });
 
+    let Some(link) = node_clone.establish_link(service, dest_hash).await else {
+        eprintln!("Failed to establish link");
+        std::process::exit(1);
+    };
+
     let result = tokio::time::timeout(
         timeout,
-        node_clone.request(service, dest_hash, "fetch_file", remote_path.as_bytes()),
+        node_clone.request(service, link, "fetch_file", remote_path.as_bytes()),
     )
     .await;
 

@@ -10,6 +10,7 @@ tokio = ["dep:tokio", "dep:env_logger", "tcp"]
 config = ["dep:toml"]
 relay = ["tokio", "config", "dep:serde_json", "dep:simplelog", "dep:ratatui", "dep:crossterm"]
 iroh = ["dep:iroh", "dep:tokio"]
+nomad = ["tokio", "config", "dep:simplelog", "dep:ratatui", "dep:crossterm", "dep:micronaut", "dep:tui-input", "dep:cli-clipboard", "dep:unicode-width", "dep:tokio-util", "dep:thiserror"]
 
 [dependencies]
 aes = "0.8.4"
@@ -36,6 +37,14 @@ ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.29", optional = true }
 iroh = { version = "0.32", optional = true }
 
+# nomad
+micronaut = { path = "../micronaut", features = ["ratatui"], optional = true }
+tui-input = { version = "0.15", optional = true }
+cli-clipboard = { version = "0.4", optional = true }
+unicode-width = { version = "0.2", optional = true }
+tokio-util = { version = "0.7", optional = true }
+thiserror = { version = "1", optional = true }
+
 [[bin]]
 name = "rinse-serve"
 path = "src/bin/serve.rs"
@@ -55,6 +64,16 @@ required-features = ["tokio"]
 name = "rncp"
 path = "src/bin/rncp.rs"
 required-features = ["tokio"]
+
+[[bin]]
+name = "page"
+path = "src/bin/page/main.rs"
+required-features = ["tokio", "config"]
+
+[[bin]]
+name = "nomad"
+path = "src/bin/nomad/main.rs"
+required-features = ["nomad"]
 
 [dev-dependencies]
 env_logger = "0.11"

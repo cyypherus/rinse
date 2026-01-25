@@ -53,6 +53,10 @@ enum Notification {
         data: Vec<u8>,
     },
     DestinationsChanged,
+    PathRequestResult {
+        destination: Address,
+        found: bool,
+    },
 }
 
 struct ServiceEntry {
@@ -316,25 +320,58 @@ impl<T: Transport, R: RngCore> Node<T, R> {
     pub fn request(
         &mut self,
         service: ServiceId,
-        destination: Address,
+        link: crate::LinkHandle,
         path: &str,
         data: &[u8],
-        now: Instant,
-    ) -> RequestId {
+    ) -> Option<RequestId> {
+        use crate::packet::LinkDataDestination;
+
+        let link_id = link.0;
+        let Some(established) = self.established_links.get_mut(&link_id) else {
+            log::warn!("Request on non-existent link {}", hex::encode(link_id));
+            return None;
+        };
+
         let mut id_bytes = [0u8; 16];
         self.rng.fill_bytes(&mut id_bytes);
         let local_request_id = RequestId(id_bytes);
 
-        self.send_request_inner(
-            service,
-            destination,
-            local_request_id,
+        let path_hash = crate::request::path_hash(path);
+        log::info!(
+            "Request on link {} path={} hash={} ({} bytes)",
+            hex::encode(link_id),
             path,
-            data.to_vec(),
-            now,
+            hex::encode(path_hash),
+            data.len()
         );
 
-        local_request_id
+        let req = Request::new(path, data.to_vec());
+        let encoded = req.encode();
+        let ciphertext = established.encrypt(&mut self.rng, &encoded);
+
+        let packet = Packet::LinkData {
+            hops: 0,
+            destination: LinkDataDestination::Direct(link_id),
+            context: LinkContext::Request,
+            data: ciphertext,
+        };
+        let wire_request_id = WireRequestId(packet.packet_hash()[..16].try_into().unwrap());
+        established
+            .pending_requests
+            .insert(wire_request_id, (service, local_request_id));
+
+        log::info!(
+            "Sending request over link {} wire_request_id={}",
+            hex::encode(link_id),
+            hex::encode(wire_request_id.0),
+        );
+        for iface in &mut self.interfaces {
+            self.stats.packets_sent += 1;
+            self.stats.bytes_sent += packet.to_bytes().len() as u64;
+            iface.send(packet.clone(), 0);
+        }
+
+        Some(local_request_id)
     }
 
     pub fn respond(
@@ -598,6 +635,10 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 Notification::DestinationsChanged => {
                     self.pending_events.push(ServiceEvent::DestinationsChanged);
                 }
+                Notification::PathRequestResult { destination, found } => {
+                    self.pending_events
+                        .push(ServiceEvent::PathRequestResult { destination, found });
+                }
             }
         }
     }
@@ -688,7 +729,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         }
     }
 
-    fn request_path(&mut self, destination: Address, now: Instant) {
+    pub fn request_path(&mut self, destination: Address, now: Instant) {
         log::info!(
             "Sending path request for <{}> on {} interface(s)",
             hex::encode(destination),
@@ -723,7 +764,17 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         now: Instant,
     ) -> Option<crate::LinkHandle> {
         if let Some(&link_id) = self.destination_links.get(&destination) {
-            return Some(crate::LinkHandle(link_id));
+            let is_usable = self
+                .established_links
+                .get(&link_id)
+                .map(|l| matches!(l.state, LinkState::Handshake | LinkState::Active))
+                .unwrap_or(false)
+                || self.pending_outbound_links.contains_key(&link_id);
+
+            if is_usable {
+                return Some(crate::LinkHandle(link_id));
+            }
+            self.destination_links.remove(&destination);
         }
         let link_id = self.link(Some(service), destination, now)?;
         self.destination_links.insert(destination, link_id);
@@ -761,11 +812,34 @@ impl<T: Transport, R: RngCore> Node<T, R> {
     pub fn self_identify(&mut self, link: crate::LinkHandle, identity: &crate::Identity) {
         use crate::link::LinkIdentify;
 
-        if !self.established_links.contains_key(&link.0) {
+        let Some(established) = self.established_links.get(&link.0) else {
+            log::warn!("self_identify: link {} not found", hex::encode(link.0));
+            return;
+        };
+
+        if established.state != LinkState::Active {
+            log::warn!(
+                "self_identify: link {} not active (state={:?})",
+                hex::encode(link.0),
+                established.state
+            );
+            return;
+        }
+
+        if !established.is_initiator {
+            log::warn!(
+                "self_identify: link {} is not initiator",
+                hex::encode(link.0)
+            );
             return;
         }
 
         let identify = LinkIdentify::create(&link.0, identity);
+        log::info!(
+            "Sending LinkIdentify on link {} identity={}",
+            hex::encode(link.0),
+            hex::encode(identity.hash())
+        );
         self.send_link_packet(link.0, LinkContext::LinkIdentify, &identify.to_bytes());
     }
 
@@ -1501,7 +1575,8 @@ impl<T: Transport, R: RngCore> Node<T, R> {
 
                         // Schedule for rebroadcast with random delay
                         // PATH_RESPONSE announces are not rebroadcast (they're one-shot responses)
-                        if !is_path_response {
+                        // Only schedule if we are a transport node (relay enabled)
+                        if !is_path_response && self.transport {
                             let delay_ms = self.rng.gen_range(0..=PATHFINDER_RW_MS);
                             let retry_at = now + std::time::Duration::from_millis(delay_ms);
                             self.pending_announces.push(PendingAnnounce {
@@ -1536,6 +1611,10 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                                 "Received announce for <{}> which we had a pending path request for",
                                 hex::encode(destination_hash)
                             );
+                            notifications.push(Notification::PathRequestResult {
+                                destination: destination_hash,
+                                found: true,
+                            });
                         }
 
                         // Check if we have a discovery path request waiting for this destination
@@ -2464,6 +2543,11 @@ impl<T: Transport, R: RngCore> Node<T, R> {
 
         for destination in timed_out_paths {
             self.pending_path_requests.remove(&destination);
+
+            notifications.push(Notification::PathRequestResult {
+                destination,
+                found: false,
+            });
 
             if let Some(queued) = self.pending_outbound_requests.remove(&destination) {
                 for (service, local_request_id, _path, _data) in queued {

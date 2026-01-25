@@ -60,4 +60,8 @@ pub enum ServiceEvent {
         data: Vec<u8>,
     },
     DestinationsChanged,
+    PathRequestResult {
+        destination: Address,
+        found: bool,
+    },
 }

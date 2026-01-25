@@ -1,50 +1,19 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use thiserror::Error;
 
-use serde::{Deserialize, Serialize};
-
-use crate::identity::Identity;
-
-#[derive(Debug)]
+#[derive(Error, Debug)]
 pub enum ConfigError {
-    Io(std::io::Error),
-    Parse(toml::de::Error),
-    InvalidIdentity,
-}
-
-impl std::fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConfigError::Io(e) => write!(f, "io error: {}", e),
-            ConfigError::Parse(e) => write!(f, "parse error: {}", e),
-            ConfigError::InvalidIdentity => write!(f, "invalid identity data"),
-        }
-    }
-}
-
-impl std::error::Error for ConfigError {}
-
-impl From<std::io::Error> for ConfigError {
-    fn from(e: std::io::Error) -> Self {
-        ConfigError::Io(e)
-    }
-}
-
-impl From<toml::de::Error> for ConfigError {
-    fn from(e: toml::de::Error) -> Self {
-        ConfigError::Parse(e)
-    }
-}
-
-pub fn data_dir() -> PathBuf {
-    PathBuf::from(".rinse")
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("parse error: {0}")]
+    Parse(#[from] toml::de::Error),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
-    #[serde(default)]
-    pub name: Option<String>,
     #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default)]
@@ -94,15 +63,31 @@ impl InterfaceConfig {
 
 impl Config {
     pub fn load() -> Result<Self, ConfigError> {
-        let config_path = Self::config_path();
+        let config_path = Self::config_path()?;
 
         if config_path.exists() {
             let contents = fs::read_to_string(&config_path)?;
             Ok(toml::from_str(&contents)?)
         } else {
-            let config = Config::default();
+            let config = Config::default_with_example_interface();
             config.save()?;
             Ok(config)
+        }
+    }
+
+    fn default_with_example_interface() -> Self {
+        let mut interfaces = HashMap::new();
+        interfaces.insert(
+            "Default TCP".to_string(),
+            InterfaceConfig::TCPClientInterface {
+                enabled: true,
+                target_host: "amsterdam.connect.reticulum.network".to_string(),
+                target_port: 4965,
+            },
+        );
+        Self {
+            network: NetworkConfig::default(),
+            interfaces,
         }
     }
 
@@ -115,7 +100,7 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<(), ConfigError> {
-        let config_path = Self::config_path();
+        let config_path = Self::config_path()?;
 
         if let Some(parent) = config_path.parent() {
             fs::create_dir_all(parent)?;
@@ -126,33 +111,11 @@ impl Config {
         Ok(())
     }
 
-    fn config_path() -> PathBuf {
-        data_dir().join("config.toml")
-    }
-}
-
-pub fn load_or_generate_identity() -> Result<Identity, ConfigError> {
-    let path = data_dir().join("identity");
-
-    if path.exists() {
-        let hex_str = fs::read_to_string(&path)?;
-        let bytes = hex::decode(hex_str.trim()).map_err(|_| ConfigError::InvalidIdentity)?;
-        Identity::from_bytes(&bytes).ok_or(ConfigError::InvalidIdentity)
-    } else {
-        let identity = Identity::generate(&mut rand::thread_rng());
-        save_identity(&identity)?;
-        Ok(identity)
-    }
-}
-
-pub fn save_identity(identity: &Identity) -> Result<(), ConfigError> {
-    let path = data_dir().join("identity");
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+    pub fn data_dir() -> Result<PathBuf, ConfigError> {
+        Ok(PathBuf::from(".rinse"))
     }
 
-    let hex_str = hex::encode(identity.to_bytes());
-    fs::write(path, hex_str)?;
-    Ok(())
+    fn config_path() -> Result<PathBuf, ConfigError> {
+        Ok(Self::data_dir()?.join("config.toml"))
+    }
 }
