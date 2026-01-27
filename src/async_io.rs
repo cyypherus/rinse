@@ -223,6 +223,8 @@ type RequestWaiters = Arc<
     StdMutex<HashMap<RequestId, oneshot::Sender<Result<(Vec<u8>, Option<Vec<u8>>), RequestError>>>>,
 >;
 type RespondWaiters = Arc<StdMutex<HashMap<RequestId, oneshot::Sender<Result<(), RespondError>>>>>;
+type LinkWaiters = HashMap<crate::LinkHandle, Vec<oneshot::Sender<bool>>>;
+type PathWaiters = HashMap<Address, Vec<oneshot::Sender<bool>>>;
 type EventReceiver = Arc<TokioMutex<mpsc::UnboundedReceiver<ServiceEvent>>>;
 
 #[derive(Clone)]
@@ -243,7 +245,7 @@ enum Command<T: Transport> {
     },
     Request {
         service: ServiceId,
-        dest: Address,
+        link: crate::LinkHandle,
         path: String,
         data: Vec<u8>,
         reply: oneshot::Sender<RequestId>,
@@ -258,21 +260,69 @@ enum Command<T: Transport> {
         dest: Address,
         data: Vec<u8>,
     },
-    HasDestination {
-        dest: Address,
-        reply: oneshot::Sender<bool>,
-    },
     GetDestinations {
         reply: oneshot::Sender<Vec<Destination>>,
     },
     GetStats {
         reply: oneshot::Sender<StatsSnapshot>,
     },
+    CreateLink {
+        service: ServiceId,
+        destination: Address,
+        reply: oneshot::Sender<Option<crate::LinkHandle>>,
+    },
+    LinkStatus {
+        link: crate::LinkHandle,
+        reply: oneshot::Sender<crate::LinkStatus>,
+    },
+    LinkRtt {
+        link: crate::LinkHandle,
+        reply: oneshot::Sender<Option<u64>>,
+    },
+    CloseLink {
+        link: crate::LinkHandle,
+    },
+    SelfIdentify {
+        link: crate::LinkHandle,
+        identity: Box<crate::Identity>,
+    },
+    LinkRequest {
+        link: crate::LinkHandle,
+        path: String,
+        data: Vec<u8>,
+        reply: oneshot::Sender<Option<RequestId>>,
+    },
+    AdvertiseResource {
+        link: crate::LinkHandle,
+        data: Vec<u8>,
+        metadata: Option<Vec<u8>>,
+        compress: bool,
+        reply: oneshot::Sender<Option<crate::ResourceHandle>>,
+    },
+    ResourceProgress {
+        resource: crate::ResourceHandle,
+        reply: oneshot::Sender<Option<f32>>,
+    },
+    ProvePacket {
+        service: ServiceId,
+        packet_data: Vec<u8>,
+        reply: oneshot::Sender<bool>,
+    },
+    AwaitLinkActive {
+        link: crate::LinkHandle,
+        reply: oneshot::Sender<bool>,
+    },
+    RequestPath {
+        destination: Address,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 struct AsyncNodeInner<T: Transport> {
     node: crate::Node<T, StdRng>,
     command_rx: mpsc::UnboundedReceiver<Command<T>>,
+    link_waiters: LinkWaiters,
+    path_waiters: PathWaiters,
 }
 
 pub struct AsyncNode<T: Transport> {
@@ -305,6 +355,8 @@ impl<T: Transport> AsyncNode<T> {
             inner: Some(AsyncNodeInner {
                 node: crate::Node::with_rng(rng, transport),
                 command_rx,
+                link_waiters: HashMap::new(),
+                path_waiters: HashMap::new(),
             }),
         }
     }
@@ -373,15 +425,6 @@ impl<T: Transport> AsyncNode<T> {
         });
     }
 
-    pub async fn has_destination(&self, dest: &Address) -> bool {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.command_tx.send(Command::HasDestination {
-            dest: *dest,
-            reply: reply_tx,
-        });
-        reply_rx.await.unwrap_or(false)
-    }
-
     pub async fn known_destinations(&self) -> Vec<Destination> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self
@@ -399,14 +442,14 @@ impl<T: Transport> AsyncNode<T> {
     pub async fn request(
         &self,
         service: ServiceId,
-        dest: Address,
+        link: crate::LinkHandle,
         path: &str,
         data: &[u8],
     ) -> Result<(Vec<u8>, Option<Vec<u8>>), RequestError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.command_tx.send(Command::Request {
             service,
-            dest,
+            link,
             path: path.to_string(),
             data: data.to_vec(),
             reply: reply_tx,
@@ -463,7 +506,7 @@ impl<T: Transport> AsyncNode<T> {
         waiter_rx.await.unwrap_or(Err(RespondError::LinkClosed))
     }
 
-    pub async fn receive(&self, service: ServiceId) -> Option<ServiceEvent> {
+    pub async fn recv(&self, service: ServiceId) -> Option<ServiceEvent> {
         let event_rx = {
             let services = self.services.lock().unwrap();
             let channels = services
@@ -472,6 +515,122 @@ impl<T: Transport> AsyncNode<T> {
             channels.event_rx.clone()
         };
         event_rx.lock().await.recv().await
+    }
+
+    pub async fn request_path(&self, destination: Address) -> bool {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::RequestPath {
+            destination,
+            reply: reply_tx,
+        });
+        reply_rx.await.unwrap_or(false)
+    }
+
+    pub async fn establish_link(
+        &self,
+        service: ServiceId,
+        destination: Address,
+    ) -> Option<crate::LinkHandle> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::CreateLink {
+            service,
+            destination,
+            reply: reply_tx,
+        });
+        let link = reply_rx.await.ok().flatten()?;
+
+        let (active_tx, active_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::AwaitLinkActive {
+            link,
+            reply: active_tx,
+        });
+        if active_rx.await.unwrap_or(false) {
+            Some(link)
+        } else {
+            None
+        }
+    }
+
+    pub async fn link_status(&self, link: crate::LinkHandle) -> crate::LinkStatus {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::LinkStatus {
+            link,
+            reply: reply_tx,
+        });
+        reply_rx.await.unwrap_or(crate::LinkStatus::Closed)
+    }
+
+    pub async fn link_rtt(&self, link: crate::LinkHandle) -> Option<u64> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::LinkRtt {
+            link,
+            reply: reply_tx,
+        });
+        reply_rx.await.ok().flatten()
+    }
+
+    pub fn close_link(&self, link: crate::LinkHandle) {
+        let _ = self.command_tx.send(Command::CloseLink { link });
+    }
+
+    pub fn self_identify(&self, link: crate::LinkHandle, identity: &crate::Identity) {
+        let _ = self.command_tx.send(Command::SelfIdentify {
+            link,
+            identity: Box::new(identity.clone()),
+        });
+    }
+
+    pub async fn link_request(
+        &self,
+        link: crate::LinkHandle,
+        path: &str,
+        data: &[u8],
+    ) -> Option<RequestId> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::LinkRequest {
+            link,
+            path: path.to_string(),
+            data: data.to_vec(),
+            reply: reply_tx,
+        });
+        reply_rx.await.ok().flatten()
+    }
+
+    pub async fn advertise_resource(
+        &self,
+        link: crate::LinkHandle,
+        data: Vec<u8>,
+        metadata: Option<Vec<u8>>,
+        compress: bool,
+    ) -> Option<crate::ResourceHandle> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::AdvertiseResource {
+            link,
+            data,
+            metadata,
+            compress,
+            reply: reply_tx,
+        });
+        reply_rx.await.ok().flatten()
+    }
+
+    pub async fn resource_progress(&self, resource: crate::ResourceHandle) -> Option<f32> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::ResourceProgress {
+            resource,
+            reply: reply_tx,
+        });
+        reply_rx.await.ok().flatten()
+    }
+
+    pub async fn prove_packet(&self, service: ServiceId, packet_data: &[u8]) -> bool {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::ProvePacket {
+            service,
+            packet_data: packet_data.to_vec(),
+            reply: reply_tx,
+        });
+        reply_rx.await.unwrap_or(false)
     }
 
     pub async fn run(mut self) {
@@ -501,7 +660,35 @@ impl<T: Transport> AsyncNode<T> {
     ) {
         let now = Instant::now();
         let events = inner.node.poll(now);
+
+        for event in &events {
+            if let ServiceEvent::PathRequestResult { destination, found } = event
+                && let Some(waiters) = inner.path_waiters.remove(destination)
+            {
+                for tx in waiters {
+                    let _ = tx.send(*found);
+                }
+            }
+        }
+
         Self::dispatch_events(services, events);
+
+        inner.link_waiters.retain(|link, waiters| {
+            let status = inner.node.link_status(*link);
+            if status == crate::LinkStatus::Active {
+                for tx in waiters.drain(..) {
+                    let _ = tx.send(true);
+                }
+                false
+            } else if status == crate::LinkStatus::Closed {
+                for tx in waiters.drain(..) {
+                    let _ = tx.send(false);
+                }
+                false
+            } else {
+                true
+            }
+        });
     }
 
     fn dispatch_events(
@@ -526,7 +713,8 @@ impl<T: Transport> AsyncNode<T> {
                     if let Some(channels) = services.get(service) {
                         let mut waiters = channels.request_waiters.lock().unwrap();
                         if let Some(tx) = waiters.remove(request_id) {
-                            let _ = tx.send(result.clone().map(|(_, data, metadata)| (data, metadata)));
+                            let _ =
+                                tx.send(result.clone().map(|(_, data, metadata)| (data, metadata)));
                         }
                     }
                 }
@@ -542,7 +730,12 @@ impl<T: Transport> AsyncNode<T> {
                         }
                     }
                 }
-                ServiceEvent::DestinationsChanged => {}
+                ServiceEvent::DestinationsChanged => {
+                    for channels in services.values() {
+                        let _ = channels.event_tx.send(ServiceEvent::DestinationsChanged);
+                    }
+                }
+                ServiceEvent::PathRequestResult { .. } => {}
             }
         }
     }
@@ -566,13 +759,14 @@ impl<T: Transport> AsyncNode<T> {
             }
             Command::Request {
                 service,
-                dest,
+                link,
                 path,
                 data,
                 reply,
             } => {
-                let request_id = inner.node.request(service, dest, &path, &data, now);
-                let _ = reply.send(request_id);
+                if let Some(request_id) = inner.node.request(service, link, &path, &data) {
+                    let _ = reply.send(request_id);
+                }
             }
             Command::Respond {
                 request_id,
@@ -580,19 +774,89 @@ impl<T: Transport> AsyncNode<T> {
                 metadata,
                 compress,
             } => {
-                inner.node.respond(request_id, &data, metadata.as_deref(), compress);
+                inner
+                    .node
+                    .respond(request_id, &data, metadata.as_deref(), compress);
             }
             Command::SendRaw { dest, data } => {
                 inner.node.send_raw(dest, &data);
-            }
-            Command::HasDestination { dest, reply } => {
-                let _ = reply.send(inner.node.has_destination(&dest));
             }
             Command::GetDestinations { reply } => {
                 let _ = reply.send(inner.node.known_destinations());
             }
             Command::GetStats { reply } => {
                 let _ = reply.send(inner.node.stats());
+            }
+            Command::CreateLink {
+                service,
+                destination,
+                reply,
+            } => {
+                let _ = reply.send(inner.node.create_link(service, destination, now));
+            }
+            Command::LinkStatus { link, reply } => {
+                let _ = reply.send(inner.node.link_status(link));
+            }
+            Command::LinkRtt { link, reply } => {
+                let _ = reply.send(inner.node.link_rtt(link));
+            }
+            Command::CloseLink { link } => {
+                inner.node.close_link(link);
+            }
+            Command::SelfIdentify { link, identity } => {
+                inner.node.self_identify(link, &identity);
+            }
+            Command::LinkRequest {
+                link,
+                path,
+                data,
+                reply,
+            } => {
+                let _ = reply.send(inner.node.link_request(link, &path, &data, now));
+            }
+            Command::AdvertiseResource {
+                link,
+                data,
+                metadata,
+                compress,
+                reply,
+            } => {
+                let _ = reply.send(
+                    inner
+                        .node
+                        .advertise_resource(link, data, metadata, compress),
+                );
+            }
+            Command::ResourceProgress { resource, reply } => {
+                let _ = reply.send(inner.node.resource_progress(resource));
+            }
+            Command::ProvePacket {
+                service,
+                packet_data,
+                reply,
+            } => {
+                let _ = reply.send(inner.node.prove_packet(service, &packet_data));
+            }
+            Command::AwaitLinkActive { link, reply } => {
+                if inner.node.link_status(link) == crate::LinkStatus::Active {
+                    let _ = reply.send(true);
+                } else if inner.node.link_status(link) == crate::LinkStatus::Closed {
+                    let _ = reply.send(false);
+                } else {
+                    inner.link_waiters.entry(link).or_default().push(reply);
+                }
+            }
+            Command::RequestPath { destination, reply } => {
+                if inner.node.path_table.contains_key(&destination) {
+                    let _ = reply.send(true);
+                } else {
+                    inner.node.request_path(destination, now);
+                    inner
+                        .path_waiters
+                        .entry(destination)
+                        .or_default()
+                        .push(reply);
+                }
             }
         }
         Self::poll(inner, services);

@@ -58,7 +58,12 @@ impl<T: Transport> Interface<T> {
         }
     }
 
-    pub fn with_ifac(mut self, signing_key: [u8; 32], shared_key: Vec<u8>, size: usize) -> Self {
+    pub fn with_access_codes(
+        mut self,
+        signing_key: [u8; 32],
+        shared_key: Vec<u8>,
+        size: usize,
+    ) -> Self {
         self.ifac_identity = Some(SigningKey::from_bytes(&signing_key));
         self.ifac_key = Some(shared_key);
         self.ifac_size = size;
@@ -328,7 +333,7 @@ mod tests {
         let ifac_key = vec![0xAB; 32];
 
         let (transport, sent) = MockTransport::new(true);
-        let iface = Interface::new(transport).with_ifac(ifac_identity, ifac_key, 8);
+        let iface = Interface::new(transport).with_access_codes(ifac_identity, ifac_key, 8);
         (iface, sent)
     }
 
@@ -362,7 +367,7 @@ mod tests {
         rng.fill_bytes(&mut ifac_identity_b);
         let ifac_key_b = vec![0xCD; 32]; // different key
         let (transport_b, _) = MockTransport::new(true);
-        let iface_b = Interface::new(transport_b).with_ifac(ifac_identity_b, ifac_key_b, 8);
+        let iface_b = Interface::new(transport_b).with_access_codes(ifac_identity_b, ifac_key_b, 8);
 
         let packet = make_packet([1u8; 16], 5);
         let raw = packet.to_bytes();

@@ -8,6 +8,7 @@ mod handle;
 mod identity;
 mod interface;
 mod link;
+mod link_handle;
 mod node;
 mod packet;
 mod packet_hashlist;
@@ -26,6 +27,7 @@ pub use aspect::AspectHash;
 pub use handle::{Destination, RequestError, RespondError, ServiceEvent, ServiceId};
 pub use identity::Identity;
 pub use interface::{Interface, Transport};
+pub use link_handle::{LinkHandle, LinkStatus, ResourceHandle};
 pub use node::Node;
 pub use packet::Address;
 pub use request::RequestId;
@@ -37,3 +39,6 @@ pub use async_io::AsyncNode;
 
 #[cfg(all(feature = "tokio", feature = "tcp"))]
 pub use async_io::AsyncTcpTransport;
+
+#[cfg(feature = "iroh")]
+pub use transports::iroh::{IrohError, IrohNode, IrohTransport};

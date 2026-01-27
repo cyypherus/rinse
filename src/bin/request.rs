@@ -1,4 +1,4 @@
-use rinse::{AsyncNode, AsyncTcpTransport, Identity, Interface, RequestError, ServiceEvent};
+use rinse::{AsyncNode, AsyncTcpTransport, Identity, Interface, ServiceEvent};
 
 #[tokio::main]
 async fn main() {
@@ -93,7 +93,7 @@ async fn main() {
     let node_for_progress = node_clone.clone();
     let progress_task = tokio::spawn(async move {
         loop {
-            match node_for_progress.receive(service).await {
+            match node_for_progress.recv(service).await {
                 Some(ServiceEvent::ResourceProgress {
                     received_bytes,
                     total_bytes,
@@ -118,7 +118,11 @@ async fn main() {
         }
     });
 
-    let response = node_clone.request(service, node_id, &path, &[]).await;
+    let link = node_clone
+        .establish_link(service, node_id)
+        .await
+        .expect("Failed to establish link");
+    let response = node_clone.request(service, link, &path, &[]).await;
 
     progress_task.abort();
 

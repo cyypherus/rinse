@@ -38,15 +38,30 @@ impl From<toml::de::Error> for ConfigError {
 }
 
 pub fn data_dir() -> PathBuf {
-    PathBuf::from(".nomad")
+    PathBuf::from(".rinse")
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default)]
     pub interfaces: HashMap<String, InterfaceConfig>,
+    #[serde(default)]
+    pub serve: ServeConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServeConfig {
+    pub directory: Option<String>,
+    #[serde(default = "default_aspect")]
+    pub aspect: String,
+}
+
+fn default_aspect() -> String {
+    "nomadnetwork.node".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
