@@ -1360,19 +1360,6 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             if !matches!(packet, Packet::Announce { .. })
                 && !matches!(packet, Packet::LinkRequest { .. })
                 && !matches!(packet, Packet::LinkProof { .. })
-            {
-                let found = self.link_table.contains_key(&link_id);
-                if !found && matches!(packet, Packet::LinkData { .. }) {
-                    log::debug!(
-                        "LinkData for link <{}> not in link_table, known links: {:?}",
-                        hex::encode(link_id),
-                        self.link_table.keys().map(hex::encode).collect::<Vec<_>>()
-                    );
-                }
-            }
-            if !matches!(packet, Packet::Announce { .. })
-                && !matches!(packet, Packet::LinkRequest { .. })
-                && !matches!(packet, Packet::LinkProof { .. })
                 && let Some(link_entry) = self.link_table.get_mut(&link_id)
             {
                 let hops = packet.hops();
@@ -1743,160 +1730,192 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 };
                 link.touch_inbound(now);
 
-                // Resource data packets are raw chunks of pre-encrypted stream - no Token decryption
-                if context == LinkContext::Resource {
-                    self.handle_resource_packet(link_id, context, &data, now);
-                    return None;
-                }
-
-                // CacheRequest packets are not encrypted - just a packet hash
-                if context == LinkContext::CacheRequest {
-                    // TODO: handle cache request - look up packet in cache and resend
-                    log::debug!(
-                        "Received CacheRequest on link {} ({} bytes)",
-                        hex::encode(link_id),
-                        data.len()
-                    );
-                    return None;
-                }
-
-                // All other LinkData packets use Token encryption
-                let plaintext = match link.decrypt(&data) {
-                    Some(p) => p,
-                    None => {
-                        log::warn!(
-                            "Failed to decrypt LinkData on link {} (ctx={:?}, data_len={}, is_initiator={}, dest={})",
-                            hex::encode(link_id),
-                            context,
-                            data.len(),
-                            link.is_initiator,
-                            hex::encode(link.destination)
-                        );
-                        return None;
+                let decrypt = |link: &EstablishedLink, data: &[u8]| -> Option<Vec<u8>> {
+                    match link.decrypt(data) {
+                        Some(p) => Some(p),
+                        None => {
+                            log::warn!(
+                                "Failed to decrypt LinkData on link {} (ctx={:?}, data_len={}, is_initiator={}, dest={})",
+                                hex::encode(link_id),
+                                context,
+                                data.len(),
+                                link.is_initiator,
+                                hex::encode(link.destination)
+                            );
+                            None
+                        }
                     }
                 };
 
-                // Handle keepalive
-                if context == LinkContext::Keepalive {
-                    self.handle_keepalive(link_id, &plaintext, now);
-                } else if context == LinkContext::LinkRtt {
-                    self.handle_link_rtt(link_id, &plaintext);
-                } else if context == LinkContext::LinkIdentify {
-                    self.handle_link_identify(link_id, &plaintext);
-                } else if context == LinkContext::LinkClose {
-                    // Verify the close packet contains the link_id
-                    if plaintext.as_slice() == link_id {
-                        let dest = link.destination;
-                        log::info!(
-                            "Link <{}> closed by remote (dest=<{}>)",
+                match context {
+                    // === NOT ENCRYPTED ===
+
+                    LinkContext::Resource => {
+                        self.handle_resource_packet(link_id, context, &data, now);
+                    }
+
+                    LinkContext::CacheRequest => {
+                        log::debug!(
+                            "Received CacheRequest on link {} ({} bytes)",
                             hex::encode(link_id),
-                            hex::encode(dest)
-                        );
-                        self.destination_links.remove(&dest);
-                        self.established_links.remove(&link_id);
-                    } else {
-                        log::warn!(
-                            "Received LinkClose with mismatched link_id: expected {}, got {}",
-                            hex::encode(link_id),
-                            hex::encode(&plaintext)
+                            data.len()
                         );
                     }
-                    return None;
-                } else if matches!(
-                    context,
-                    LinkContext::ResourceAdv
-                        | LinkContext::ResourceReq
-                        | LinkContext::ResourceHmu
-                        | LinkContext::ResourceIcl
-                        | LinkContext::ResourceRcl
-                ) {
-                    self.handle_resource_packet(link_id, context, &plaintext, now);
-                } else if context == LinkContext::Response {
-                    log::debug!(
-                        "Received Response on link {} ({} bytes plaintext)",
-                        hex::encode(link_id),
-                        plaintext.len()
-                    );
-                    if let Some(resp) = Response::decode(&plaintext) {
-                        log::info!(
-                            "Response decoded: wire_request_id={} data_len={}",
-                            hex::encode(resp.request_id.0),
-                            resp.data.len()
-                        );
-                        if let Some((service, local_request_id)) =
-                            link.pending_requests.remove(&resp.request_id)
-                        {
-                            log::info!(
-                                "Matched pending request local_id={} - delivering {} bytes",
-                                hex::encode(local_request_id.0),
-                                resp.data.len()
-                            );
-                            let from = link.destination;
-                            notifications.push(Notification::RequestResult {
-                                service,
-                                request_id: local_request_id,
-                                result: Ok((from, resp.data, None)),
-                            });
-                        } else {
-                            log::warn!(
-                                "Response wire_request_id={} did not match any pending request",
-                                hex::encode(resp.request_id.0)
-                            );
+
+                    LinkContext::Keepalive => {
+                        self.handle_keepalive(link_id, &data);
+                    }
+
+                    // === ENCRYPTED ===
+
+                    LinkContext::LinkRtt => {
+                        if let Some(plaintext) = decrypt(link, &data) {
+                            self.handle_link_rtt(link_id, &plaintext);
                         }
-                    } else {
-                        log::warn!("Failed to decode Response from plaintext");
                     }
-                } else if let Some(service) = link.local_service {
-                    match context {
-                        LinkContext::Request => {
-                            if let Some(req) = Request::decode(&plaintext) {
-                                let wire_request_id =
-                                    WireRequestId(packet.packet_hash()[..16].try_into().unwrap());
-                                let mut id_bytes = [0u8; 16];
-                                self.rng.fill_bytes(&mut id_bytes);
-                                let request_id = RequestId(id_bytes);
-                                let path = self.services[service.0]
-                                    .registered_paths
-                                    .get(&req.path_hash)
-                                    .cloned();
+
+                    LinkContext::LinkIdentify => {
+                        if let Some(plaintext) = decrypt(link, &data) {
+                            self.handle_link_identify(link_id, &plaintext);
+                        }
+                    }
+
+                    LinkContext::LinkClose => {
+                        if let Some(plaintext) = decrypt(link, &data) {
+                            if plaintext.as_slice() == link_id {
+                                let dest = link.destination;
                                 log::info!(
-                                    "Request path_hash={} matched={:?} registered_count={}",
-                                    hex::encode(req.path_hash),
-                                    path,
-                                    self.services[service.0].registered_paths.len()
+                                    "Link <{}> closed by remote (dest=<{}>)",
+                                    hex::encode(link_id),
+                                    hex::encode(dest)
                                 );
-                                notifications.push(Notification::Request {
-                                    service,
-                                    link_id,
-                                    request_id,
-                                    wire_request_id,
-                                    path: path.unwrap_or_default(),
-                                    data: req.data.unwrap_or_default(),
-                                });
+                                self.destination_links.remove(&dest);
+                                self.established_links.remove(&link_id);
                             } else {
                                 log::warn!(
-                                    "Failed to decode Request from plaintext {} bytes",
-                                    plaintext.len()
+                                    "Received LinkClose with mismatched link_id: expected {}, got {}",
+                                    hex::encode(link_id),
+                                    hex::encode(&plaintext)
                                 );
+                            }
+                        }
+                    }
+
+                    LinkContext::ResourceAdv
+                    | LinkContext::ResourceReq
+                    | LinkContext::ResourceHmu
+                    | LinkContext::ResourceIcl
+                    | LinkContext::ResourceRcl => {
+                        if let Some(plaintext) = decrypt(link, &data) {
+                            self.handle_resource_packet(link_id, context, &plaintext, now);
+                        }
+                    }
+
+                    LinkContext::Response => {
+                        if let Some(plaintext) = decrypt(link, &data) {
+                            log::debug!(
+                                "Received Response on link {} ({} bytes plaintext)",
+                                hex::encode(link_id),
+                                plaintext.len()
+                            );
+                            if let Some(resp) = Response::decode(&plaintext) {
+                                log::info!(
+                                    "Response decoded: wire_request_id={} data_len={}",
+                                    hex::encode(resp.request_id.0),
+                                    resp.data.len()
+                                );
+                                if let Some((service, local_request_id)) =
+                                    link.pending_requests.remove(&resp.request_id)
+                                {
+                                    log::info!(
+                                        "Matched pending request local_id={} - delivering {} bytes",
+                                        hex::encode(local_request_id.0),
+                                        resp.data.len()
+                                    );
+                                    let from = link.destination;
+                                    notifications.push(Notification::RequestResult {
+                                        service,
+                                        request_id: local_request_id,
+                                        result: Ok((from, resp.data, None)),
+                                    });
+                                } else {
+                                    log::warn!(
+                                        "Response wire_request_id={} did not match any pending request",
+                                        hex::encode(resp.request_id.0)
+                                    );
+                                }
+                            } else {
+                                log::warn!("Failed to decode Response from plaintext");
+                            }
+                        }
+                    }
+
+                    LinkContext::Request => {
+                        if let Some(plaintext) = decrypt(link, &data) {
+                            if let Some(service) = link.local_service {
+                                if let Some(req) = Request::decode(&plaintext) {
+                                    let wire_request_id =
+                                        WireRequestId(packet.packet_hash()[..16].try_into().unwrap());
+                                    let mut id_bytes = [0u8; 16];
+                                    self.rng.fill_bytes(&mut id_bytes);
+                                    let request_id = RequestId(id_bytes);
+                                    let path = self.services[service.0]
+                                        .registered_paths
+                                        .get(&req.path_hash)
+                                        .cloned();
+                                    log::info!(
+                                        "Request path_hash={} matched={:?} registered_count={}",
+                                        hex::encode(req.path_hash),
+                                        path,
+                                        self.services[service.0].registered_paths.len()
+                                    );
+                                    notifications.push(Notification::Request {
+                                        service,
+                                        link_id,
+                                        request_id,
+                                        wire_request_id,
+                                        path: path.unwrap_or_default(),
+                                        data: req.data.unwrap_or_default(),
+                                    });
+                                } else {
+                                    log::warn!(
+                                        "Failed to decode Request from plaintext {} bytes",
+                                        plaintext.len()
+                                    );
+                                    notifications.push(Notification::Raw {
+                                        service,
+                                        data: plaintext,
+                                    });
+                                }
+                            } else {
+                                log::warn!(
+                                    "No local_service for Request: link_id={} context={:?}",
+                                    hex::encode(link_id),
+                                    context
+                                );
+                            }
+                        }
+                    }
+
+                    LinkContext::None
+                    | LinkContext::Command
+                    | LinkContext::CommandStatus
+                    | LinkContext::Channel => {
+                        if let Some(plaintext) = decrypt(link, &data) {
+                            if let Some(service) = link.local_service {
                                 notifications.push(Notification::Raw {
                                     service,
                                     data: plaintext,
                                 });
+                            } else {
+                                log::warn!(
+                                    "No local_service for link data: link_id={} context={:?}",
+                                    hex::encode(link_id),
+                                    context
+                                );
                             }
                         }
-                        _ => {
-                            notifications.push(Notification::Raw {
-                                service,
-                                data: plaintext,
-                            });
-                        }
-                    };
-                } else {
-                    log::warn!(
-                        "No local_service for link data: link_id={} context={:?}",
-                        hex::encode(link_id),
-                        context
-                    );
+                    }
                 }
             }
             Packet::SingleData { ciphertext, .. } => {
@@ -2637,7 +2656,8 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         }
 
         for link_id in to_keepalive {
-            if let Some(link) = self.established_links.get_mut(&link_id) {
+            use crate::packet::LinkDataDestination;
+            let target_interface = if let Some(link) = self.established_links.get_mut(&link_id) {
                 log::debug!(
                     "Sending keepalive request on link {} (no inbound for {}s, rtt={:?}ms, interval={}s)",
                     hex::encode(link_id),
@@ -2646,13 +2666,20 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                     link.keepalive_interval_secs()
                 );
                 link.last_keepalive_sent = Some(now);
+                link.touch_outbound(now);
+                link.receiving_interface
+            } else {
+                continue;
+            };
+            let packet = Packet::LinkData {
+                hops: 0,
+                destination: LinkDataDestination::Direct(link_id),
+                context: LinkContext::Keepalive,
+                data: vec![crate::link::KEEPALIVE_REQUEST],
+            };
+            if let Some(iface) = self.interfaces.get_mut(target_interface) {
+                iface.send(packet, 0);
             }
-            self.send_link_packet_with_activity(
-                link_id,
-                LinkContext::Keepalive,
-                &[crate::link::KEEPALIVE_REQUEST],
-                now,
-            );
         }
 
         for link_id in to_close {
@@ -2686,46 +2713,47 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         next_wake
     }
 
-    fn handle_keepalive(&mut self, link_id: LinkId, plaintext: &[u8], _now: Instant) {
+    fn handle_keepalive(&mut self, link_id: LinkId, data: &[u8]) {
         use crate::link::{KEEPALIVE_REQUEST, KEEPALIVE_RESPONSE};
         use crate::packet::LinkDataDestination;
 
-        if plaintext.is_empty() {
+        if data.is_empty() {
             return;
         }
 
-        if let Some(link) = self.established_links.get_mut(&link_id) {
-            if plaintext[0] == KEEPALIVE_REQUEST && !link.is_initiator {
-                log::debug!(
-                    "Received keepalive request on link {}, sending response",
-                    hex::encode(link_id)
-                );
-                // Responder: reply to keepalive request
-                let response = link.encrypt(&mut self.rng, &[KEEPALIVE_RESPONSE]);
-                let target_interface = link.receiving_interface;
-                let packet = Packet::LinkData {
-                    hops: 0,
-                    destination: LinkDataDestination::Direct(link_id),
-                    context: LinkContext::Keepalive,
-                    data: response,
-                };
-                if let Some(iface) = self.interfaces.get_mut(target_interface) {
-                    iface.send(packet, 0);
-                }
-            } else if plaintext[0] == KEEPALIVE_RESPONSE && link.is_initiator {
-                // Initiator: received keepalive response
-                log::debug!(
-                    "Received keepalive response on link {}",
-                    hex::encode(link_id)
-                );
-            } else {
-                log::warn!(
-                    "Unexpected keepalive byte 0x{:02x} on link {} (is_initiator={})",
-                    plaintext[0],
-                    hex::encode(link_id),
-                    link.is_initiator
-                );
+        let Some(link) = self.established_links.get(&link_id) else {
+            return;
+        };
+
+        let is_initiator = link.is_initiator;
+        let target_interface = link.receiving_interface;
+
+        if data[0] == KEEPALIVE_REQUEST && !is_initiator {
+            log::debug!(
+                "Received keepalive request on link {}, sending response",
+                hex::encode(link_id)
+            );
+            let packet = Packet::LinkData {
+                hops: 0,
+                destination: LinkDataDestination::Direct(link_id),
+                context: LinkContext::Keepalive,
+                data: vec![KEEPALIVE_RESPONSE],
+            };
+            if let Some(iface) = self.interfaces.get_mut(target_interface) {
+                iface.send(packet, 0);
             }
+        } else if data[0] == KEEPALIVE_RESPONSE && is_initiator {
+            log::debug!(
+                "Received keepalive response on link {}",
+                hex::encode(link_id)
+            );
+        } else {
+            log::warn!(
+                "Unexpected keepalive byte 0x{:02x} on link {} (is_initiator={})",
+                data[0],
+                hex::encode(link_id),
+                is_initiator
+            );
         }
     }
 
@@ -8088,6 +8116,181 @@ mod tests {
         assert!(
             server.interfaces[1].transport.outbox.is_empty(),
             "interface 1 should have no link packets"
+        );
+    }
+
+    #[test]
+    fn keepalive_packets_are_not_encrypted() {
+        use crate::link::KEEPALIVE_REQUEST;
+        use std::time::Duration;
+
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_b = b.add_service("server", &[], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let now = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(None, addr_b, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        assert!(a.established_links.contains_key(&link_id));
+        assert!(b.established_links.contains_key(&link_id));
+
+        if let Some(link) = a.established_links.get_mut(&link_id) {
+            link.last_inbound = now;
+            link.last_keepalive_sent = None;
+            link.set_rtt(0);
+        }
+
+        let future = now + Duration::from_secs(6);
+        a.poll(future);
+
+        let raw_packet = a.interfaces[0]
+            .transport
+            .outbox
+            .pop_front()
+            .expect("keepalive packet should be sent");
+        let packet = Packet::from_bytes(&raw_packet).expect("valid packet");
+
+        if let Packet::LinkData { context, data, .. } = packet {
+            assert_eq!(context, LinkContext::Keepalive);
+            assert_eq!(
+                data.len(),
+                1,
+                "keepalive data should be 1 byte (unencrypted), got {} bytes",
+                data.len()
+            );
+            assert_eq!(
+                data[0], KEEPALIVE_REQUEST,
+                "keepalive should be raw 0xFF request byte"
+            );
+        } else {
+            panic!("expected LinkData packet");
+        }
+    }
+
+    #[test]
+    fn keepalive_response_is_not_encrypted() {
+        use crate::link::{KEEPALIVE_REQUEST, KEEPALIVE_RESPONSE};
+        use crate::packet::LinkDataDestination;
+
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_b = b.add_service("server", &[], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let now = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(None, addr_b, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        let keepalive_request = Packet::LinkData {
+            hops: 0,
+            destination: LinkDataDestination::Direct(link_id),
+            context: LinkContext::Keepalive,
+            data: vec![KEEPALIVE_REQUEST],
+        };
+        b.interfaces[0]
+            .transport
+            .inbox
+            .push_back(keepalive_request.to_bytes());
+        b.poll(now);
+
+        let raw_response = b.interfaces[0]
+            .transport
+            .outbox
+            .pop_front()
+            .expect("keepalive response should be sent");
+        let response_packet = Packet::from_bytes(&raw_response).expect("valid packet");
+
+        if let Packet::LinkData { context, data, .. } = response_packet {
+            assert_eq!(context, LinkContext::Keepalive);
+            assert_eq!(
+                data.len(),
+                1,
+                "keepalive response should be 1 byte (unencrypted), got {} bytes",
+                data.len()
+            );
+            assert_eq!(
+                data[0], KEEPALIVE_RESPONSE,
+                "keepalive response should be raw 0xFE byte"
+            );
+        } else {
+            panic!("expected LinkData packet");
+        }
+    }
+
+    #[test]
+    fn receives_unencrypted_keepalive_from_remote() {
+        use crate::link::KEEPALIVE_REQUEST;
+        use crate::packet::LinkDataDestination;
+
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_b = b.add_service("server", &[], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let now = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let link_id = a.link(None, addr_b, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+
+        let keepalive_request = Packet::LinkData {
+            hops: 0,
+            destination: LinkDataDestination::Direct(link_id),
+            context: LinkContext::Keepalive,
+            data: vec![KEEPALIVE_REQUEST],
+        };
+        b.interfaces[0]
+            .transport
+            .inbox
+            .push_back(keepalive_request.to_bytes());
+
+        b.poll(now);
+
+        assert!(
+            !b.interfaces[0].transport.outbox.is_empty(),
+            "b should respond to unencrypted keepalive request"
         );
     }
 }
