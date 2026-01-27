@@ -4,7 +4,7 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use rand::RngCore;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
-use crate::crypto::{LinkEncryption, LinkKeys, sha256, sign, verify};
+use crate::crypto::{sha256, sign, verify, LinkEncryption, LinkKeys};
 use crate::handle::ServiceId;
 use crate::packet::Address;
 
@@ -230,6 +230,7 @@ pub(crate) struct EstablishedLink {
     pub last_keepalive_sent: Option<Instant>,
     pub rtt_ms: Option<u64>,
     pub remote_identity: Option<Address>,
+    pub receiving_interface: usize,
     keys: LinkKeys,
     pub(crate) pending_requests:
         std::collections::HashMap<crate::WireRequestId, (ServiceId, crate::RequestId)>,
@@ -243,6 +244,7 @@ impl EstablishedLink {
     pub fn from_initiator(
         pending: PendingLink,
         responder_public: &X25519Public,
+        receiving_interface: usize,
         now: Instant,
     ) -> Self {
         let shared_key = pending
@@ -268,6 +270,7 @@ impl EstablishedLink {
             last_keepalive_sent: None,
             rtt_ms: Some(rtt_ms),
             remote_identity: None,
+            receiving_interface,
             keys,
             pending_requests: std::collections::HashMap::new(),
         }
@@ -279,6 +282,7 @@ impl EstablishedLink {
         initiator_public: &X25519Public,
         destination: Address,
         local_service: ServiceId,
+        receiving_interface: usize,
         now: Instant,
     ) -> Self {
         let shared_key = responder_secret.diffie_hellman(initiator_public).to_bytes();
@@ -300,6 +304,7 @@ impl EstablishedLink {
             last_keepalive_sent: None,
             rtt_ms: None,
             remote_identity: None,
+            receiving_interface,
             keys,
             pending_requests: std::collections::HashMap::new(),
         }
@@ -352,8 +357,8 @@ impl EstablishedLink {
 mod tests {
     use super::*;
     use crate::crypto::EphemeralKeyPair;
-    use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     fn test_rng() -> StdRng {
         StdRng::seed_from_u64(42)
@@ -436,13 +441,14 @@ mod tests {
         };
 
         let initiator_link =
-            EstablishedLink::from_initiator(pending, &responder_keypair.public, now);
+            EstablishedLink::from_initiator(pending, &responder_keypair.public, 0, now);
         let responder_link = EstablishedLink::from_responder(
             link_id,
             &responder_keypair.secret,
             &initiator_keypair.public,
             dest,
             ServiceId(0),
+            0,
             now,
         );
 
@@ -495,7 +501,8 @@ mod tests {
             local_service: None,
             request_time: now,
         };
-        let initiator_link = EstablishedLink::from_initiator(pending, &responder_enc.public, now);
+        let initiator_link =
+            EstablishedLink::from_initiator(pending, &responder_enc.public, 0, now);
 
         let responder_link = EstablishedLink::from_responder(
             link_id,
@@ -503,6 +510,7 @@ mod tests {
             &initiator_enc.public,
             dest,
             ServiceId(0),
+            0,
             now,
         );
 
@@ -557,7 +565,8 @@ mod tests {
             request_time,
         };
 
-        let link = EstablishedLink::from_initiator(pending, &responder_keypair.public, proof_time);
+        let link =
+            EstablishedLink::from_initiator(pending, &responder_keypair.public, 0, proof_time);
 
         assert!(link.rtt_ms.is_some());
         assert!(link.rtt_ms.unwrap() >= 10);
@@ -580,7 +589,7 @@ mod tests {
             request_time: now,
         };
 
-        let mut link = EstablishedLink::from_initiator(pending, &responder_keypair.public, now);
+        let mut link = EstablishedLink::from_initiator(pending, &responder_keypair.public, 0, now);
 
         // With no/zero RTT, should use max keepalive
         link.rtt_ms = Some(0);

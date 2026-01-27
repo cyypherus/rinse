@@ -1,21 +1,30 @@
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
-use rinse::{AsyncNode, AsyncTcpTransport, Identity, Interface, ServiceEvent, ServiceId};
+use rinse::config::{load_or_generate_identity, Config, InterfaceConfig};
+use rinse::{AsyncNode, AsyncTcpTransport, Interface, ServiceEvent, ServiceId};
 use tokio::net::TcpListener;
 
-fn scan_directory(base: &Path, current: &Path, paths: &mut Vec<String>) {
-    if let Ok(entries) = std::fs::read_dir(current) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                scan_directory(base, &path, paths);
-            } else if path.is_file()
-                && let Ok(relative) = path.strip_prefix(base)
-            {
-                let request_path = format!("/{}", relative.display());
-                paths.push(request_path);
-            }
+fn load_directory(base: &Path, current: &Path, files: &mut HashMap<String, Vec<u8>>) {
+    let Ok(entries) = std::fs::read_dir(current) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            load_directory(base, &path, files);
+        } else if path.is_file()
+            && let Ok(relative) = path.strip_prefix(base)
+            && let Ok(data) = std::fs::read(&path)
+        {
+            let request_path = format!("/{}", relative.display());
+            log::info!("Loaded {} ({} bytes)", request_path, data.len());
+            files.insert(request_path, data);
         }
     }
 }
@@ -24,93 +33,71 @@ fn scan_directory(base: &Path, current: &Path, paths: &mut Vec<String>) {
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let args: Vec<String> = std::env::args().collect();
+    let config = Config::load().expect("failed to load config");
+    let identity = load_or_generate_identity().expect("failed to load identity");
 
-    let mut name = "Rinse File Server".to_string();
-    let mut dir_arg = None;
-    let mut connect_addr = None;
-    let mut listen_addr = "0.0.0.0:4242".to_string();
+    let dir_arg = std::env::args().nth(1);
+    let name = config.name.clone().unwrap_or_else(|| "Rinse File Server".to_string());
+    let aspect = config.serve.aspect.clone();
+    let dir_str = dir_arg.or(config.serve.directory.clone()).expect("no directory specified");
 
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--name" => {
-                name = args.get(i + 1).expect("--name requires a value").clone();
-                i += 2;
-            }
-            "--connect" => {
-                connect_addr = Some(
-                    args.get(i + 1)
-                        .expect("--connect requires an address")
-                        .clone(),
-                );
-                i += 2;
-            }
-            "--listen" => {
-                listen_addr = args
-                    .get(i + 1)
-                    .expect("--listen requires an address")
-                    .clone();
-                i += 2;
-            }
-            arg if !arg.starts_with('-') && dir_arg.is_none() => {
-                dir_arg = Some(arg.to_string());
-                i += 1;
-            }
-            _ => {
-                eprintln!("Unknown argument: {}", args[i]);
-                std::process::exit(1);
-            }
-        }
-    }
-
-    let dir_str = dir_arg.unwrap_or_else(|| {
-        eprintln!("Usage: {} <directory> [options]", args[0]);
-        eprintln!("  --name <name>      - Display name (default: Rinse File Server)");
-        eprintln!("  --connect <addr>   - Connect to an existing node");
-        eprintln!("  --listen <addr>    - Listen address (default: 0.0.0.0:4242)");
-        std::process::exit(1);
-    });
-
-    let dir = PathBuf::from(&dir_str);
+    let dir = std::path::PathBuf::from(&dir_str);
     if !dir.is_dir() {
         eprintln!("Error: '{}' is not a directory", dir_str);
         std::process::exit(1);
     }
-    let dir = Arc::new(dir.canonicalize().expect("failed to canonicalize path"));
+    let dir = dir.canonicalize().expect("failed to canonicalize path");
 
-    let mut paths: Vec<String> = Vec::new();
-    scan_directory(&dir, &dir, &mut paths);
-    log::info!("Registered {} paths", paths.len());
-    for p in &paths {
-        log::debug!("  {}", p);
-    }
+    let mut files: HashMap<String, Vec<u8>> = HashMap::new();
+    load_directory(&dir, &dir, &mut files);
+    let paths: Vec<String> = files.keys().cloned().collect();
+    log::info!("Loaded {} files from {}", files.len(), dir.display());
+    let files = Arc::new(files);
 
-    let mut node: AsyncNode<AsyncTcpTransport> = AsyncNode::new(false);
-    let identity = Identity::generate(&mut rand::thread_rng());
+    let mut node: AsyncNode<AsyncTcpTransport> = AsyncNode::new(config.network.relay);
 
     let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-    let service = node.add_service("nomadnetwork.node", &path_refs, &identity);
+    let service = node.add_service(&aspect, &path_refs, &identity);
     let addr = node.service_address(service).unwrap();
-    log::info!("Node: {} ({})", name, hex::encode(addr));
+    log::info!("Node: {} ({}) aspect={}", name, hex::encode(addr), aspect);
 
-    if let Some(addr) = connect_addr {
-        log::info!("Connecting to {}", addr);
-        let transport = AsyncTcpTransport::connect(&addr)
-            .await
-            .expect("failed to connect");
-        node.add_interface(Interface::new(transport));
-    } else {
-        log::info!("Listening on {}", listen_addr);
-        let listener = TcpListener::bind(&listen_addr)
-            .await
-            .expect("failed to bind");
-
-        // Spawn accept loop
-        tokio::spawn(accept_loop(listener, node.clone()));
+    for (iface_name, iface_config) in config.enabled_interfaces() {
+        match iface_config {
+            InterfaceConfig::TCPClientInterface {
+                target_host,
+                target_port,
+                ..
+            } => {
+                let addr = format!("{}:{}", target_host, target_port);
+                log::info!("Connecting to {} ({})", iface_name, addr);
+                match AsyncTcpTransport::connect(&addr).await {
+                    Ok(transport) => {
+                        node.add_interface(Interface::new(transport));
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to connect to {}: {}", iface_name, e);
+                    }
+                }
+            }
+            InterfaceConfig::TCPServerInterface {
+                listen_ip,
+                listen_port,
+                ..
+            } => {
+                let addr = format!("{}:{}", listen_ip, listen_port);
+                log::info!("Listening on {} ({})", iface_name, addr);
+                match TcpListener::bind(&addr).await {
+                    Ok(listener) => {
+                        tokio::spawn(accept_loop(listener, node.clone()));
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to bind {}: {}", iface_name, e);
+                    }
+                }
+            }
+        }
     }
 
-    log::info!("Serving files from {}", dir.display());
     let name_bytes = name.into_bytes();
 
     let node_clone = node.clone();
@@ -124,7 +111,7 @@ async fn main() {
                 }
                 event = node_clone.recv(service) => {
                     let Some(event) = event else { break };
-                    handle_event(&node_clone, service, &dir, event).await;
+                    handle_event(&node_clone, service, &files, event).await;
                 }
             }
         }
@@ -157,7 +144,7 @@ async fn accept_loop(listener: TcpListener, node: AsyncNode<AsyncTcpTransport>) 
 async fn handle_event(
     node: &AsyncNode<AsyncTcpTransport>,
     service: ServiceId,
-    dir: &std::path::Path,
+    files: &HashMap<String, Vec<u8>>,
     event: ServiceEvent,
 ) {
     let ServiceEvent::Request {
@@ -172,22 +159,20 @@ async fn handle_event(
 
     log::info!("Request path='{}' data_len={}", path, data.len());
 
-    let filename = path.trim_start_matches('/');
-    let file_path = dir.join(filename);
-
-    let response = if !file_path.starts_with(dir) {
-        log::warn!("Path traversal attempt: {}", filename);
-        b"error: invalid path".to_vec()
+    let key = if path.starts_with('/') {
+        path.clone()
     } else {
-        match tokio::fs::read(&file_path).await {
-            Ok(data) => {
-                log::info!("Serving {} ({} bytes)", file_path.display(), data.len());
-                data
-            }
-            Err(e) => {
-                log::warn!("Failed to read {}: {}", file_path.display(), e);
-                format!("error: {}", e).into_bytes()
-            }
+        format!("/{}", path)
+    };
+
+    let response = match files.get(&key) {
+        Some(data) => {
+            log::info!("Serving {} ({} bytes)", key, data.len());
+            data.clone()
+        }
+        None => {
+            log::warn!("Not found: {}", key);
+            b"error: not found".to_vec()
         }
     };
 

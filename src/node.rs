@@ -348,6 +348,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         let req = Request::new(path, data.to_vec());
         let encoded = req.encode();
         let ciphertext = established.encrypt(&mut self.rng, &encoded);
+        let target_interface = established.receiving_interface;
 
         let packet = Packet::LinkData {
             hops: 0,
@@ -365,10 +366,10 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             hex::encode(link_id),
             hex::encode(wire_request_id.0),
         );
-        for iface in &mut self.interfaces {
+        if let Some(iface) = self.interfaces.get_mut(target_interface) {
             self.stats.packets_sent += 1;
             self.stats.bytes_sent += packet.to_bytes().len() as u64;
-            iface.send(packet.clone(), 0);
+            iface.send(packet, 0);
         }
 
         Some(local_request_id)
@@ -387,6 +388,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             self.inbound_request_links.remove(&request_id)
             && let Some(link) = self.established_links.get(&link_id)
         {
+            let target_interface = link.receiving_interface;
             if data.len() <= LINK_MDU && metadata.is_none() {
                 let resp = Response::new(wire_request_id, data.to_vec());
                 let ciphertext = link.encrypt(&mut self.rng, &resp.encode());
@@ -397,8 +399,8 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                     context: LinkContext::Response,
                     data: ciphertext,
                 };
-                for iface in &mut self.interfaces {
-                    iface.send(packet.clone(), 0);
+                if let Some(iface) = self.interfaces.get_mut(target_interface) {
+                    iface.send(packet, 0);
                 }
                 self.dispatch_notifications(vec![Notification::RespondResult {
                     service: service_idx,
@@ -487,8 +489,8 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                     ),
                 );
 
-                for iface in &mut self.interfaces {
-                    iface.send(packet.clone(), 0);
+                if let Some(iface) = self.interfaces.get_mut(target_interface) {
+                    iface.send(packet, 0);
                 }
             }
         }
@@ -531,6 +533,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                     hex::encode(&encoded[..encoded.len().min(64)])
                 );
                 let ciphertext = link.encrypt(&mut self.rng, &encoded);
+                let target_interface = link.receiving_interface;
                 log::debug!(
                     "Request ciphertext {} bytes: {}",
                     ciphertext.len(),
@@ -553,10 +556,10 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                     hex::encode(wire_request_id.0),
                     hex::encode(packet.packet_hash())
                 );
-                for iface in &mut self.interfaces {
+                if let Some(iface) = self.interfaces.get_mut(target_interface) {
                     self.stats.packets_sent += 1;
                     self.stats.bytes_sent += packet.to_bytes().len() as u64;
-                    iface.send(packet.clone(), 0);
+                    iface.send(packet, 0);
                 }
             } else {
                 log::warn!(
@@ -860,6 +863,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         let req = Request::new(path, data.to_vec());
         let encoded = req.encode();
         let ciphertext = link_entry.encrypt(&mut self.rng, &encoded);
+        let target_interface = link_entry.receiving_interface;
 
         let packet = Packet::LinkData {
             hops: 0,
@@ -883,10 +887,10 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             .pending_requests
             .insert(wire_request_id, (service_id, local_request_id));
 
-        for iface in &mut self.interfaces {
+        if let Some(iface) = self.interfaces.get_mut(target_interface) {
             self.stats.packets_sent += 1;
             self.stats.bytes_sent += packet.to_bytes().len() as u64;
-            iface.send(packet.clone(), 0);
+            iface.send(packet, 0);
         }
 
         if let Some(link_entry) = self.established_links.get_mut(&link.0) {
@@ -909,6 +913,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         if established.state != LinkState::Active {
             return None;
         }
+        let target_interface = established.receiving_interface;
 
         let mut resource = crate::resource::OutboundResource::new_segment(
             &mut self.rng,
@@ -940,10 +945,10 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             (link.0, established.destination, None, None, resource),
         );
 
-        for iface in &mut self.interfaces {
+        if let Some(iface) = self.interfaces.get_mut(target_interface) {
             self.stats.packets_sent += 1;
             self.stats.bytes_sent += packet.to_bytes().len() as u64;
-            iface.send(packet.clone(), 0);
+            iface.send(packet, 0);
         }
 
         Some(crate::ResourceHandle(hash))
@@ -1686,6 +1691,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         &request.encryption_public,
                         destination_hash,
                         ServiceId(service_idx),
+                        interface_index,
                         now,
                     );
 
@@ -1998,8 +2004,12 @@ impl<T: Transport, R: RngCore> Node<T, R> {
 
                     // Establish the link using the responder's public key from the proof
                     let dest = pending.destination;
-                    let link =
-                        EstablishedLink::from_initiator(pending, &proof.encryption_public, now);
+                    let link = EstablishedLink::from_initiator(
+                        pending,
+                        &proof.encryption_public,
+                        interface_index,
+                        now,
+                    );
                     let rtt_secs = link.rtt_seconds();
 
                     self.established_links.insert(destination_hash, link);
@@ -2188,6 +2198,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             log::warn!("send_next_segment: link {} not found", hex::encode(link_id));
             return;
         };
+        let target_interface = link.receiving_interface;
 
         let start = (next_segment - 1) * MAX_EFFICIENT_SIZE;
         let end = (start + MAX_EFFICIENT_SIZE).min(multi.full_data.len());
@@ -2241,8 +2252,8 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             ),
         );
 
-        for iface in &mut self.interfaces {
-            iface.send(packet.clone(), 0);
+        if let Some(iface) = self.interfaces.get_mut(target_interface) {
+            iface.send(packet, 0);
         }
     }
 
@@ -2254,6 +2265,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         };
 
         let ciphertext = link.encrypt(&mut self.rng, plaintext);
+        let target_interface = link.receiving_interface;
 
         let packet = Packet::LinkData {
             hops: 0,
@@ -2262,8 +2274,8 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             data: ciphertext,
         };
 
-        for iface in &mut self.interfaces {
-            iface.send(packet.clone(), 0);
+        if let Some(iface) = self.interfaces.get_mut(target_interface) {
+            iface.send(packet, 0);
         }
     }
 
@@ -2520,12 +2532,6 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                     });
                 }
             }
-
-            log::debug!(
-                "Pending link <{}> to <{}> timed out",
-                hex::encode(link_id),
-                hex::encode(destination)
-            );
         }
 
         // Check for timed out path requests
@@ -2661,6 +2667,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                     link.state
                 );
                 let dest = link.destination;
+                let target_interface = link.receiving_interface;
                 let close_data = link.encrypt(&mut self.rng, &link_id);
                 let packet = Packet::LinkData {
                     hops: 0,
@@ -2668,8 +2675,8 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                     context: LinkContext::LinkClose,
                     data: close_data,
                 };
-                for iface in &mut self.interfaces {
-                    iface.send(packet.clone(), 0);
+                if let Some(iface) = self.interfaces.get_mut(target_interface) {
+                    iface.send(packet, 0);
                 }
                 self.destination_links.remove(&dest);
             }
@@ -2695,14 +2702,15 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 );
                 // Responder: reply to keepalive request
                 let response = link.encrypt(&mut self.rng, &[KEEPALIVE_RESPONSE]);
+                let target_interface = link.receiving_interface;
                 let packet = Packet::LinkData {
                     hops: 0,
                     destination: LinkDataDestination::Direct(link_id),
                     context: LinkContext::Keepalive,
                     data: response,
                 };
-                for iface in &mut self.interfaces {
-                    iface.send(packet.clone(), 0);
+                if let Some(iface) = self.interfaces.get_mut(target_interface) {
+                    iface.send(packet, 0);
                 }
             } else if plaintext[0] == KEEPALIVE_RESPONSE && link.is_initiator {
                 // Initiator: received keepalive response
@@ -2884,6 +2892,10 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                     .map(|c| [c[0], c[1], c[2], c[3]])
                     .collect();
 
+                let target_interface = self
+                    .established_links
+                    .get(&link_id)
+                    .map(|l| l.receiving_interface);
                 if let Some((_, _, _, _, resource)) = self.outbound_resources.get_mut(&hash) {
                     resource.mark_transferring();
 
@@ -2897,8 +2909,10 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                                 context: LinkContext::Resource,
                                 data: part_data.to_vec(),
                             };
-                            for iface in &mut self.interfaces {
-                                iface.send(packet.clone(), 0);
+                            if let Some(iface_idx) = target_interface
+                                && let Some(iface) = self.interfaces.get_mut(iface_idx)
+                            {
+                                iface.send(packet, 0);
                             }
                         }
                     }
@@ -2921,8 +2935,10 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                             context: LinkContext::ResourceHmu,
                             data: ciphertext,
                         };
-                        for iface in &mut self.interfaces {
-                            iface.send(packet.clone(), 0);
+                        if let Some(iface_idx) = target_interface
+                            && let Some(iface) = self.interfaces.get_mut(iface_idx)
+                        {
+                            iface.send(packet, 0);
                         }
                     }
                 }
@@ -3131,8 +3147,9 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             context: ProofContext::ResourcePrf,
             data: payload,
         };
-        for iface in &mut self.interfaces {
-            iface.send(packet.clone(), 0);
+        let target_interface = link.receiving_interface;
+        if let Some(iface) = self.interfaces.get_mut(target_interface) {
+            iface.send(packet, 0);
         }
 
         if !resource.is_response {
@@ -3383,14 +3400,15 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                 exhausted
             );
             let ciphertext = link.encrypt(&mut self.rng, &payload);
+            let target_interface = link.receiving_interface;
             let packet = Packet::LinkData {
                 hops: 0,
                 destination: LinkDataDestination::Direct(link_id),
                 context: LinkContext::ResourceReq,
                 data: ciphertext,
             };
-            for iface in &mut self.interfaces {
-                iface.send(packet.clone(), 0);
+            if let Some(iface) = self.interfaces.get_mut(target_interface) {
+                iface.send(packet, 0);
             }
 
             // Mark request sent for rate tracking
@@ -6217,6 +6235,7 @@ mod tests {
             &initiator_keypair.public,
             dest,
             ServiceId(0),
+            0,
             now,
         )
     }
@@ -7979,5 +7998,96 @@ mod tests {
 
         let b_relayed = b.stats().packets_relayed;
         assert!(b_relayed > 0);
+    }
+
+    #[test]
+    fn link_packets_only_sent_on_link_interface() {
+        use std::time::Duration;
+
+        let mut server = test_node(true);
+        let mut client = test_node(true);
+
+        server.add_interface(test_interface());
+        server.add_interface(test_interface());
+        client.add_interface(test_interface());
+
+        let svc_client = client.add_service("client", &[], &id(1));
+        let svc_server = server.add_service("server", &["test"], &id(2));
+        let addr = server.service_address(svc_server).unwrap();
+        let now = Instant::now();
+
+        // Announce goes to all interfaces (correct behavior)
+        server.announce(svc_server);
+        server.poll(now);
+        transfer(&mut server, 0, &mut client, 0);
+        client.poll(now);
+
+        // Establish link via interface 0
+        let link_id = client.link(None, addr, now).unwrap();
+        client.poll(now);
+        transfer(&mut client, 0, &mut server, 0);
+        server.poll(now);
+        transfer(&mut server, 0, &mut client, 0);
+        client.poll(now);
+
+        assert!(client.established_links.contains_key(&link_id));
+        assert!(server.established_links.contains_key(&link_id));
+
+        // Clear interface 1 after link setup (announce legitimately used it)
+        server.interfaces[1].transport.outbox.clear();
+
+        // send_link_packet
+        server.send_link_packet(link_id, LinkContext::None, b"payload");
+        server.poll(now);
+
+        // request + small respond
+        client.request(svc_client, crate::LinkHandle(link_id), "test", b"req");
+        client.poll(now);
+        transfer(&mut client, 0, &mut server, 0);
+        let events = server.poll(now);
+        let req_id = events.iter().find_map(|e| match e {
+            ServiceEvent::Request { request_id, .. } => Some(*request_id),
+            _ => None,
+        }).unwrap();
+        server.respond(req_id, b"small", None, false);
+        server.poll(now);
+
+        // large respond (resource adv) + resource transfer
+        transfer(&mut server, 0, &mut client, 0);
+        client.poll(now);
+        client.request(svc_client, crate::LinkHandle(link_id), "test", b"req2");
+        client.poll(now);
+        transfer(&mut client, 0, &mut server, 0);
+        let events = server.poll(now);
+        let req_id = events.iter().find_map(|e| match e {
+            ServiceEvent::Request { request_id, .. } => Some(*request_id),
+            _ => None,
+        }).unwrap();
+        let large: Vec<u8> = (0..1000).map(|i| i as u8).collect();
+        server.respond(req_id, &large, None, false);
+        server.poll(now);
+
+        // resource request + parts
+        transfer(&mut server, 0, &mut client, 0);
+        client.poll(now);
+        transfer(&mut client, 0, &mut server, 0);
+        server.poll(now);
+
+        // keepalive
+        if let Some(link) = server.established_links.get_mut(&link_id) {
+            link.last_inbound = now;
+            link.last_keepalive_sent = None;
+            link.set_rtt(0);
+        }
+        server.poll(now + Duration::from_secs(10));
+
+        // link close
+        server.poll(now + Duration::from_secs(800));
+
+        // After all link operations, interface 1 should have received nothing
+        assert!(
+            server.interfaces[1].transport.outbox.is_empty(),
+            "interface 1 should have no link packets"
+        );
     }
 }

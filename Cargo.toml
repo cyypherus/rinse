@@ -48,7 +48,7 @@ thiserror = { version = "1", optional = true }
 [[bin]]
 name = "rinse-serve"
 path = "src/bin/serve.rs"
-required-features = ["tokio"]
+required-features = ["tokio", "config"]
 
 [[bin]]
 name = "rinse-relay"
