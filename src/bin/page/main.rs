@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use rinse::config::{Config, InterfaceConfig, load_or_generate_identity};
-use rinse::{Address, AsyncNode, AsyncTcpTransport, Interface, ServiceEvent, ServiceId};
+use rinse::{Address, IncomingRequest, Interface, Node, ServiceId, TcpTransport};
 use tokio::net::TcpListener;
 
 mod pages;
@@ -44,7 +44,7 @@ async fn main() {
         .clone()
         .unwrap_or_else(|| "Page Server".to_string());
 
-    let mut node: AsyncNode<AsyncTcpTransport> = AsyncNode::new(config.network.relay);
+    let mut node: Node<TcpTransport> = Node::new(config.network.relay);
 
     let paths = vec!["/page/index.mu", "/page/guestbook.mu", "/page/about.mu"];
     let service = node.add_service("nomadnetwork.node", &paths, &identity);
@@ -60,7 +60,7 @@ async fn main() {
             } => {
                 let addr = format!("{}:{}", target_host, target_port);
                 log::info!("[{}] Connecting to {}", name, addr);
-                match AsyncTcpTransport::connect(&addr).await {
+                match TcpTransport::connect(&addr).await {
                     Ok(transport) => {
                         node.add_interface(Interface::new(transport));
                     }
@@ -106,9 +106,9 @@ async fn main() {
                     node_clone.announce_with_app_data(service, Some(name_bytes.clone()));
                     log::info!("Re-announced service");
                 }
-                event = node_clone.recv(service) => {
-                    let Some(event) = event else { break };
-                    handle_event(&node_clone, service, &state_clone, &name, event).await;
+                request = node_clone.recv_request(service) => {
+                    let Some(request) = request else { break };
+                    handle_request(&node_clone, service, &state_clone, &name, request).await;
                 }
             }
         }
@@ -117,12 +117,12 @@ async fn main() {
     node.run().await;
 }
 
-async fn accept_loop(name: String, listener: TcpListener, node: AsyncNode<AsyncTcpTransport>) {
+async fn accept_loop(name: String, listener: TcpListener, node: Node<TcpTransport>) {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 log::info!("[{}] Connection from {}", name, peer);
-                match AsyncTcpTransport::from_stream(peer.to_string(), stream) {
+                match TcpTransport::from_stream(peer.to_string(), stream) {
                     Ok(transport) => {
                         node.add_interface(Interface::new(transport));
                     }
@@ -145,41 +145,30 @@ fn parse_form_data(data: &[u8]) -> HashMap<String, String> {
     rmp_serde::from_slice(data).unwrap_or_default()
 }
 
-async fn handle_event(
-    node: &AsyncNode<AsyncTcpTransport>,
+async fn handle_request(
+    node: &Node<TcpTransport>,
     service: ServiceId,
     state: &Arc<Mutex<PageState>>,
     name: &str,
-    event: ServiceEvent,
+    request: IncomingRequest,
 ) {
-    let ServiceEvent::Request {
-        request_id,
-        path,
-        data,
-        remote_identity,
-        ..
-    } = event
-    else {
-        return;
-    };
-
-    let form_data = parse_form_data(&data);
+    let form_data = parse_form_data(&request.data);
     log::info!(
         "Request path='{}' form_data={:?} identity={:?}",
-        path,
+        request.path,
         form_data,
-        remote_identity.map(hex::encode)
+        request.remote_identity.map(hex::encode)
     );
 
-    let response = match path.as_str() {
-        "/page/index.mu" => pages::index(state, name, &form_data, remote_identity),
-        "/page/guestbook.mu" => pages::guestbook(state, &form_data, remote_identity),
+    let response = match request.path.as_str() {
+        "/page/index.mu" => pages::index(state, name, &form_data, request.remote_identity),
+        "/page/guestbook.mu" => pages::guestbook(state, &form_data, request.remote_identity),
         "/page/about.mu" => pages::about(name),
-        _ => pages::not_found(&path),
+        _ => pages::not_found(&request.path),
     };
 
     if let Err(e) = node
-        .respond(service, request_id, response.as_bytes(), None, true)
+        .respond(service, request.request_id, response.as_bytes(), None, true)
         .await
     {
         log::warn!("Failed to respond: {:?}", e);

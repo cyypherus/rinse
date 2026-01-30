@@ -13,6 +13,21 @@ pub trait Transport: Send {
     }
 }
 
+impl Transport for Box<dyn Transport> {
+    fn send(&mut self, data: &[u8]) {
+        (**self).send(data)
+    }
+    fn recv(&mut self) -> Option<Vec<u8>> {
+        (**self).recv()
+    }
+    fn bandwidth_available(&self) -> bool {
+        (**self).bandwidth_available()
+    }
+    fn is_connected(&self) -> bool {
+        (**self).is_connected()
+    }
+}
+
 #[derive(Clone)]
 struct QueuedPacket {
     packet: Packet,

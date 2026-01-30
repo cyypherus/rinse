@@ -5,7 +5,7 @@ use crate::crypto::sha256;
 use rmpv::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RequestId(pub [u8; 16]);
+pub struct RequestId(pub(crate) [u8; 16]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WireRequestId(pub [u8; 16]);

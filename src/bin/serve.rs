@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use rinse::config::{load_or_generate_identity, Config, InterfaceConfig};
-use rinse::{AsyncNode, AsyncTcpTransport, Interface, ServiceEvent, ServiceId};
+use rinse::config::{Config, InterfaceConfig, load_or_generate_identity};
+use rinse::{IncomingRequest, Interface, Node, ServiceId, TcpTransport};
 use tokio::net::TcpListener;
 
 fn load_directory(base: &Path, current: &Path, files: &mut HashMap<String, Vec<u8>>) {
@@ -37,9 +37,14 @@ async fn main() {
     let identity = load_or_generate_identity().expect("failed to load identity");
 
     let dir_arg = std::env::args().nth(1);
-    let name = config.name.clone().unwrap_or_else(|| "Rinse File Server".to_string());
+    let name = config
+        .name
+        .clone()
+        .unwrap_or_else(|| "Rinse File Server".to_string());
     let aspect = config.serve.aspect.clone();
-    let dir_str = dir_arg.or(config.serve.directory.clone()).expect("no directory specified");
+    let dir_str = dir_arg
+        .or(config.serve.directory.clone())
+        .expect("no directory specified");
 
     let dir = std::path::PathBuf::from(&dir_str);
     if !dir.is_dir() {
@@ -54,7 +59,7 @@ async fn main() {
     log::info!("Loaded {} files from {}", files.len(), dir.display());
     let files = Arc::new(files);
 
-    let mut node: AsyncNode<AsyncTcpTransport> = AsyncNode::new(config.network.relay);
+    let mut node: Node<TcpTransport> = Node::new(config.network.relay);
 
     let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
     let service = node.add_service(&aspect, &path_refs, &identity);
@@ -70,7 +75,7 @@ async fn main() {
             } => {
                 let addr = format!("{}:{}", target_host, target_port);
                 log::info!("Connecting to {} ({})", iface_name, addr);
-                match AsyncTcpTransport::connect(&addr).await {
+                match TcpTransport::connect(&addr).await {
                     Ok(transport) => {
                         node.add_interface(Interface::new(transport));
                     }
@@ -109,9 +114,9 @@ async fn main() {
                     node_clone.announce_with_app_data(service, Some(name_bytes.clone()));
                     log::debug!("Announced service");
                 }
-                event = node_clone.recv(service) => {
-                    let Some(event) = event else { break };
-                    handle_event(&node_clone, service, &files, event).await;
+                request = node_clone.recv_request(service) => {
+                    let Some(request) = request else { break };
+                    handle_request(&node_clone, service, &files, request).await;
                 }
             }
         }
@@ -120,12 +125,12 @@ async fn main() {
     node.run().await;
 }
 
-async fn accept_loop(listener: TcpListener, node: AsyncNode<AsyncTcpTransport>) {
+async fn accept_loop(listener: TcpListener, node: Node<TcpTransport>) {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 log::info!("Accepted connection from {}", peer);
-                match AsyncTcpTransport::from_stream(peer.to_string(), stream) {
+                match TcpTransport::from_stream(peer.to_string(), stream) {
                     Ok(transport) => {
                         node.add_interface(Interface::new(transport));
                     }
@@ -141,28 +146,22 @@ async fn accept_loop(listener: TcpListener, node: AsyncNode<AsyncTcpTransport>) 
     }
 }
 
-async fn handle_event(
-    node: &AsyncNode<AsyncTcpTransport>,
+async fn handle_request(
+    node: &Node<TcpTransport>,
     service: ServiceId,
     files: &HashMap<String, Vec<u8>>,
-    event: ServiceEvent,
+    request: IncomingRequest,
 ) {
-    let ServiceEvent::Request {
-        request_id,
-        path,
-        data,
-        ..
-    } = event
-    else {
-        return;
-    };
+    log::info!(
+        "Request path='{}' data_len={}",
+        request.path,
+        request.data.len()
+    );
 
-    log::info!("Request path='{}' data_len={}", path, data.len());
-
-    let key = if path.starts_with('/') {
-        path.clone()
+    let key = if request.path.starts_with('/') {
+        request.path.clone()
     } else {
-        format!("/{}", path)
+        format!("/{}", request.path)
     };
 
     let response = match files.get(&key) {
@@ -177,7 +176,7 @@ async fn handle_event(
     };
 
     if let Err(e) = node
-        .respond(service, request_id, &response, None, true)
+        .respond(service, request.request_id, &response, None, true)
         .await
     {
         log::warn!("Failed to respond: {:?}", e);

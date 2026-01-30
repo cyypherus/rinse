@@ -21,6 +21,41 @@ pub enum RespondError {
     TransferFailed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkError {
+    DestinationUnreachable,
+    Timeout,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceError {
+    LinkClosed,
+    InvalidLink,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathNotFound;
+
+pub struct IncomingRequest {
+    pub request_id: RequestId,
+    pub path: String,
+    pub data: Vec<u8>,
+    pub remote_identity: Option<Address>,
+}
+
+pub struct Response {
+    pub data: Vec<u8>,
+    pub metadata: Option<Vec<u8>>,
+}
+
+pub struct Progress {
+    pub request_id: RequestId,
+    pub received_parts: usize,
+    pub total_parts: usize,
+    pub received_bytes: usize,
+    pub total_bytes: usize,
+}
+
 pub struct Destination {
     pub address: Address,
     pub app_data: Option<Vec<u8>>,
@@ -29,7 +64,7 @@ pub struct Destination {
     pub last_seen: Instant,
 }
 
-pub enum ServiceEvent {
+pub(crate) enum ServiceEvent {
     Request {
         service: ServiceId,
         request_id: RequestId,

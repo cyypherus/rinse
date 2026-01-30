@@ -11,12 +11,8 @@ impl AspectHash {
         Self(bytes)
     }
 
-    pub fn from_bytes(bytes: [u8; 10]) -> Self {
+    pub(crate) fn from_bytes(bytes: [u8; 10]) -> Self {
         Self(bytes)
-    }
-
-    pub fn as_bytes(&self) -> &[u8; 10] {
-        &self.0
     }
 }
 

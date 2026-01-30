@@ -15,30 +15,32 @@ mod packet_hashlist;
 mod request;
 mod resource;
 mod stats;
-pub mod transports;
 
-#[cfg(feature = "tokio")]
 mod async_io;
+
+#[cfg(any(feature = "tcp", feature = "iroh"))]
+mod transports;
 
 #[cfg(feature = "config")]
 pub mod config;
 
 pub use aspect::AspectHash;
-pub use handle::{Destination, RequestError, RespondError, ServiceEvent, ServiceId};
+pub use handle::{
+    Destination, IncomingRequest, LinkError, PathNotFound, Progress, RequestError, ResourceError,
+    RespondError, Response, ServiceId,
+};
 pub use identity::Identity;
 pub use interface::{Interface, Transport};
 pub use link_handle::{LinkHandle, LinkStatus, ResourceHandle};
-pub use node::Node;
 pub use packet::Address;
 pub use request::RequestId;
 pub(crate) use request::WireRequestId;
 pub use stats::StatsSnapshot;
 
-#[cfg(feature = "tokio")]
-pub use async_io::AsyncNode;
+pub use async_io::AsyncNode as Node;
 
-#[cfg(all(feature = "tokio", feature = "tcp"))]
-pub use async_io::AsyncTcpTransport;
+#[cfg(feature = "tcp")]
+pub use async_io::AsyncTcpTransport as TcpTransport;
 
 #[cfg(feature = "iroh")]
 pub use transports::iroh::{IrohError, IrohNode, IrohTransport};

@@ -174,49 +174,6 @@ pub struct Node<T, R = ThreadRng> {
     pending_resource_requests: Vec<(LinkId, [u8; 32])>,
 }
 
-impl<T: Transport> Node<T, ThreadRng> {
-    pub fn new(transport: bool) -> Self {
-        let mut rng = rand::thread_rng();
-        let mut transport_id = [0u8; 16];
-        rng.fill_bytes(&mut transport_id);
-        log::info!(
-            "Node started with transport_id <{}>",
-            hex::encode(transport_id)
-        );
-        Self {
-            transport,
-            max_hops: DEFAULT_MAX_HOPS,
-            retries: DEFAULT_RETRIES,
-            retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
-            rng,
-            transport_id,
-            path_table: HashMap::new(),
-            pending_announces: Vec::new(),
-            seen_packets: crate::packet_hashlist::PacketHashlist::new(1_000_000),
-            reverse_table: HashMap::new(),
-            receipts: Vec::new(),
-            interfaces: Vec::new(),
-            services: Vec::new(),
-            pending_outbound_links: HashMap::new(),
-            established_links: HashMap::new(),
-            link_table: HashMap::new(),
-            outbound_resources: HashMap::new(),
-            inbound_resources: HashMap::new(),
-            pending_resource_adverts: HashMap::new(),
-            multi_segment_transfers: HashMap::new(),
-            outbound_multi_segments: HashMap::new(),
-            inbound_request_links: HashMap::new(),
-            destination_links: HashMap::new(),
-            pending_outbound_requests: HashMap::new(),
-            pending_path_requests: HashMap::new(),
-            discovery_path_requests: HashMap::new(),
-            stats: Stats::new(),
-            pending_events: Vec::new(),
-            pending_resource_requests: Vec::new(),
-        }
-    }
-}
-
 impl<T: Transport, R: RngCore> Node<T, R> {
     pub fn with_rng(mut rng: R, transport: bool) -> Self {
         let mut transport_id = [0u8; 16];
@@ -954,7 +911,8 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         Some(crate::ResourceHandle(hash))
     }
 
-    pub fn resource_progress(&self, resource: crate::ResourceHandle) -> Option<f32> {
+    #[cfg(test)]
+    fn resource_progress(&self, resource: crate::ResourceHandle) -> Option<f32> {
         if let Some((_, _, _, _, outbound)) = self.outbound_resources.get(&resource.0) {
             let total = outbound.transfer_size();
             if total == 0 {
@@ -973,11 +931,11 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         None
     }
 
-    pub fn prove_packet(&mut self, service: ServiceId, packet_data: &[u8]) -> bool {
+    pub(crate) fn prove_packet(&mut self, service: ServiceId, packet_data: &[u8]) {
         use crate::packet::ProofDestination;
 
         let Some(service_entry) = self.services.get(service.0) else {
-            return false;
+            return;
         };
 
         let signature = crate::crypto::create_proof(&service_entry.signing_key, packet_data);
@@ -997,7 +955,6 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             self.stats.bytes_sent += packet.to_bytes().len() as u64;
             iface.send(packet.clone(), 0);
         }
-        true
     }
 
     pub(crate) fn link(
@@ -1749,7 +1706,6 @@ impl<T: Transport, R: RngCore> Node<T, R> {
 
                 match context {
                     // === NOT ENCRYPTED ===
-
                     LinkContext::Resource => {
                         self.handle_resource_packet(link_id, context, &data, now);
                     }
@@ -1767,7 +1723,6 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                     }
 
                     // === ENCRYPTED ===
-
                     LinkContext::LinkRtt => {
                         if let Some(plaintext) = decrypt(link, &data) {
                             self.handle_link_rtt(link_id, &plaintext);
@@ -1854,8 +1809,9 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         if let Some(plaintext) = decrypt(link, &data) {
                             if let Some(service) = link.local_service {
                                 if let Some(req) = Request::decode(&plaintext) {
-                                    let wire_request_id =
-                                        WireRequestId(packet.packet_hash()[..16].try_into().unwrap());
+                                    let wire_request_id = WireRequestId(
+                                        packet.packet_hash()[..16].try_into().unwrap(),
+                                    );
                                     let mut id_bytes = [0u8; 16];
                                     self.rng.fill_bytes(&mut id_bytes);
                                     let request_id = RequestId(id_bytes);
@@ -3061,10 +3017,10 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                                 .map(|t| (t.service, t.local_request_id))
                         });
 
-                    if let Some((service, local_request_id)) = request_info {
+                    if let Some((service, request_id)) = request_info {
                         self.pending_events.push(ServiceEvent::ResourceProgress {
                             service,
-                            request_id: local_request_id,
+                            request_id,
                             received_parts,
                             total_parts,
                             received_bytes,
@@ -5850,12 +5806,12 @@ mod tests {
                 match event {
                     ServiceEvent::ResourceProgress {
                         request_id,
-                        received_parts,
-                        total_parts,
+                        received_bytes,
+                        total_bytes,
                         ..
                     } => {
                         assert_eq!(*request_id, local_req_id);
-                        progress_events.push((*received_parts, *total_parts));
+                        progress_events.push((*received_bytes, *total_bytes));
                     }
                     ServiceEvent::RequestResult { request_id, .. } => {
                         assert_eq!(*request_id, local_req_id);
@@ -6464,7 +6420,7 @@ mod tests {
                         ..
                     } => {
                         assert_eq!(*request_id, local_req_id);
-                        // First segment has ~11 parts, second has ~3
+                        // First segment has more parts, second has fewer
                         if *total_parts > 5 {
                             first_segment_events += 1;
                         } else {
@@ -6563,7 +6519,7 @@ mod tests {
         let _t = Instant::now();
 
         let packet_data = b"test packet data";
-        assert!(a.prove_packet(svc_a, packet_data));
+        a.prove_packet(svc_a, packet_data);
     }
 
     #[test]
@@ -8073,10 +8029,13 @@ mod tests {
         client.poll(now);
         transfer(&mut client, 0, &mut server, 0);
         let events = server.poll(now);
-        let req_id = events.iter().find_map(|e| match e {
-            ServiceEvent::Request { request_id, .. } => Some(*request_id),
-            _ => None,
-        }).unwrap();
+        let req_id = events
+            .iter()
+            .find_map(|e| match e {
+                ServiceEvent::Request { request_id, .. } => Some(*request_id),
+                _ => None,
+            })
+            .unwrap();
         server.respond(req_id, b"small", None, false);
         server.poll(now);
 
@@ -8087,10 +8046,13 @@ mod tests {
         client.poll(now);
         transfer(&mut client, 0, &mut server, 0);
         let events = server.poll(now);
-        let req_id = events.iter().find_map(|e| match e {
-            ServiceEvent::Request { request_id, .. } => Some(*request_id),
-            _ => None,
-        }).unwrap();
+        let req_id = events
+            .iter()
+            .find_map(|e| match e {
+                ServiceEvent::Request { request_id, .. } => Some(*request_id),
+                _ => None,
+            })
+            .unwrap();
         let large: Vec<u8> = (0..1000).map(|i| i as u8).collect();
         server.respond(req_id, &large, None, false);
         server.poll(now);
