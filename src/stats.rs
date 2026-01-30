@@ -55,30 +55,3 @@ pub struct StatsSnapshot {
     pub proofs_relayed: u64,
     pub link_packets_relayed: u64,
 }
-
-impl StatsSnapshot {
-    pub fn format_bytes(bytes: u64) -> String {
-        if bytes >= 1_000_000_000 {
-            format!("{:.1}GB", bytes as f64 / 1_000_000_000.0)
-        } else if bytes >= 1_000_000 {
-            format!("{:.1}MB", bytes as f64 / 1_000_000.0)
-        } else if bytes >= 1_000 {
-            format!("{:.1}KB", bytes as f64 / 1_000.0)
-        } else {
-            format!("{}B", bytes)
-        }
-    }
-
-    pub fn format_uptime(secs: u64) -> String {
-        let days = secs / 86400;
-        let hours = (secs % 86400) / 3600;
-        let mins = (secs % 3600) / 60;
-        if days > 0 {
-            format!("{}d{}h", days, hours)
-        } else if hours > 0 {
-            format!("{}h{}m", hours, mins)
-        } else {
-            format!("{}m", mins)
-        }
-    }
-}

@@ -1,4 +1,4 @@
-use rinse::{AsyncNode, AsyncTcpTransport, Identity, Interface, RequestError, ServiceEvent};
+use rinse::{Identity, Interface, Node, TcpTransport};
 
 #[tokio::main]
 async fn main() {
@@ -68,13 +68,13 @@ async fn main() {
             std::process::exit(1);
         });
 
-    let mut node = AsyncNode::new(false);
+    let mut node = Node::new(false);
     let identity = Identity::generate(&mut rand::thread_rng());
 
     let service = node.add_service("nomadnetwork.node", &[], &identity);
 
     log::info!("Connecting to {}", connect_addr);
-    let transport = AsyncTcpTransport::connect(&connect_addr)
+    let transport = TcpTransport::connect(&connect_addr)
         .await
         .expect("failed to connect");
     node.add_interface(Interface::new(transport));
@@ -93,47 +93,41 @@ async fn main() {
     let node_for_progress = node_clone.clone();
     let progress_task = tokio::spawn(async move {
         loop {
-            match node_for_progress.receive(service).await {
-                Some(ServiceEvent::ResourceProgress {
-                    received_bytes,
-                    total_bytes,
-                    ..
-                }) => {
-                    let pct = if total_bytes > 0 {
-                        (received_bytes as f64 / total_bytes as f64) * 100.0
-                    } else {
-                        0.0
-                    };
-                    eprint!(
-                        "\rProgress: {}/{} bytes ({:.1}%)    ",
-                        received_bytes, total_bytes, pct
-                    );
-                }
-                Some(ServiceEvent::RequestResult { .. }) => {
-                    eprintln!();
-                    break;
-                }
-                _ => {}
-            }
+            let Some(progress) = node_for_progress.recv_progress(service).await else {
+                break;
+            };
+            let pct = if progress.total_bytes > 0 {
+                (progress.received_bytes as f64 / progress.total_bytes as f64) * 100.0
+            } else {
+                0.0
+            };
+            eprint!(
+                "\rProgress: {}/{} bytes ({:.1}%)    ",
+                progress.received_bytes, progress.total_bytes, pct
+            );
         }
     });
 
-    let response = node_clone.request(service, node_id, &path, &[]).await;
+    let link = node_clone
+        .establish_link(service, node_id)
+        .await
+        .expect("Failed to establish link");
+    let response = node_clone.request(service, link, &path, &[]).await;
 
     progress_task.abort();
 
     match response {
-        Ok((data, _metadata)) => {
-            log::info!("Received {} bytes", data.len());
+        Ok(resp) => {
+            log::info!("Received {} bytes", resp.data.len());
             if let Some(output_path) = output_file {
-                tokio::fs::write(&output_path, &data)
+                tokio::fs::write(&output_path, &resp.data)
                     .await
                     .expect("failed to write output file");
                 log::info!("Written to {}", output_path);
             } else {
                 use std::io::Write;
                 std::io::stdout()
-                    .write_all(&data)
+                    .write_all(&resp.data)
                     .expect("failed to write to stdout");
             }
         }

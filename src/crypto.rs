@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use aes::cipher::KeyIvInit;
 use cbc::cipher::{BlockDecryptMut, BlockEncryptMut};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -178,29 +176,6 @@ impl SingleDestEncryption {
     }
 }
 
-pub struct GroupDestEncryption;
-
-impl GroupDestEncryption {
-    // "In case the packet is addressed to a group destination type, the packet will be
-    // encrypted with the pre-shared AES-256 key associated with the destination."
-    pub fn encrypt<R: RngCore>(rng: &mut R, psk: &[u8; AES_KEY_LEN], plaintext: &[u8]) -> Vec<u8> {
-        let mut iv = [0u8; AES_IV_LEN];
-        rng.fill_bytes(&mut iv);
-        let mut ciphertext = iv.to_vec();
-        ciphertext.extend(encrypt_aes256(psk, &iv, plaintext));
-        ciphertext
-    }
-
-    pub fn decrypt(psk: &[u8; AES_KEY_LEN], ciphertext: &[u8]) -> Option<Vec<u8>> {
-        if ciphertext.len() < AES_IV_LEN {
-            return None;
-        }
-        let iv: [u8; AES_IV_LEN] = ciphertext[..AES_IV_LEN].try_into().ok()?;
-        let encrypted = &ciphertext[AES_IV_LEN..];
-        decrypt_aes256(psk, &iv, encrypted)
-    }
-}
-
 pub(crate) struct LinkEncryption;
 
 impl LinkEncryption {
@@ -286,24 +261,9 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
-// "Once the packet has been received and decrypted by the addressed destination, that
-// destination can opt to prove its receipt of the packet. It does this by calculating
-// the SHA-256 hash of the received packet, and signing this hash with its Ed25519
-// signing key."
-pub fn create_proof(signing_key: &SigningKey, packet_data: &[u8]) -> Signature {
+pub(crate) fn create_proof(signing_key: &SigningKey, packet_data: &[u8]) -> Signature {
     let hash = sha256(packet_data);
     sign(signing_key, &hash)
-}
-
-// "Transport nodes in the network can then direct this proof back to the packets origin,
-// where the signature can be verified against the destination's known public signing key."
-pub fn verify_proof(
-    verifying_key: &VerifyingKey,
-    packet_data: &[u8],
-    signature: &Signature,
-) -> bool {
-    let hash = sha256(packet_data);
-    verify(verifying_key, &hash, signature)
 }
 
 #[cfg(test)]
@@ -380,64 +340,37 @@ mod tests {
         assert_eq!(decrypted, plaintext);
     }
 
-    // "Once the packet has been received and decrypted by the addressed destination, that
-    // destination can opt to prove its receipt of the packet. It does this by calculating
-    // the SHA-256 hash of the received packet, and signing this hash with its Ed25519
-    // signing key."
     #[test]
-    fn proof_of_receipt_is_sha256_hash_signed_with_ed25519() {
+    fn create_proof_signs_packet_hash() {
         let mut rng = test_rng();
         let signing_key = SigningKey::generate(&mut rng);
         let packet_data = b"packet contents";
 
-        let proof = create_proof(&signing_key, packet_data);
+        let signature = create_proof(&signing_key, packet_data);
         let expected_hash = sha256(packet_data);
 
         assert!(
             signing_key
                 .verifying_key()
-                .verify(&expected_hash, &proof)
+                .verify(&expected_hash, &signature)
                 .is_ok()
         );
     }
 
-    // "Transport nodes in the network can then direct this proof back to the packets origin,
-    // where the signature can be verified against the destination's known public signing key."
     #[test]
-    fn proof_signature_verifiable_with_public_key() {
+    fn proof_verifiable_with_public_key() {
         let mut rng = test_rng();
         let signing_key = SigningKey::generate(&mut rng);
         let verifying_key = signing_key.verifying_key();
         let packet_data = b"original packet";
 
-        let proof = create_proof(&signing_key, packet_data);
+        let signature = create_proof(&signing_key, packet_data);
+        let packet_hash = sha256(packet_data);
 
-        assert!(verify_proof(&verifying_key, packet_data, &proof));
-        assert!(!verify_proof(&verifying_key, b"tampered", &proof));
-    }
+        assert!(verify(&verifying_key, &packet_hash, &signature));
 
-    // "In case the packet is addressed to a group destination type, the packet will be
-    // encrypted with the pre-shared AES-256 key associated with the destination."
-    #[test]
-    fn group_destination_uses_preshared_aes256() {
-        let mut rng = test_rng();
-        let mut psk = [0u8; 32];
-        rng.fill_bytes(&mut psk);
-        let plaintext = b"group message";
-
-        let ciphertext = GroupDestEncryption::encrypt(&mut rng, &psk, plaintext);
-        let decrypted = GroupDestEncryption::decrypt(&psk, &ciphertext).expect("decrypt");
-
-        assert_eq!(decrypted, plaintext);
-        assert_ne!(&ciphertext[AES_IV_LEN..], plaintext);
-    }
-
-    // "In case the packet is addressed to a plain destination type, the payload data will
-    // not be encrypted."
-    #[test]
-    fn plain_destination_no_encryption() {
-        let plaintext = b"plain data";
-        assert_eq!(plaintext, plaintext);
+        let tampered_hash = sha256(b"tampered");
+        assert!(!verify(&verifying_key, &tampered_hash, &signature));
     }
 
     #[test]

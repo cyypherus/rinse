@@ -26,7 +26,6 @@ pub enum LinkContext {
     ResourceAdv = 0x02,
     ResourceReq = 0x03,
     ResourceHmu = 0x04,
-    ResourcePrf = 0x05,
     ResourceIcl = 0x06,
     ResourceRcl = 0x07,
     CacheRequest = 0x08,
@@ -38,7 +37,6 @@ pub enum LinkContext {
     Keepalive = 0xFA,
     LinkIdentify = 0xFB,
     LinkClose = 0xFC,
-    LinkProof = 0xFD,
     LinkRtt = 0xFE,
 }
 
@@ -166,7 +164,6 @@ impl LinkContext {
             0x02 => Some(Self::ResourceAdv),
             0x03 => Some(Self::ResourceReq),
             0x04 => Some(Self::ResourceHmu),
-            0x05 => Some(Self::ResourcePrf),
             0x06 => Some(Self::ResourceIcl),
             0x07 => Some(Self::ResourceRcl),
             0x08 => Some(Self::CacheRequest),
@@ -178,7 +175,6 @@ impl LinkContext {
             0xFA => Some(Self::Keepalive),
             0xFB => Some(Self::LinkIdentify),
             0xFC => Some(Self::LinkClose),
-            0xFD => Some(Self::LinkProof),
             0xFE => Some(Self::LinkRtt),
             _ => None,
         }

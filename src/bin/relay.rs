@@ -20,9 +20,11 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, Paragraph},
 };
 use rinse::config::{Config, InterfaceConfig, data_dir, load_or_generate_identity};
-use rinse::{AsyncNode, AsyncTcpTransport, Interface, StatsSnapshot};
+use rinse::{Interface, Node, StatsSnapshot, TcpTransport};
 use serde::{Deserialize, Serialize};
-use simplelog::{Config as LogConfig, SharedLogger, WriteLogger};
+use simplelog::{
+    ColorChoice, Config as LogConfig, SharedLogger, TermLogger, TerminalMode, WriteLogger,
+};
 use tokio::net::TcpListener;
 
 const BANNER: &str = r#"    ____  _
@@ -236,7 +238,29 @@ impl RelayTui {
     }
 
     fn format_bytes(bytes: u64) -> String {
-        StatsSnapshot::format_bytes(bytes)
+        if bytes >= 1_000_000_000_000 {
+            format!("{:.2} TB", bytes as f64 / 1_000_000_000_000.0)
+        } else if bytes >= 1_000_000_000 {
+            format!("{:.2} GB", bytes as f64 / 1_000_000_000.0)
+        } else if bytes >= 1_000_000 {
+            format!("{:.2} MB", bytes as f64 / 1_000_000.0)
+        } else if bytes >= 1_000 {
+            format!("{:.2} KB", bytes as f64 / 1_000.0)
+        } else {
+            format!("{} B", bytes)
+        }
+    }
+
+    fn format_uptime(secs: u64) -> String {
+        if secs >= 86400 {
+            format!("{}d {}h", secs / 86400, (secs % 86400) / 3600)
+        } else if secs >= 3600 {
+            format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+        } else if secs >= 60 {
+            format!("{}m {}s", secs / 60, secs % 60)
+        } else {
+            format!("{}s", secs)
+        }
     }
 
     fn format_rate(bytes_per_sec: f64) -> String {
@@ -310,12 +334,12 @@ impl RelayTui {
         lines.push(Line::from(vec![
             Span::styled(" Session: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                StatsSnapshot::format_uptime(combined.session_uptime_secs),
+                Self::format_uptime(combined.session_uptime_secs),
                 Style::default().fg(Color::White),
             ),
             Span::styled(" | Total: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                StatsSnapshot::format_uptime(combined.total_uptime_secs),
+                Self::format_uptime(combined.total_uptime_secs),
                 Style::default().fg(Color::White),
             ),
             if !upstreams.is_empty() {
@@ -623,6 +647,18 @@ fn stats_path() -> PathBuf {
     data_dir().join("relay_stats.json")
 }
 
+fn format_uptime(secs: u64) -> String {
+    if secs >= 86400 {
+        format!("{}d {}h", secs / 86400, (secs % 86400) / 3600)
+    } else if secs >= 3600 {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -644,6 +680,9 @@ fn log_level_from_env() -> LevelFilter {
 
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let headless = args.iter().any(|a| a == "--headless");
+
     let _ = std::fs::create_dir_all(data_dir());
 
     let log_level = log_level_from_env();
@@ -651,23 +690,34 @@ async fn main() {
 
     let log_file = File::create(data_dir().join("relay.log")).expect("failed to create log file");
     let file_logger = WriteLogger::new(log_level, LogConfig::default(), log_file);
-    let tui_logger = TuiLogger::new(log_buffer.clone(), file_logger);
 
-    log::set_boxed_logger(Box::new(tui_logger)).expect("failed to set logger");
-    log::set_max_level(log_level);
+    if headless {
+        let term_logger = TermLogger::new(
+            log_level,
+            LogConfig::default(),
+            TerminalMode::Mixed,
+            ColorChoice::Auto,
+        );
+        simplelog::CombinedLogger::init(vec![term_logger, file_logger])
+            .expect("failed to set logger");
+    } else {
+        let tui_logger = TuiLogger::new(log_buffer.clone(), file_logger);
+        log::set_boxed_logger(Box::new(tui_logger)).expect("failed to set logger");
+        log::set_max_level(log_level);
+    }
 
     let config = Config::load().expect("failed to load config");
     let identity = load_or_generate_identity().expect("failed to load identity");
 
     let stats_file = stats_path();
-    let mut persisted = PersistedStats::load(&stats_file);
+    let persisted = PersistedStats::load(&stats_file);
     log::info!(
         "Loaded persisted stats: {} packets relayed, {} uptime",
         persisted.packets_relayed,
-        StatsSnapshot::format_uptime(persisted.total_uptime_secs)
+        format_uptime(persisted.total_uptime_secs)
     );
 
-    let mut node: AsyncNode<AsyncTcpTransport> = AsyncNode::new(true);
+    let mut node: Node<TcpTransport> = Node::new(true);
     let service = node.add_service("relay.stats", &[], &identity);
 
     let enabled_interfaces = config.enabled_interfaces();
@@ -696,7 +746,7 @@ async fn main() {
             } => {
                 let addr = format!("{}:{}", target_host, target_port);
                 log::info!("Connecting to {} ({})", name, addr);
-                match AsyncTcpTransport::connect(&addr).await {
+                match TcpTransport::connect(&addr).await {
                     Ok(transport) => {
                         node.add_interface(Interface::new(transport));
                         upstreams.push(addr);
@@ -722,7 +772,7 @@ async fn main() {
                                     Ok((stream, peer)) => {
                                         log::info!("Accepted connection from {}", peer);
                                         if let Ok(transport) =
-                                            AsyncTcpTransport::from_stream(peer.to_string(), stream)
+                                            TcpTransport::from_stream(peer.to_string(), stream)
                                         {
                                             node_clone.add_interface(Interface::new(transport));
                                         }
@@ -742,6 +792,78 @@ async fn main() {
         }
     }
 
+    if headless {
+        run_headless(node, service, persisted, stats_file).await;
+    } else {
+        run_tui(node, service, persisted, stats_file, log_buffer, upstreams).await;
+    }
+}
+
+async fn run_headless(
+    node: Node<TcpTransport>,
+    service: rinse::ServiceId,
+    mut persisted: PersistedStats,
+    stats_file: PathBuf,
+) {
+    eprintln!("Relay running in headless mode (Ctrl+C to stop)");
+
+    let node_handle = node.clone();
+    tokio::spawn(async move {
+        node.run().await;
+    });
+
+    let save_interval = Duration::from_secs(60);
+    let mut last_save = std::time::Instant::now();
+
+    let mut announce_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(10),
+        Duration::from_secs(60),
+    );
+
+    let mut stats_tick = tokio::time::interval(Duration::from_secs(30));
+
+    loop {
+        tokio::select! {
+            _ = announce_tick.tick() => {
+                node_handle.announce(service);
+                log::debug!("Announced relay");
+            }
+            _ = stats_tick.tick() => {
+                let session_stats = node_handle.stats().await;
+                log::info!(
+                    "Stats: {} packets relayed, {} received, {} sent",
+                    session_stats.packets_relayed,
+                    session_stats.packets_received,
+                    session_stats.packets_sent
+                );
+
+                if last_save.elapsed() >= save_interval {
+                    let mut save_persisted = persisted.clone();
+                    save_persisted.merge(&session_stats);
+                    save_persisted.total_uptime_secs = persisted.total_uptime_secs;
+                    save_persisted.save(&stats_file);
+                    last_save = std::time::Instant::now();
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                let session_stats = node_handle.stats().await;
+                persisted.merge(&session_stats);
+                persisted.save(&stats_file);
+                eprintln!("\nShutting down. Packets relayed: {}", persisted.packets_relayed);
+                break;
+            }
+        }
+    }
+}
+
+async fn run_tui(
+    node: Node<TcpTransport>,
+    service: rinse::ServiceId,
+    mut persisted: PersistedStats,
+    stats_file: PathBuf,
+    log_buffer: Arc<Mutex<VecDeque<LogEntry>>>,
+    upstreams: Vec<String>,
+) {
     let mut terminal = setup_terminal().expect("failed to setup terminal");
 
     let stats_interval = Duration::from_secs(1);
@@ -818,7 +940,7 @@ async fn main() {
                     println!("    Announces relayed: {}", persisted.announces_relayed);
                     println!(
                         "    Total uptime: {}",
-                        StatsSnapshot::format_uptime(persisted.total_uptime_secs)
+                        format_uptime(persisted.total_uptime_secs)
                     );
                     println!();
 
