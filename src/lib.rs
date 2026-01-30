@@ -27,7 +27,7 @@ pub mod config;
 pub use aspect::AspectHash;
 pub use handle::{
     Destination, IncomingRequest, LinkError, PathNotFound, Progress, RequestError, ResourceError,
-    RespondError, Response, ServiceId,
+    RespondError, Response, SendError, ServiceId,
 };
 pub use identity::Identity;
 pub use interface::{Interface, Transport};

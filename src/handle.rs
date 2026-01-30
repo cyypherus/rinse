@@ -36,6 +36,12 @@ pub enum ResourceError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathNotFound;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendError {
+    PayloadTooLarge { size: usize, max: usize },
+    DestinationUnknown,
+}
+
 pub struct IncomingRequest {
     pub request_id: RequestId,
     pub path: String,

@@ -267,6 +267,11 @@ enum Command<T: Transport> {
     SendRaw {
         dest: Address,
         data: Vec<u8>,
+        reply: oneshot::Sender<Result<(), crate::handle::SendError>>,
+    },
+    SendLinkData {
+        link: crate::LinkHandle,
+        data: Vec<u8>,
     },
     GetDestinations {
         reply: oneshot::Sender<Vec<Destination>>,
@@ -437,9 +442,25 @@ impl<T: Transport> AsyncNode<T> {
             .send(Command::Announce { service, app_data });
     }
 
-    pub fn send_raw(&self, dest: Address, data: &[u8]) {
+    pub async fn send_raw(
+        &self,
+        dest: Address,
+        data: &[u8],
+    ) -> Result<(), crate::handle::SendError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.command_tx.send(Command::SendRaw {
             dest,
+            data: data.to_vec(),
+            reply: reply_tx,
+        });
+        reply_rx
+            .await
+            .unwrap_or(Err(crate::handle::SendError::DestinationUnknown))
+    }
+
+    pub fn send_link_data(&self, link: crate::LinkHandle, data: &[u8]) {
+        let _ = self.command_tx.send(Command::SendLinkData {
+            link,
             data: data.to_vec(),
         });
     }
@@ -886,8 +907,11 @@ impl<T: Transport> AsyncNode<T> {
                     .node
                     .respond(request_id, &data, metadata.as_deref(), compress);
             }
-            Command::SendRaw { dest, data } => {
-                inner.node.send_raw(dest, &data);
+            Command::SendRaw { dest, data, reply } => {
+                let _ = reply.send(inner.node.send_raw(dest, &data));
+            }
+            Command::SendLinkData { link, data } => {
+                inner.node.send_link_data(link, &data);
             }
             Command::GetDestinations { reply } => {
                 let _ = reply.send(inner.node.known_destinations());

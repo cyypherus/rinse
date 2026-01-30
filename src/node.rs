@@ -13,6 +13,7 @@ use crate::handle::{Destination, RequestError, RespondError, ServiceEvent, Servi
 use crate::stats::{Stats, StatsSnapshot};
 
 const LINK_MDU: usize = 431;
+const SINGLE_MDU: usize = 383;
 use crate::link::{EstablishedLink, LinkId, LinkProof, LinkRequest, LinkState, PendingLink};
 use crate::packet::{Address, LinkContext, Packet, SingleDestination};
 use crate::packet_hashlist::PacketHashlist;
@@ -713,8 +714,31 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         }
     }
 
-    pub fn send_raw(&mut self, destination: Address, data: &[u8]) {
+    pub fn send_raw(
+        &mut self,
+        destination: Address,
+        data: &[u8],
+    ) -> Result<(), crate::handle::SendError> {
+        if data.len() > SINGLE_MDU {
+            return Err(crate::handle::SendError::PayloadTooLarge {
+                size: data.len(),
+                max: SINGLE_MDU,
+            });
+        }
         self.send_single_data(destination, data);
+        Ok(())
+    }
+
+    pub fn send_link_data(&mut self, link: crate::LinkHandle, data: &[u8]) {
+        if data.len() <= LINK_MDU {
+            if let Some(established) = self.established_links.get(&link.0)
+                && established.state == LinkState::Active
+            {
+                self.send_link_packet(link.0, LinkContext::None, data);
+            }
+            return;
+        }
+        self.advertise_resource(link, data.to_vec(), None, false);
     }
 
     pub fn create_link(
