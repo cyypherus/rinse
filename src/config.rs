@@ -41,6 +41,43 @@ pub fn data_dir() -> PathBuf {
     PathBuf::from(".rinse")
 }
 
+const DEFAULT_CONFIG: &str = r#"#
+
+name = "Anonymous Peer"
+
+# [network]
+# relay = false # Enable message forwarding
+
+# Data can travel both ways on any interface.
+# If you'd like to connect via outbound connections, you can configure a client interface.
+
+# [interfaces."Test Network Example"]
+# type = "TCPClientInterface"
+# enabled = true
+# target_host = "test.network.example"
+# target_port = 4242
+
+# If you'd like to accept inbound connections on a port, you can configure a server interface.
+
+# [interfaces.server]
+# type = "TCPServerInterface"
+# enabled = true
+# listen_ip = "0.0.0.0"
+# listen_port = 4242
+
+
+# Various resources curate tcp/ip relays you can use to connect to the network.
+# https://unsigned.io/rnode_bootstrap_console/r/connect.html
+# https://directory.rns.recipes/
+
+# An entry like this must be converted to TOML as seen above
+# [[Test Network Example]]
+#   type = TCPClientInterface
+#   enabled = yes
+#   target_host = test.network.example
+#   target_port = 4242
+"#;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -49,14 +86,6 @@ pub struct Config {
     pub network: NetworkConfig,
     #[serde(default)]
     pub interfaces: HashMap<String, InterfaceConfig>,
-    #[serde(default)]
-    pub serve: ServeConfig,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ServeConfig {
-    pub directory: Option<String>,
-    pub aspect: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -97,9 +126,11 @@ impl Config {
             let contents = fs::read_to_string(&config_path)?;
             Ok(toml::from_str(&contents)?)
         } else {
-            let config = Config::default();
-            config.save()?;
-            Ok(config)
+            if let Some(parent) = config_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&config_path, DEFAULT_CONFIG)?;
+            Ok(Config::default())
         }
     }
 

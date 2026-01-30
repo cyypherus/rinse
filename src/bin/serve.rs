@@ -36,15 +36,15 @@ async fn main() {
     let config = Config::load().expect("failed to load config");
     let identity = load_or_generate_identity().expect("failed to load identity");
 
-    let dir_arg = std::env::args().nth(1);
+    let mut args = std::env::args().skip(1);
+    let dir_str = args
+        .next()
+        .expect("usage: rinse-serve <directory> [aspect]");
+    let aspect = args.next().unwrap_or_else(|| "files".to_string());
     let name = config
         .name
         .clone()
         .unwrap_or_else(|| "Rinse File Server".to_string());
-    let aspect = config.serve.aspect.clone();
-    let dir_str = dir_arg
-        .or(config.serve.directory.clone())
-        .expect("no directory specified");
 
     let dir = std::path::PathBuf::from(&dir_str);
     if !dir.is_dir() {
