@@ -3137,11 +3137,25 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         }
 
         if !resource.is_response {
-            log::debug!(
-                "Resource {} is not a response, data ({} bytes) not delivered to any service",
-                hex::encode(hash),
-                segment_data.len()
-            );
+            if let Some(service) = link.local_service {
+                log::debug!(
+                    "Resource {} is unsolicited, delivering {} bytes to service {:?}",
+                    hex::encode(hash),
+                    segment_data.len(),
+                    service
+                );
+                self.pending_events.push(ServiceEvent::Resource {
+                    service,
+                    link: crate::LinkHandle(link_id),
+                    data: segment_data,
+                });
+            } else {
+                log::debug!(
+                    "Resource {} is unsolicited but link has no local_service, dropping {} bytes",
+                    hex::encode(hash),
+                    segment_data.len()
+                );
+            }
             return;
         }
 

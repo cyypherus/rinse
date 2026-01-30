@@ -94,6 +94,11 @@ pub(crate) enum ServiceEvent {
         service: ServiceId,
         data: Vec<u8>,
     },
+    Resource {
+        service: ServiceId,
+        link: crate::LinkHandle,
+        data: Vec<u8>,
+    },
     DestinationsChanged,
     PathRequestResult {
         destination: Address,

@@ -226,6 +226,7 @@ type LinkWaiters = HashMap<crate::LinkHandle, Vec<oneshot::Sender<Result<(), Lin
 type PathWaiters = HashMap<Address, Vec<oneshot::Sender<bool>>>;
 type IncomingRequestReceiver = Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingRequest>>>;
 type RawReceiver = Arc<TokioMutex<mpsc::UnboundedReceiver<Vec<u8>>>>;
+type ResourceReceiver = Arc<TokioMutex<mpsc::UnboundedReceiver<(crate::LinkHandle, Vec<u8>)>>>;
 type ProgressReceiver = Arc<TokioMutex<mpsc::UnboundedReceiver<crate::handle::Progress>>>;
 
 #[derive(Clone)]
@@ -234,6 +235,8 @@ struct ServiceChannels {
     request_rx: IncomingRequestReceiver,
     raw_tx: mpsc::UnboundedSender<Vec<u8>>,
     raw_rx: RawReceiver,
+    resource_tx: mpsc::UnboundedSender<(crate::LinkHandle, Vec<u8>)>,
+    resource_rx: ResourceReceiver,
     progress_tx: mpsc::UnboundedSender<crate::handle::Progress>,
     progress_rx: ProgressReceiver,
     request_waiters: RequestWaiters,
@@ -382,6 +385,7 @@ impl<T: Transport> AsyncNode<T> {
 
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let (raw_tx, raw_rx) = mpsc::unbounded_channel();
+        let (resource_tx, resource_rx) = mpsc::unbounded_channel();
         let (progress_tx, progress_rx) = mpsc::unbounded_channel();
         let request_waiters: RequestWaiters = Arc::new(StdMutex::new(HashMap::new()));
         let respond_waiters: RespondWaiters = Arc::new(StdMutex::new(HashMap::new()));
@@ -396,6 +400,8 @@ impl<T: Transport> AsyncNode<T> {
                 request_rx: Arc::new(TokioMutex::new(request_rx)),
                 raw_tx,
                 raw_rx: Arc::new(TokioMutex::new(raw_rx)),
+                resource_tx,
+                resource_rx: Arc::new(TokioMutex::new(resource_rx)),
                 progress_tx,
                 progress_rx: Arc::new(TokioMutex::new(progress_rx)),
                 request_waiters,
@@ -542,6 +548,17 @@ impl<T: Transport> AsyncNode<T> {
             channels.raw_rx.clone()
         };
         raw_rx.lock().await.recv().await
+    }
+
+    pub async fn recv_resource(&self, service: ServiceId) -> Option<(crate::LinkHandle, Vec<u8>)> {
+        let resource_rx = {
+            let services = self.services.lock().unwrap();
+            let channels = services
+                .get(&service)
+                .expect("invalid ServiceId - service not registered");
+            channels.resource_rx.clone()
+        };
+        resource_rx.lock().await.recv().await
     }
 
     pub async fn recv_progress(&self, service: ServiceId) -> Option<crate::handle::Progress> {
@@ -769,6 +786,15 @@ impl<T: Transport> AsyncNode<T> {
                 ServiceEvent::Raw { service, data } => {
                     if let Some(channels) = services.get(&service) {
                         let _ = channels.raw_tx.send(data);
+                    }
+                }
+                ServiceEvent::Resource {
+                    service,
+                    link,
+                    data,
+                } => {
+                    if let Some(channels) = services.get(&service) {
+                        let _ = channels.resource_tx.send((link, data));
                     }
                 }
                 ServiceEvent::ResourceProgress {

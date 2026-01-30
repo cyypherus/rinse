@@ -25,10 +25,10 @@ pub fn index(
 ) -> String {
     let mut state = state.lock().unwrap();
 
-    if let Some(username) = form_data.get("field_username") {
-        if let Some(id) = remote_identity {
-            state.set_username(id, username.clone());
-        }
+    if let Some(username) = form_data.get("field_username")
+        && let Some(id) = remote_identity
+    {
+        state.set_username(id, username.clone());
     }
 
     let username = form_data
@@ -48,32 +48,31 @@ pub fn guestbook(
 ) -> String {
     let mut state = state.lock().unwrap();
 
-    if let Some(msg) = form_data.get("field_message") {
-        if !msg.trim().is_empty() {
-            let author = form_data
+    if let Some(msg) = form_data.get("field_message")
+        && !msg.trim().is_empty()
+    {
+        let author = form_data
+            .get("field_author")
+            .cloned()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| state.get_username(remote_identity).map(|s| s.to_string()))
+            .unwrap_or_else(|| {
+                remote_identity
+                    .map(|id| format!("<{}>", &hex::encode(id)[..8]))
+                    .unwrap_or_else(|| "Anonymous".to_string())
+            });
+
+        if let Some(id) = remote_identity
+            && let Some(name) = form_data
                 .get("field_author")
-                .cloned()
                 .filter(|s| !s.trim().is_empty())
-                .or_else(|| state.get_username(remote_identity).map(|s| s.to_string()))
-                .unwrap_or_else(|| {
-                    remote_identity
-                        .map(|id| format!("<{}>", &hex::encode(id)[..8]))
-                        .unwrap_or_else(|| "Anonymous".to_string())
-                });
+        {
+            state.set_username(id, name.clone());
+        }
 
-            if let Some(id) = remote_identity {
-                if let Some(name) = form_data
-                    .get("field_author")
-                    .filter(|s| !s.trim().is_empty())
-                {
-                    state.set_username(id, name.clone());
-                }
-            }
-
-            state.messages.push((author, msg.clone()));
-            if state.messages.len() > 20 {
-                state.messages.remove(0);
-            }
+        state.messages.push((author, msg.clone()));
+        if state.messages.len() > 20 {
+            state.messages.remove(0);
         }
     }
 
