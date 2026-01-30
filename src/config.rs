@@ -56,12 +56,7 @@ pub struct Config {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServeConfig {
     pub directory: Option<String>,
-    #[serde(default = "default_aspect")]
     pub aspect: String,
-}
-
-fn default_aspect() -> String {
-    "nomadnetwork.node".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -74,26 +69,15 @@ pub struct NetworkConfig {
 #[serde(tag = "type")]
 pub enum InterfaceConfig {
     TCPClientInterface {
-        #[serde(default = "default_true")]
         enabled: bool,
         target_host: String,
         target_port: u16,
     },
     TCPServerInterface {
-        #[serde(default = "default_true")]
         enabled: bool,
-        #[serde(default = "default_listen_ip")]
         listen_ip: String,
         listen_port: u16,
     },
-}
-
-fn default_listen_ip() -> String {
-    "0.0.0.0".to_string()
-}
-
-fn default_true() -> bool {
-    true
 }
 
 impl InterfaceConfig {

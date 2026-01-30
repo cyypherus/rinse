@@ -18,7 +18,7 @@ mod stats;
 
 mod async_io;
 
-#[cfg(any(feature = "tcp", feature = "iroh"))]
+#[cfg(feature = "tcp")]
 mod transports;
 
 #[cfg(feature = "config")]
@@ -41,6 +41,3 @@ pub use async_io::AsyncNode as Node;
 
 #[cfg(feature = "tcp")]
 pub use async_io::AsyncTcpTransport as TcpTransport;
-
-#[cfg(feature = "iroh")]
-pub use transports::iroh::{IrohError, IrohNode, IrohTransport};
