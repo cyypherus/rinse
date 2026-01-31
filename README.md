@@ -9,8 +9,7 @@
 > [!NOTE]
 > `rinse` implements the core Reticulum networking primitives: nodes, links, announces, path discovery, and request/response
 >
-> - `rinse` is async-first, built on tokio
-> - `rinse` does not provide a CLI or daemon - it's a library for building Reticulum applications
+> `rinse` does not provide a CLI or daemon - it's primarily a library for building Reticulum applications
 
 # Reticulum
 
@@ -23,7 +22,7 @@ The reference implementation is [Reticulum](https://github.com/markqvist/Reticul
 - `default` - core node implementation with no transport
 - `tcp` - TCP transport using HDLC framing
 - `config` - TOML configuration file support
-- `relay` - transport node functionality with TUI stats display
+- `relay` - feature gate for the relay binary dependencies
 
 # Usage
 
@@ -59,7 +58,7 @@ while let Some(req) = node.recv_request(service).await {
 # Examples
 
 - [`serve`](examples/serve.rs) - file server that serves a directory over Reticulum
-- [`request`](examples/request.rs) - CLI client for making requests to Reticulum nodes  
+- [`request`](examples/request.rs) - CLI client for making requests to Reticulum nodes
 - [`page`](examples/page) - interactive micron page server with guestbook
 
 ```sh
