@@ -7,4 +7,3 @@ traces/
 *.DS_Store
 .cargo/
 .rinse*
-*.md
