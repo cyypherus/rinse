@@ -16,6 +16,7 @@ mod request;
 mod resource;
 mod stats;
 
+#[cfg(feature = "tokio")]
 mod async_io;
 
 #[cfg(feature = "tcp")]
@@ -27,7 +28,7 @@ pub mod config;
 pub use aspect::AspectHash;
 pub use handle::{
     Destination, IncomingRequest, LinkError, PathNotFound, Progress, RequestError, ResourceError,
-    RespondError, Response, SendError, ServiceId,
+    RespondError, Response, SendError, ServiceEvent, ServiceId,
 };
 pub use identity::Identity;
 pub use interface::{Interface, Transport};
@@ -37,7 +38,10 @@ pub use request::RequestId;
 pub(crate) use request::WireRequestId;
 pub use stats::StatsSnapshot;
 
+#[cfg(feature = "tokio")]
 pub use async_io::AsyncNode as Node;
+#[cfg(not(feature = "tokio"))]
+pub use node::Node;
 
 #[cfg(feature = "tcp")]
 pub use async_io::AsyncTcpTransport as TcpTransport;

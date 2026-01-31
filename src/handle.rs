@@ -70,7 +70,8 @@ pub struct Destination {
     pub last_seen: Instant,
 }
 
-pub(crate) enum ServiceEvent {
+#[cfg_attr(not(feature = "tokio"), derive(Debug))]
+pub enum ServiceEvent {
     Request {
         service: ServiceId,
         request_id: RequestId,
