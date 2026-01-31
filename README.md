@@ -7,7 +7,7 @@
 </div>
 
 > [!NOTE]
-> `rinse` implements the core Reticulum networking primitives: nodes, links, announces, path discovery, and request/response
+> `rinse` implements a functional subset of core Reticulum networking features
 >
 > `rinse` does not provide a CLI or daemon - it's primarily a library for building Reticulum applications
 
@@ -78,6 +78,8 @@ cargo run --bin rinse-relay --features relay,tcp
 > [!NOTE]
 >
 > - As many recent projects are, rinse was written with the assistance of LLMs, with very close guidance & review in terms of architecture, testing, & adherence to the original implementation.
+>
+> - The API is very much in flux & there won't be significant effort towards stability at this stage.
 >
 > - This repo doesn't implement every single feature the original python implementation contains (there are a lot of features in the original), but the implemented core features are interoperable with other reticulum nodes.
 > 
