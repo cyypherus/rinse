@@ -74,3 +74,7 @@ cargo run --example page --features config,tcp
 ```sh
 cargo run --bin rinse-relay --features relay,tcp
 ```
+
+> [!NOTE]
+> From the original reticulum implementation:
+> "Reticulum is relatively young software, and should be considered as such. While it has been built with cryptography best-practices very foremost in mind, it has not been externally security audited, and there could very well be privacy or security breaking bugs."
