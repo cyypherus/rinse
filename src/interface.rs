@@ -55,7 +55,7 @@ impl Ord for QueuedPacket {
 }
 
 pub struct Interface<T> {
-    pub(crate) transport: T,
+    pub transport: T,
     queue: BinaryHeap<QueuedPacket>,
     pub(crate) ifac_size: usize,
     pub(crate) ifac_identity: Option<SigningKey>,

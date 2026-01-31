@@ -36,6 +36,12 @@ pub enum ResourceError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathNotFound;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendError {
+    PayloadTooLarge { size: usize, max: usize },
+    DestinationUnknown,
+}
+
 pub struct IncomingRequest {
     pub request_id: RequestId,
     pub path: String,
@@ -64,7 +70,8 @@ pub struct Destination {
     pub last_seen: Instant,
 }
 
-pub(crate) enum ServiceEvent {
+#[cfg_attr(not(feature = "tokio"), derive(Debug))]
+pub enum ServiceEvent {
     Request {
         service: ServiceId,
         request_id: RequestId,
@@ -92,6 +99,11 @@ pub(crate) enum ServiceEvent {
     },
     Raw {
         service: ServiceId,
+        data: Vec<u8>,
+    },
+    Resource {
+        service: ServiceId,
+        link: crate::LinkHandle,
         data: Vec<u8>,
     },
     DestinationsChanged,

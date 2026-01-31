@@ -226,6 +226,7 @@ type LinkWaiters = HashMap<crate::LinkHandle, Vec<oneshot::Sender<Result<(), Lin
 type PathWaiters = HashMap<Address, Vec<oneshot::Sender<bool>>>;
 type IncomingRequestReceiver = Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingRequest>>>;
 type RawReceiver = Arc<TokioMutex<mpsc::UnboundedReceiver<Vec<u8>>>>;
+type ResourceReceiver = Arc<TokioMutex<mpsc::UnboundedReceiver<(crate::LinkHandle, Vec<u8>)>>>;
 type ProgressReceiver = Arc<TokioMutex<mpsc::UnboundedReceiver<crate::handle::Progress>>>;
 
 #[derive(Clone)]
@@ -234,6 +235,8 @@ struct ServiceChannels {
     request_rx: IncomingRequestReceiver,
     raw_tx: mpsc::UnboundedSender<Vec<u8>>,
     raw_rx: RawReceiver,
+    resource_tx: mpsc::UnboundedSender<(crate::LinkHandle, Vec<u8>)>,
+    resource_rx: ResourceReceiver,
     progress_tx: mpsc::UnboundedSender<crate::handle::Progress>,
     progress_rx: ProgressReceiver,
     request_waiters: RequestWaiters,
@@ -247,6 +250,15 @@ enum Command<T: Transport> {
     Announce {
         service: ServiceId,
         app_data: Option<Vec<u8>>,
+    },
+    EnableRatchets {
+        service: ServiceId,
+        interval: Duration,
+        existing_ratchets: Option<Vec<[u8; 32]>>,
+    },
+    ExportRatchets {
+        service: ServiceId,
+        reply: oneshot::Sender<Option<Vec<[u8; 32]>>>,
     },
     Request {
         service: ServiceId,
@@ -263,6 +275,11 @@ enum Command<T: Transport> {
     },
     SendRaw {
         dest: Address,
+        data: Vec<u8>,
+        reply: oneshot::Sender<Result<(), crate::handle::SendError>>,
+    },
+    SendLinkData {
+        link: crate::LinkHandle,
         data: Vec<u8>,
     },
     GetDestinations {
@@ -315,6 +332,16 @@ enum Command<T: Transport> {
     ProvePacket {
         service: ServiceId,
         packet_data: Vec<u8>,
+    },
+    AppEncryptFor {
+        destination: Address,
+        data: Vec<u8>,
+        reply: oneshot::Sender<Option<Vec<u8>>>,
+    },
+    AppDecryptAs {
+        service: ServiceId,
+        data: Vec<u8>,
+        reply: oneshot::Sender<Option<Vec<u8>>>,
     },
 }
 
@@ -382,6 +409,7 @@ impl<T: Transport> AsyncNode<T> {
 
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let (raw_tx, raw_rx) = mpsc::unbounded_channel();
+        let (resource_tx, resource_rx) = mpsc::unbounded_channel();
         let (progress_tx, progress_rx) = mpsc::unbounded_channel();
         let request_waiters: RequestWaiters = Arc::new(StdMutex::new(HashMap::new()));
         let respond_waiters: RespondWaiters = Arc::new(StdMutex::new(HashMap::new()));
@@ -396,6 +424,8 @@ impl<T: Transport> AsyncNode<T> {
                 request_rx: Arc::new(TokioMutex::new(request_rx)),
                 raw_tx,
                 raw_rx: Arc::new(TokioMutex::new(raw_rx)),
+                resource_tx,
+                resource_rx: Arc::new(TokioMutex::new(resource_rx)),
                 progress_tx,
                 progress_rx: Arc::new(TokioMutex::new(progress_rx)),
                 request_waiters,
@@ -431,9 +461,47 @@ impl<T: Transport> AsyncNode<T> {
             .send(Command::Announce { service, app_data });
     }
 
-    pub fn send_raw(&self, dest: Address, data: &[u8]) {
+    pub fn enable_ratchets(
+        &self,
+        service: ServiceId,
+        interval: Duration,
+        existing_ratchets: Option<Vec<[u8; 32]>>,
+    ) {
+        let _ = self.command_tx.send(Command::EnableRatchets {
+            service,
+            interval,
+            existing_ratchets,
+        });
+    }
+
+    pub async fn export_ratchets(&self, service: ServiceId) -> Option<Vec<[u8; 32]>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::ExportRatchets {
+            service,
+            reply: reply_tx,
+        });
+        reply_rx.await.ok().flatten()
+    }
+
+    pub async fn send_raw(
+        &self,
+        dest: Address,
+        data: &[u8],
+    ) -> Result<(), crate::handle::SendError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.command_tx.send(Command::SendRaw {
             dest,
+            data: data.to_vec(),
+            reply: reply_tx,
+        });
+        reply_rx
+            .await
+            .unwrap_or(Err(crate::handle::SendError::DestinationUnknown))
+    }
+
+    pub fn send_link_data(&self, link: crate::LinkHandle, data: &[u8]) {
+        let _ = self.command_tx.send(Command::SendLinkData {
+            link,
             data: data.to_vec(),
         });
     }
@@ -542,6 +610,17 @@ impl<T: Transport> AsyncNode<T> {
             channels.raw_rx.clone()
         };
         raw_rx.lock().await.recv().await
+    }
+
+    pub async fn recv_resource(&self, service: ServiceId) -> Option<(crate::LinkHandle, Vec<u8>)> {
+        let resource_rx = {
+            let services = self.services.lock().unwrap();
+            let channels = services
+                .get(&service)
+                .expect("invalid ServiceId - service not registered");
+            channels.resource_rx.clone()
+        };
+        resource_rx.lock().await.recv().await
     }
 
     pub async fn recv_progress(&self, service: ServiceId) -> Option<crate::handle::Progress> {
@@ -683,24 +762,63 @@ impl<T: Transport> AsyncNode<T> {
         });
     }
 
+    /// Encrypt data for a known destination at the application layer.
+    ///
+    /// This is NOT transport encryption - rinse handles that automatically.
+    /// Use this when you need to pre-encrypt data for a recipient who will
+    /// receive it later through an intermediary (e.g., a store-and-forward
+    /// server that shouldn't be able to read the contents).
+    ///
+    /// The destination must have announced and be in the path table.
+    /// Returns the encrypted blob (ephemeral public key + ciphertext).
+    pub async fn app_encrypt_for(&self, destination: Address, data: &[u8]) -> Option<Vec<u8>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::AppEncryptFor {
+            destination,
+            data: data.to_vec(),
+            reply: reply_tx,
+        });
+        reply_rx.await.ok().flatten()
+    }
+
+    /// Decrypt data that was application-layer encrypted for one of our services.
+    ///
+    /// This is the counterpart to `app_encrypt_for`. Use this to decrypt data
+    /// that was pre-encrypted for your service and delivered through an
+    /// intermediary (e.g., fetched from a store-and-forward server).
+    ///
+    /// The data format is: ephemeral public key (32 bytes) + ciphertext.
+    pub async fn app_decrypt_as(&self, service: ServiceId, data: &[u8]) -> Option<Vec<u8>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::AppDecryptAs {
+            service,
+            data: data.to_vec(),
+            reply: reply_tx,
+        });
+        reply_rx.await.ok().flatten()
+    }
+
     pub async fn run(mut self) {
         let Some((mut inner, destinations_tx)) = self.inner.take() else {
             panic!("run() can only be called on the original AsyncNode, not a clone");
         };
 
-        let mut tick_interval = tokio::time::interval(Duration::from_millis(10));
-        tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut next_wake: Option<Instant> = None;
 
         loop {
+            let sleep_duration = next_wake
+                .map(|t| t.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::from_millis(10))
+                .max(Duration::from_millis(1));
+
             tokio::select! {
                 biased;
                 Some(cmd) = inner.command_rx.recv() => {
                     Self::handle_command(&mut inner, &self.services, &destinations_tx, cmd, Instant::now());
                 }
-                _ = tick_interval.tick() => {
-                    Self::poll(&mut inner, &self.services, &destinations_tx);
-                }
+                _ = tokio::time::sleep(sleep_duration) => {}
             }
+            next_wake = Self::poll(&mut inner, &self.services, &destinations_tx);
         }
     }
 
@@ -708,9 +826,9 @@ impl<T: Transport> AsyncNode<T> {
         inner: &mut AsyncNodeInner<T>,
         services: &Arc<StdMutex<HashMap<ServiceId, ServiceChannels>>>,
         destinations_tx: &watch::Sender<()>,
-    ) {
+    ) -> Option<Instant> {
         let now = Instant::now();
-        let events = inner.node.poll(now);
+        let (events, next_wake) = inner.node.poll(now);
 
         for event in &events {
             if let ServiceEvent::PathRequestResult { destination, found } = event
@@ -740,6 +858,8 @@ impl<T: Transport> AsyncNode<T> {
                 true
             }
         });
+
+        next_wake
     }
 
     fn dispatch_events(
@@ -769,6 +889,15 @@ impl<T: Transport> AsyncNode<T> {
                 ServiceEvent::Raw { service, data } => {
                     if let Some(channels) = services.get(&service) {
                         let _ = channels.raw_tx.send(data);
+                    }
+                }
+                ServiceEvent::Resource {
+                    service,
+                    link,
+                    data,
+                } => {
+                    if let Some(channels) = services.get(&service) {
+                        let _ = channels.resource_tx.send((link, data));
                     }
                 }
                 ServiceEvent::ResourceProgress {
@@ -839,6 +968,18 @@ impl<T: Transport> AsyncNode<T> {
                     inner.node.announce(service);
                 }
             }
+            Command::EnableRatchets {
+                service,
+                interval,
+                existing_ratchets,
+            } => {
+                inner
+                    .node
+                    .enable_ratchets(service, interval, existing_ratchets, now);
+            }
+            Command::ExportRatchets { service, reply } => {
+                let _ = reply.send(inner.node.export_ratchets(service));
+            }
             Command::Request {
                 service,
                 link,
@@ -860,8 +1001,11 @@ impl<T: Transport> AsyncNode<T> {
                     .node
                     .respond(request_id, &data, metadata.as_deref(), compress);
             }
-            Command::SendRaw { dest, data } => {
-                inner.node.send_raw(dest, &data);
+            Command::SendRaw { dest, data, reply } => {
+                let _ = reply.send(inner.node.send_raw(dest, &data));
+            }
+            Command::SendLinkData { link, data } => {
+                inner.node.send_link_data(link, &data);
             }
             Command::GetDestinations { reply } => {
                 let _ = reply.send(inner.node.known_destinations());
@@ -919,7 +1063,7 @@ impl<T: Transport> AsyncNode<T> {
                 }
             }
             Command::RequestPath { destination, reply } => {
-                if inner.node.path_table.contains_key(&destination) {
+                if inner.node.has_path(destination) {
                     let _ = reply.send(true);
                 } else {
                     inner.node.request_path(destination, now);
@@ -935,6 +1079,20 @@ impl<T: Transport> AsyncNode<T> {
                 packet_data,
             } => {
                 inner.node.prove_packet(service, &packet_data);
+            }
+            Command::AppEncryptFor {
+                destination,
+                data,
+                reply,
+            } => {
+                let _ = reply.send(inner.node.app_encrypt_for(destination, &data));
+            }
+            Command::AppDecryptAs {
+                service,
+                data,
+                reply,
+            } => {
+                let _ = reply.send(inner.node.app_decrypt_as(service, &data));
             }
         }
         Self::poll(inner, services, destinations_tx);

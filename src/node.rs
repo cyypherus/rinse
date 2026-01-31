@@ -13,6 +13,7 @@ use crate::handle::{Destination, RequestError, RespondError, ServiceEvent, Servi
 use crate::stats::{Stats, StatsSnapshot};
 
 const LINK_MDU: usize = 431;
+const SINGLE_MDU: usize = 383;
 use crate::link::{EstablishedLink, LinkId, LinkProof, LinkRequest, LinkState, PendingLink};
 use crate::packet::{Address, LinkContext, Packet, SingleDestination};
 use crate::packet_hashlist::PacketHashlist;
@@ -66,6 +67,10 @@ struct ServiceEntry {
     encryption_public: X25519Public,
     signing_key: SigningKey,
     registered_paths: HashMap<PathHash, String>,
+    ratchets: Vec<StaticSecret>,
+    ratchet_interval: Option<std::time::Duration>,
+    last_ratchet_time: Option<Instant>,
+    retained_ratchets: usize,
 }
 
 struct Receipt {
@@ -174,7 +179,7 @@ pub struct Node<T, R = ThreadRng> {
     pending_resource_requests: Vec<(LinkId, [u8; 32])>,
 }
 
-impl<T: Transport, R: RngCore> Node<T, R> {
+impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
     pub fn with_rng(mut rng: R, transport: bool) -> Self {
         let mut transport_id = [0u8; 16];
         rng.fill_bytes(&mut transport_id);
@@ -648,9 +653,41 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             encryption_public,
             signing_key,
             registered_paths,
+            ratchets: Vec::new(),
+            ratchet_interval: None,
+            last_ratchet_time: None,
+            retained_ratchets: 512,
         });
 
         service_id
+    }
+
+    pub fn enable_ratchets(
+        &mut self,
+        service: ServiceId,
+        interval: std::time::Duration,
+        existing_ratchets: Option<Vec<[u8; 32]>>,
+        now: Instant,
+    ) {
+        let Some(entry) = self.services.get_mut(service.0) else {
+            return;
+        };
+        entry.ratchet_interval = Some(interval);
+        entry.last_ratchet_time = Some(now);
+
+        if let Some(ratchets) = existing_ratchets {
+            entry.ratchets = ratchets.into_iter().map(StaticSecret::from).collect();
+        }
+
+        if entry.ratchets.is_empty() {
+            let ratchet = StaticSecret::random_from_rng(&mut self.rng);
+            entry.ratchets.push(ratchet);
+        }
+    }
+
+    pub fn export_ratchets(&self, service: ServiceId) -> Option<Vec<[u8; 32]>> {
+        let entry = self.services.get(service.0)?;
+        Some(entry.ratchets.iter().map(|r| r.to_bytes()).collect())
     }
 
     pub fn announce(&mut self, service: ServiceId) {
@@ -658,10 +695,30 @@ impl<T: Transport, R: RngCore> Node<T, R> {
     }
 
     pub fn announce_with_app_data(&mut self, service: ServiceId, app_data: Option<Vec<u8>>) {
-        let Some(entry) = self.services.get(service.0) else {
+        let Some(entry) = self.services.get_mut(service.0) else {
             return;
         };
+
+        // Rotate ratchet if interval has passed
+        if let (Some(interval), Some(last_time)) = (entry.ratchet_interval, entry.last_ratchet_time)
+        {
+            let now = Instant::now();
+            if now.duration_since(last_time) >= interval {
+                let ratchet = StaticSecret::random_from_rng(&mut self.rng);
+                entry.ratchets.insert(0, ratchet);
+                entry.last_ratchet_time = Some(now);
+                while entry.ratchets.len() > entry.retained_ratchets {
+                    entry.ratchets.pop();
+                }
+            }
+        }
+
         let address = entry.address;
+        let has_ratchet = !entry.ratchets.is_empty();
+        let ratchet_public = entry
+            .ratchets
+            .first()
+            .map(|r| *X25519Public::from(r).as_bytes());
 
         let mut random_hash = [0u8; 10];
         self.rng.fill_bytes(&mut random_hash);
@@ -672,13 +729,22 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             entry.name_hash,
             random_hash,
         );
+        if let Some(ratchet) = ratchet_public {
+            builder = builder.with_ratchet(ratchet);
+        }
         if let Some(data) = app_data {
             builder = builder.with_app_data(data);
         }
         let announce_data = builder.build(&address);
 
-        let packet =
-            self.make_announce_packet(address, 0, false, false, announce_data.to_bytes(), None);
+        let packet = self.make_announce_packet(
+            address,
+            0,
+            has_ratchet,
+            false,
+            announce_data.to_bytes(),
+            None,
+        );
         let packet_len = packet.to_bytes().len();
         let num_interfaces = self.interfaces.len();
         self.stats.packets_sent += num_interfaces as u64;
@@ -687,6 +753,10 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         for iface in &mut self.interfaces {
             iface.send(packet.clone(), 0);
         }
+    }
+
+    pub fn has_path(&self, destination: Address) -> bool {
+        self.path_table.contains_key(&destination)
     }
 
     pub fn request_path(&mut self, destination: Address, now: Instant) {
@@ -713,8 +783,31 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         }
     }
 
-    pub fn send_raw(&mut self, destination: Address, data: &[u8]) {
+    pub fn send_raw(
+        &mut self,
+        destination: Address,
+        data: &[u8],
+    ) -> Result<(), crate::handle::SendError> {
+        if data.len() > SINGLE_MDU {
+            return Err(crate::handle::SendError::PayloadTooLarge {
+                size: data.len(),
+                max: SINGLE_MDU,
+            });
+        }
         self.send_single_data(destination, data);
+        Ok(())
+    }
+
+    pub fn send_link_data(&mut self, link: crate::LinkHandle, data: &[u8]) {
+        if data.len() <= LINK_MDU {
+            if let Some(established) = self.established_links.get(&link.0)
+                && established.state == LinkState::Active
+            {
+                self.send_link_packet(link.0, LinkContext::None, data);
+            }
+            return;
+        }
+        self.advertise_resource(link, data.to_vec(), None, false);
     }
 
     pub fn create_link(
@@ -931,7 +1024,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         None
     }
 
-    pub(crate) fn prove_packet(&mut self, service: ServiceId, packet_data: &[u8]) {
+    pub fn prove_packet(&mut self, service: ServiceId, packet_data: &[u8]) {
         use crate::packet::ProofDestination;
 
         let Some(service_entry) = self.services.get(service.0) else {
@@ -955,6 +1048,59 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             self.stats.bytes_sent += packet.to_bytes().len() as u64;
             iface.send(packet.clone(), 0);
         }
+    }
+
+    /// Encrypt data for a known destination at the application layer.
+    ///
+    /// This is NOT transport encryption - rinse handles that automatically.
+    /// Use this when you need to pre-encrypt data for a recipient who will
+    /// receive it later through an intermediary (e.g., a store-and-forward
+    /// server that shouldn't be able to read the contents).
+    ///
+    /// The destination must have announced and be in the path table.
+    /// Returns the encrypted blob (ephemeral public key + ciphertext).
+    pub fn app_encrypt_for(&mut self, destination: Address, data: &[u8]) -> Option<Vec<u8>> {
+        use crate::crypto::SingleDestEncryption;
+
+        let entry = self.path_table.get(&destination)?;
+        let target_key = entry.ratchet_key.as_ref().unwrap_or(&entry.encryption_key);
+        let (ephemeral_pub, ciphertext) =
+            SingleDestEncryption::encrypt(&mut self.rng, target_key, data);
+
+        let mut result = ephemeral_pub.as_bytes().to_vec();
+        result.extend(ciphertext);
+        Some(result)
+    }
+
+    /// Decrypt data that was application-layer encrypted for one of our services.
+    ///
+    /// This is the counterpart to `app_encrypt_for`. Use this to decrypt data
+    /// that was pre-encrypted for your service and delivered through an
+    /// intermediary (e.g., fetched from a store-and-forward server).
+    ///
+    /// The data format is: ephemeral public key (32 bytes) + ciphertext.
+    pub fn app_decrypt_as(&self, service: ServiceId, data: &[u8]) -> Option<Vec<u8>> {
+        use crate::crypto::SingleDestEncryption;
+
+        if data.len() < 32 {
+            return None;
+        }
+
+        let service_entry = self.services.get(service.0)?;
+        let ephemeral_pub = X25519Public::from(<[u8; 32]>::try_from(&data[..32]).ok()?);
+        let ciphertext = &data[32..];
+
+        // Try ratchet keys first (newest to oldest)
+        for ratchet in &service_entry.ratchets {
+            if let Some(plaintext) =
+                SingleDestEncryption::decrypt(ratchet, &ephemeral_pub, ciphertext)
+            {
+                return Some(plaintext);
+            }
+        }
+
+        // Fall back to static key
+        SingleDestEncryption::decrypt(&service_entry.encryption_secret, &ephemeral_pub, ciphertext)
     }
 
     pub(crate) fn link(
@@ -1889,14 +2035,32 @@ impl<T: Transport, R: RngCore> Node<T, R> {
                         X25519Public::from(<[u8; 32]>::try_from(&ciphertext[..32]).unwrap());
                     let encrypted = &ciphertext[32..];
 
-                    if let Some(plaintext) = crate::crypto::SingleDestEncryption::decrypt(
-                        &service.encryption_secret,
-                        &ephemeral_public,
-                        encrypted,
-                    ) {
+                    // Try ratchet keys first (newest to oldest)
+                    let mut plaintext = None;
+                    for ratchet in &service.ratchets {
+                        if let Some(pt) = crate::crypto::SingleDestEncryption::decrypt(
+                            ratchet,
+                            &ephemeral_public,
+                            encrypted,
+                        ) {
+                            plaintext = Some(pt);
+                            break;
+                        }
+                    }
+
+                    // Fall back to static key if no ratchet worked
+                    if plaintext.is_none() {
+                        plaintext = crate::crypto::SingleDestEncryption::decrypt(
+                            &service.encryption_secret,
+                            &ephemeral_public,
+                            encrypted,
+                        );
+                    }
+
+                    if let Some(data) = plaintext {
                         notifications.push(Notification::Raw {
                             service: ServiceId(service_idx),
-                            data: plaintext,
+                            data,
                         });
                     }
                 }
@@ -2369,7 +2533,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         sent
     }
 
-    pub fn poll(&mut self, now: Instant) -> Vec<ServiceEvent> {
+    pub fn poll(&mut self, now: Instant) -> (Vec<ServiceEvent>, Option<Instant>) {
         let mut next_wake: Option<Instant> = None;
         let mut update_wake = |t: Instant| {
             next_wake = Some(next_wake.map_or(t, |w| w.min(t)));
@@ -2463,7 +2627,7 @@ impl<T: Transport, R: RngCore> Node<T, R> {
             log::debug!("Removed {} disconnected interface(s)", removed);
         }
 
-        std::mem::take(&mut self.pending_events)
+        (std::mem::take(&mut self.pending_events), next_wake)
     }
 
     fn maintain_links(&mut self, now: Instant) -> Option<Instant> {
@@ -3137,11 +3301,25 @@ impl<T: Transport, R: RngCore> Node<T, R> {
         }
 
         if !resource.is_response {
-            log::debug!(
-                "Resource {} is not a response, data ({} bytes) not delivered to any service",
-                hex::encode(hash),
-                segment_data.len()
-            );
+            if let Some(service) = link.local_service {
+                log::debug!(
+                    "Resource {} is unsolicited, delivering {} bytes to service {:?}",
+                    hex::encode(hash),
+                    segment_data.len(),
+                    service
+                );
+                self.pending_events.push(ServiceEvent::Resource {
+                    service,
+                    link: crate::LinkHandle(link_id),
+                    data: segment_data,
+                });
+            } else {
+                log::debug!(
+                    "Resource {} is unsolicited but link has no local_service, dropping {} bytes",
+                    hex::encode(hash),
+                    segment_data.len()
+                );
+            }
             return;
         }
 
@@ -3670,7 +3848,7 @@ mod tests {
         a.send_link_packet(link_id, LinkContext::None, b"payload");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let events = b.poll(now);
+        let (events, _) = b.poll(now);
 
         // B receives raw data via ServiceEvent::Raw
         let raw_events: Vec<_> = events
@@ -3723,7 +3901,7 @@ mod tests {
         transfer(&mut a, 0, &mut b, 0);
         b.poll(later);
         transfer(&mut b, 1, &mut c, 0);
-        let events = c.poll(later);
+        let (events, _) = c.poll(later);
 
         // C receives raw data via ServiceEvent::Raw
         let raw_events: Vec<_> = events
@@ -3777,7 +3955,7 @@ mod tests {
         );
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let events_b = b.poll(now);
+        let (events_b, _) = b.poll(now);
 
         // B should have received the request via ServiceEvent::Request
         let request = events_b.iter().find_map(|e| match e {
@@ -3797,7 +3975,7 @@ mod tests {
         b.respond(*request_id, b"response data", None, true);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
-        let events_a = a.poll(now);
+        let (events_a, _) = a.poll(now);
 
         // A should have received the response via ServiceEvent::RequestResult
         let response = events_a.iter().find_map(|e| match e {
@@ -3863,7 +4041,7 @@ mod tests {
         transfer(&mut a, 0, &mut b, 0);
         b.poll(later);
         transfer(&mut b, 1, &mut c, 0);
-        let events_c = c.poll(later);
+        let (events_c, _) = c.poll(later);
 
         // C should have received the request via ServiceEvent::Request
         let request = events_c.iter().find_map(|e| match e {
@@ -3885,7 +4063,7 @@ mod tests {
         transfer(&mut c, 0, &mut b, 1);
         b.poll(later);
         transfer(&mut b, 0, &mut a, 0);
-        let events_a = a.poll(later);
+        let (events_a, _) = a.poll(later);
 
         // A should have received the response via ServiceEvent::RequestResult
         let response = events_a.iter().find_map(|e| match e {
@@ -3933,7 +4111,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"request");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let events_b = b.poll(now);
+        let (events_b, _) = b.poll(now);
 
         // B should have received the request
         let request = events_b.iter().find_map(|e| match e {
@@ -3970,7 +4148,7 @@ mod tests {
 
         // Transfer resource parts
         transfer(&mut b, 0, &mut a, 0);
-        let events_a = a.poll(now);
+        let (events_a, _) = a.poll(now);
 
         // Transfer proof
         transfer(&mut a, 0, &mut b, 0);
@@ -4022,7 +4200,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"req");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let events_b = b.poll(now);
+        let (events_b, _) = b.poll(now);
 
         // B responds with large response
         let request_id = events_b
@@ -4039,7 +4217,7 @@ mod tests {
         let mut response_received = None;
         for _ in 0..50 {
             transfer(&mut b, 0, &mut a, 0);
-            let events_a = a.poll(now);
+            let (events_a, _) = a.poll(now);
             transfer(&mut a, 0, &mut b, 0);
             b.poll(now);
             if let Some(data) = events_a.iter().find_map(|e| match e {
@@ -4122,7 +4300,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let events_b = b.poll(now);
+        let (events_b, _) = b.poll(now);
 
         let request_id = events_b
             .iter()
@@ -4140,7 +4318,7 @@ mod tests {
         for _ in 0..500 {
             t += std::time::Duration::from_millis(1);
             transfer(&mut b, 0, &mut a, 0);
-            let events_a = a.poll(t);
+            let (events_a, _) = a.poll(t);
             transfer(&mut a, 0, &mut b, 0);
             b.poll(t);
 
@@ -4204,7 +4382,7 @@ mod tests {
         transfer(&mut a, 0, &mut b, 0);
         b.poll(later);
         transfer(&mut b, 1, &mut c, 0);
-        let events_c = c.poll(later);
+        let (events_c, _) = c.poll(later);
 
         // C responds with large response
         let request_id = events_c
@@ -4223,7 +4401,7 @@ mod tests {
             transfer(&mut c, 0, &mut b, 1);
             b.poll(later);
             transfer(&mut b, 0, &mut a, 0);
-            let events_a = a.poll(later);
+            let (events_a, _) = a.poll(later);
             transfer(&mut a, 0, &mut b, 0);
             b.poll(later);
             transfer(&mut b, 1, &mut c, 0);
@@ -4487,7 +4665,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"request");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let events_b = b.poll(now);
+        let (events_b, _) = b.poll(now);
 
         // Verify request was received
         let request_id = events_b
@@ -4513,7 +4691,7 @@ mod tests {
         b.respond(request_id, b"late response", None, true);
         b.poll(after_stale);
         transfer(&mut b, 0, &mut a, 0);
-        let events_a = a.poll(after_stale);
+        let (events_a, _) = a.poll(after_stale);
 
         // Response should be received
         let response = events_a.iter().find_map(|e| match e {
@@ -4672,7 +4850,7 @@ mod tests {
         a.send_link_packet(link_id, LinkContext::None, b"hello over ifac");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let events_b = b.poll(now);
+        let (events_b, _) = b.poll(now);
 
         // B should receive data via ServiceEvent::Raw
         let raw_data = events_b.iter().find_map(|e| match e {
@@ -4743,7 +4921,7 @@ mod tests {
         b.announce(svc_b);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
-        let events_a = a.poll(now);
+        let (events_a, _) = a.poll(now);
 
         // Check that DestinationsChanged event was emitted
         let destinations_changed = events_a
@@ -4761,7 +4939,7 @@ mod tests {
         b.announce(svc_b);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
-        let events_a2 = a.poll(now);
+        let (events_a2, _) = a.poll(now);
 
         let destinations_changed2 = events_a2
             .iter()
@@ -4801,7 +4979,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"hello");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let events_b = b.poll(now);
+        let (events_b, _) = b.poll(now);
 
         let request = events_b.iter().find_map(|e| match e {
             ServiceEvent::Request { path, data, .. } => Some((path.clone(), data.clone())),
@@ -4843,7 +5021,7 @@ mod tests {
             .unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let events_b = b.poll(now);
+        let (events_b, _) = b.poll(now);
 
         // B responds
         let request_id = events_b
@@ -4856,7 +5034,7 @@ mod tests {
         b.respond(request_id, b"response", None, true);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
-        let events_a = a.poll(now);
+        let (events_a, _) = a.poll(now);
 
         let result = events_a.iter().find_map(|e| match e {
             ServiceEvent::RequestResult {
@@ -4938,7 +5116,7 @@ mod tests {
             .unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let events_b1 = b.poll(now);
+        let (events_b1, _) = b.poll(now);
 
         // B responds to first request
         let req_id_1 = events_b1
@@ -4951,7 +5129,7 @@ mod tests {
         b.respond(req_id_1, b"response1", None, true);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
-        let events_a1 = a.poll(now);
+        let (events_a1, _) = a.poll(now);
 
         let resp1 = events_a1.iter().find_map(|e| match e {
             ServiceEvent::RequestResult {
@@ -4970,7 +5148,7 @@ mod tests {
             .unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let events_b2 = b.poll(now);
+        let (events_b2, _) = b.poll(now);
 
         // B responds to second request
         let req_id_2 = events_b2
@@ -4983,7 +5161,7 @@ mod tests {
         b.respond(req_id_2, b"response2", None, true);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
-        let events_a2 = a.poll(now);
+        let (events_a2, _) = a.poll(now);
 
         let resp2 = events_a2.iter().find_map(|e| match e {
             ServiceEvent::RequestResult {
@@ -5041,7 +5219,7 @@ mod tests {
             );
             a.poll(now);
             transfer(&mut a, 0, &mut b, 0);
-            let events_b = b.poll(now);
+            let (events_b, _) = b.poll(now);
 
             let req_id = events_b
                 .iter()
@@ -5053,7 +5231,7 @@ mod tests {
             b.respond(req_id, resp_data.as_bytes(), None, true);
             b.poll(now);
             transfer(&mut b, 0, &mut a, 0);
-            let events_a = a.poll(now);
+            let (events_a, _) = a.poll(now);
 
             let response = events_a.iter().find_map(|e| match e {
                 ServiceEvent::RequestResult {
@@ -5117,7 +5295,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let events_b = b.poll(now);
+        let (events_b, _) = b.poll(now);
 
         // B responds with large response
         let request_id = events_b
@@ -5137,7 +5315,7 @@ mod tests {
         for _ in 0..500 {
             t += std::time::Duration::from_millis(1); // Fast: ~470KB/s per part
             transfer(&mut b, 0, &mut a, 0);
-            let events_a = a.poll(t);
+            let (events_a, _) = a.poll(t);
             transfer(&mut a, 0, &mut b, 0);
             b.poll(t);
 
@@ -5199,7 +5377,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let events_b = b.poll(now);
+        let (events_b, _) = b.poll(now);
 
         // B responds with large response
         let request_id = events_b
@@ -5219,7 +5397,7 @@ mod tests {
         for _ in 0..500 {
             t += std::time::Duration::from_secs(10); // Very slow: ~47 bytes/s per part
             transfer(&mut b, 0, &mut a, 0);
-            let events_a = a.poll(t);
+            let (events_a, _) = a.poll(t);
             transfer(&mut a, 0, &mut b, 0);
             b.poll(t);
 
@@ -5279,7 +5457,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let events_b = b.poll(now);
+        let (events_b, _) = b.poll(now);
 
         // B responds with large response
         let request_id = events_b
@@ -5307,7 +5485,7 @@ mod tests {
             }
 
             transfer(&mut b, 0, &mut a, 0);
-            let events_a = a.poll(t);
+            let (events_a, _) = a.poll(t);
             transfer(&mut a, 0, &mut b, 0);
             b.poll(t);
 
@@ -5372,7 +5550,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let events_b = b.poll(now);
+        let (events_b, _) = b.poll(now);
 
         // B responds with large response
         let request_id = events_b
@@ -5393,7 +5571,7 @@ mod tests {
         for _ in 0..1000 {
             t += std::time::Duration::from_millis(1);
             transfer(&mut b, 0, &mut a, 0);
-            let events_a = a.poll(t);
+            let (events_a, _) = a.poll(t);
             transfer(&mut a, 0, &mut b, 0);
             b.poll(t);
 
@@ -5493,7 +5671,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"req");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let events_b = b.poll(now);
+        let (events_b, _) = b.poll(now);
 
         // B responds with large response
         let request_id = events_b
@@ -5573,7 +5751,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"req");
         a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
-        let events_b = b.poll(later);
+        let (events_b, _) = b.poll(later);
 
         // B responds
         let request_id = events_b
@@ -5632,7 +5810,7 @@ mod tests {
             a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"ping");
             a.poll(t);
             transfer(&mut a, 0, &mut b, 0);
-            let events_b = b.poll(t);
+            let (events_b, _) = b.poll(t);
 
             // B responds
             let request_id = events_b
@@ -5696,7 +5874,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let events = b.poll(now);
+        let (events, _) = b.poll(now);
         let req_id = events
             .iter()
             .find_map(|e| match e {
@@ -5783,7 +5961,7 @@ mod tests {
             .unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let events = b.poll(now);
+        let (events, _) = b.poll(now);
         let server_req_id = events
             .iter()
             .find_map(|e| match e {
@@ -5800,7 +5978,7 @@ mod tests {
 
         for _ in 0..100 {
             transfer(&mut b, 0, &mut a, 0);
-            let events = a.poll(now);
+            let (events, _) = a.poll(now);
 
             for event in &events {
                 match event {
@@ -6058,7 +6236,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let events = b.poll(now);
+        let (events, _) = b.poll(now);
         let server_req_id = events
             .iter()
             .find_map(|e| match e {
@@ -6075,7 +6253,7 @@ mod tests {
         let mut received_data = None;
         for _ in 0..50 {
             transfer(&mut b, 0, &mut a, 0);
-            let events = a.poll(now);
+            let (events, _) = a.poll(now);
 
             for event in &events {
                 if let ServiceEvent::RequestResult {
@@ -6387,7 +6565,7 @@ mod tests {
             .unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let events = b.poll(now);
+        let (events, _) = b.poll(now);
         let server_req_id = events
             .iter()
             .find_map(|e| match e {
@@ -6410,7 +6588,7 @@ mod tests {
         for _ in 0..500 {
             t += std::time::Duration::from_millis(1);
             transfer(&mut b, 0, &mut a, 0);
-            let events = a.poll(t);
+            let (events, _) = a.poll(t);
 
             for event in &events {
                 match event {
@@ -6538,14 +6716,85 @@ mod tests {
         transfer(&mut a, 0, &mut b, 0);
         b.poll(t);
 
-        b.send_raw(addr_a, b"raw data");
+        b.send_raw(addr_a, b"raw data").unwrap();
         b.poll(t);
 
         transfer(&mut b, 0, &mut a, 0);
-        let events = a.poll(t);
+        let (events, _) = a.poll(t);
 
         let raw_received = events.iter().any(|e| matches!(e, ServiceEvent::Raw { .. }));
         assert!(raw_received);
+    }
+
+    #[test]
+    fn ratchet_announce_and_decrypt() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("server", &[], &id(0));
+        let addr_a = a.service_address(svc_a).unwrap();
+        let t = Instant::now();
+
+        // Enable ratchets and announce
+        a.enable_ratchets(svc_a, std::time::Duration::from_secs(3600), None, t);
+        a.announce(svc_a);
+        a.poll(t);
+
+        // B receives announce and stores ratchet
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(t);
+
+        // Verify B has the ratchet key
+        let path_entry = b.path_table.get(&addr_a).unwrap();
+        assert!(path_entry.ratchet_key.is_some());
+        assert!(path_entry.has_ratchet);
+
+        // B sends raw data (will be encrypted with ratchet)
+        b.send_raw(addr_a, b"ratchet encrypted").unwrap();
+        b.poll(t);
+
+        // A receives and decrypts using ratchet
+        transfer(&mut b, 0, &mut a, 0);
+        let (events, _) = a.poll(t);
+
+        let data_received = events.iter().find_map(|e| match e {
+            ServiceEvent::Raw { data, .. } => Some(data.clone()),
+            _ => None,
+        });
+        assert_eq!(data_received, Some(b"ratchet encrypted".to_vec()));
+    }
+
+    #[test]
+    fn ratchet_persistence_roundtrip() {
+        let mut a = test_node(true);
+        a.add_interface(test_interface());
+
+        let svc_a = a.add_service("server", &[], &id(0));
+        let t = Instant::now();
+
+        // Enable ratchets (generates first one)
+        a.enable_ratchets(svc_a, std::time::Duration::from_secs(3600), None, t);
+
+        // Export ratchets
+        let exported = a.export_ratchets(svc_a).unwrap();
+        assert_eq!(exported.len(), 1);
+
+        // Simulate restart - create new node and load ratchets
+        let mut a2 = test_node(true);
+        a2.add_interface(test_interface());
+        let svc_a2 = a2.add_service("server", &[], &id(0));
+        a2.enable_ratchets(
+            svc_a2,
+            std::time::Duration::from_secs(3600),
+            Some(exported.clone()),
+            t,
+        );
+
+        // Verify loaded ratchets match
+        let reloaded = a2.export_ratchets(svc_a2).unwrap();
+        assert_eq!(exported, reloaded);
     }
 
     #[test]
@@ -6687,7 +6936,7 @@ mod tests {
         b.link_request(handle, "/test", b"hello", t);
         b.poll(t);
         transfer(&mut b, 0, &mut a, 0);
-        let events_a = a.poll(t);
+        let (events_a, _) = a.poll(t);
 
         let request_event = events_a
             .iter()
@@ -6760,7 +7009,7 @@ mod tests {
         transfer(&mut b, 1, &mut c, 0);
         c.poll(t2);
         transfer(&mut c, 1, &mut d, 0);
-        let events = d.poll(t2);
+        let (events, _) = d.poll(t2);
 
         let raw_events: Vec<_> = events
             .iter()
@@ -6816,7 +7065,7 @@ mod tests {
         transfer(&mut a, 0, &mut b, 0);
         b.poll(t1);
         transfer(&mut b, 1, &mut c, 0);
-        let events_c = c.poll(t1);
+        let (events_c, _) = c.poll(t1);
 
         let data_c: Vec<_> = events_c
             .iter()
@@ -6836,7 +7085,7 @@ mod tests {
         b.poll(t1);
         transfer(&mut b, 0, &mut a, 0);
 
-        let events_a = a.poll(t1);
+        let (events_a, _) = a.poll(t1);
 
         let data_a: Vec<_> = events_a
             .iter()
@@ -6982,7 +7231,7 @@ mod tests {
         let request_id = a.link_request(handle, "/test", b"request", t).unwrap();
         a.poll(t);
         transfer(&mut a, 0, &mut b, 0);
-        let events_b = b.poll(t);
+        let (events_b, _) = b.poll(t);
 
         let req_event = events_b
             .iter()
@@ -7001,7 +7250,7 @@ mod tests {
 
         b.poll(t);
         transfer(&mut b, 0, &mut a, 0);
-        let events_a = a.poll(t);
+        let (events_a, _) = a.poll(t);
 
         let result_event = events_a.iter().find(|e| {
             matches!(
@@ -7511,7 +7760,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"req");
         a.poll(t);
         transfer(&mut a, 0, &mut b, 0);
-        let events_b = b.poll(t);
+        let (events_b, _) = b.poll(t);
 
         let request_id = events_b
             .iter()
@@ -7663,7 +7912,7 @@ mod tests {
         assert!(stats_after.packets_relayed > stats_before.packets_relayed);
 
         transfer(&mut b, 1, &mut c, 0);
-        let events = c.poll(t1);
+        let (events, _) = c.poll(t1);
 
         let has_raw = events.iter().any(|e| matches!(e, ServiceEvent::Raw { .. }));
         assert!(has_raw);
@@ -7686,7 +7935,7 @@ mod tests {
         assert!(a.pending_path_requests.contains_key(&unknown_dest));
 
         let timeout = t + std::time::Duration::from_secs(61);
-        let events = a.poll(timeout);
+        let (events, _) = a.poll(timeout);
 
         assert!(!a.pending_path_requests.contains_key(&unknown_dest));
 
@@ -7807,7 +8056,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"req");
         a.poll(t);
         transfer(&mut a, 0, &mut b, 0);
-        let events_b = b.poll(t);
+        let (events_b, _) = b.poll(t);
 
         let request_id = events_b
             .iter()
@@ -7824,7 +8073,7 @@ mod tests {
         let mut received_data = None;
         for _ in 0..500 {
             transfer(&mut b, 0, &mut a, 0);
-            let events_a = a.poll(t);
+            let (events_a, _) = a.poll(t);
             transfer(&mut a, 0, &mut b, 0);
             b.poll(t);
 
@@ -7876,7 +8125,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"req");
         a.poll(t);
         transfer(&mut a, 0, &mut b, 0);
-        let events_b = b.poll(t);
+        let (events_b, _) = b.poll(t);
 
         let request_id = events_b
             .iter()
@@ -8028,7 +8277,7 @@ mod tests {
         client.request(svc_client, crate::LinkHandle(link_id), "test", b"req");
         client.poll(now);
         transfer(&mut client, 0, &mut server, 0);
-        let events = server.poll(now);
+        let (events, _) = server.poll(now);
         let req_id = events
             .iter()
             .find_map(|e| match e {
@@ -8045,7 +8294,7 @@ mod tests {
         client.request(svc_client, crate::LinkHandle(link_id), "test", b"req2");
         client.poll(now);
         transfer(&mut client, 0, &mut server, 0);
-        let events = server.poll(now);
+        let (events, _) = server.poll(now);
         let req_id = events
             .iter()
             .find_map(|e| match e {
@@ -8254,5 +8503,78 @@ mod tests {
             !b.interfaces[0].transport.outbox.is_empty(),
             "b should respond to unencrypted keepalive request"
         );
+    }
+
+    #[test]
+    fn app_encrypt_decrypt_roundtrip() {
+        let mut a = test_node(false);
+        let mut b = test_node(false);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let _svc_a = a.add_service("sender", &[], &id(0));
+        let svc_b = b.add_service("receiver", &[], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let t = Instant::now();
+
+        // B announces so A learns B's encryption key
+        b.announce(svc_b);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        // A encrypts for B at application layer
+        let plaintext = b"secret message for offline delivery";
+        let encrypted = a
+            .app_encrypt_for(addr_b, plaintext)
+            .expect("should encrypt for known destination");
+
+        assert!(encrypted.len() > plaintext.len());
+        assert_ne!(&encrypted[32..], plaintext);
+
+        // B decrypts using their service key
+        let decrypted = b
+            .app_decrypt_as(svc_b, &encrypted)
+            .expect("should decrypt for own service");
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn app_encrypt_fails_for_unknown_destination() {
+        let mut a = test_node(false);
+        a.add_interface(test_interface());
+        let _svc_a = a.add_service("sender", &[], &id(0));
+
+        let unknown_addr = [0xFFu8; 16];
+        let result = a.app_encrypt_for(unknown_addr, b"test");
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn app_decrypt_fails_for_wrong_service() {
+        let mut a = test_node(false);
+        let mut b = test_node(false);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("sender", &[], &id(0));
+        let svc_b = b.add_service("receiver", &[], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let t = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(t);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(t);
+
+        let encrypted = a
+            .app_encrypt_for(addr_b, b"secret")
+            .expect("should encrypt");
+
+        // Try to decrypt with wrong service (A's service, not B's)
+        let result = a.app_decrypt_as(svc_a, &encrypted);
+        assert!(result.is_none());
     }
 }

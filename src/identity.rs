@@ -64,6 +64,10 @@ impl Identity {
     pub(crate) fn hash(&self) -> [u8; 16] {
         sha256(&self.public_key())[..16].try_into().unwrap()
     }
+
+    pub fn signing_key(&self) -> &SigningKey {
+        &self.signing_key
+    }
 }
 
 impl Clone for Identity {
@@ -75,8 +79,8 @@ impl Clone for Identity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     #[test]
     fn roundtrip_bytes() {

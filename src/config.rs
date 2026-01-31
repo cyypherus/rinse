@@ -184,3 +184,48 @@ pub fn save_identity(identity: &Identity) -> Result<(), ConfigError> {
     fs::write(path, hex_str)?;
     Ok(())
 }
+
+pub fn ratchets_path(service_address: &[u8; 16]) -> PathBuf {
+    data_dir()
+        .join("ratchets")
+        .join(hex::encode(service_address))
+}
+
+pub fn load_ratchets(service_address: &[u8; 16]) -> Result<Vec<[u8; 32]>, ConfigError> {
+    let path = ratchets_path(service_address);
+
+    if path.exists() {
+        let contents = fs::read_to_string(&path)?;
+        let mut ratchets = Vec::new();
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let bytes = hex::decode(line).map_err(|_| ConfigError::InvalidIdentity)?;
+            if bytes.len() != 32 {
+                return Err(ConfigError::InvalidIdentity);
+            }
+            ratchets.push(bytes.try_into().unwrap());
+        }
+        Ok(ratchets)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+pub fn save_ratchets(service_address: &[u8; 16], ratchets: &[[u8; 32]]) -> Result<(), ConfigError> {
+    let path = ratchets_path(service_address);
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let contents: String = ratchets
+        .iter()
+        .map(hex::encode)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(path, contents)?;
+    Ok(())
+}
