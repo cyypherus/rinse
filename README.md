@@ -78,3 +78,12 @@ cargo run --bin rinse-relay --features relay,tcp
 > [!NOTE]
 > From the original reticulum implementation:
 > "Reticulum is relatively young software, and should be considered as such. While it has been built with cryptography best-practices very foremost in mind, it has not been externally security audited, and there could very well be privacy or security breaking bugs."
+
+# Contributing
+By submitting a contribution, you agree that it will be licensed under the project’s license.
+
+# License Info 
+## This information is for convenience only and does not grant any rights or warranty, please see the [license file](LICENSE.md) for the official terms.
+This project is licensed to allow individuals and small businesses to use, modify, and sell software built on it. Larger organizations may not qualify under the license terms.
+
+> Why not MIT? Open source software cannot depend on the goodwill or ethics of thoughtless profit-optimizing machines. Maintainers of modern technology's cornerstones should never have to beg for sponsorship. Billionaires & megacorporations do not need free labor. I reject the [billionaire sponsored](https://opensource.org/sponsors) definition of open source.
