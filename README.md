@@ -7,7 +7,7 @@
 </div>
 
 > [!NOTE]
-> `rinse` implements the core Reticulum networking primitives: nodes, links, announces, path discovery, and request/response
+> `rinse` implements a functional subset of core Reticulum networking features
 >
 > `rinse` does not provide a CLI or daemon - it's primarily a library for building Reticulum applications
 
@@ -19,7 +19,7 @@ The reference implementation is [Reticulum](https://github.com/markqvist/Reticul
 
 # Features
 
-- `default` - core node implementation with no transport
+- `tokio` - async node api
 - `tcp` - TCP transport using HDLC framing
 - `config` - TOML configuration file support
 - `relay` - feature gate for the relay binary dependencies
@@ -76,8 +76,14 @@ cargo run --bin rinse-relay --features relay,tcp
 ```
 
 > [!NOTE]
-> From the original reticulum implementation:
-> "Reticulum is relatively young software, and should be considered as such. While it has been built with cryptography best-practices very foremost in mind, it has not been externally security audited, and there could very well be privacy or security breaking bugs."
+>
+> - As many recent projects are, rinse was written with the assistance of LLMs, with very close guidance & review in terms of architecture, testing, & adherence to the original implementation.
+>
+> - The API is very much in flux & there won't be significant effort towards stability at this stage.
+>
+> - This repo doesn't implement every single feature the original python implementation contains (there are a lot of features in the original), but the implemented core features are interoperable with other reticulum nodes.
+> 
+> - From the original repo's readme: "Reticulum is relatively young software, and should be considered as such. While it has been built with cryptography best-practices very foremost in mind, it has not been externally security audited, and there could very well be privacy or security breaking bugs."
 
 # Contributing
 By submitting a contribution, you agree that it will be licensed under the project’s license.
