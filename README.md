@@ -91,5 +91,3 @@ By submitting a contribution, you agree that it will be licensed under the proje
 # License Info 
 ## This information is for convenience only and does not grant any rights or warranty, please see the [license file](LICENSE.md) for the official terms.
 This project is licensed to allow individuals and small businesses to use, modify, and sell software built on it. Larger organizations may not qualify under the license terms.
-
-> Why not MIT? Open source software cannot depend on the goodwill or ethics of thoughtless profit-optimizing machines. Maintainers of modern technology's cornerstones should never have to beg for sponsorship. Billionaires & megacorporations do not need free labor. I reject the [billionaire sponsored](https://opensource.org/sponsors) definition of open source.
