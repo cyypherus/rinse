@@ -1,3 +1,5 @@
+#![cfg(feature = "tcp")]
+
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};

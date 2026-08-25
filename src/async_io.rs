@@ -6,12 +6,13 @@ use std::time::{Duration, Instant};
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot, watch};
+use tokio::sync::{Mutex as TokioMutex, Notify, mpsc, oneshot, watch};
 
 use crate::handle::{
     Destination, IncomingRequest, LinkError, RequestError, ResourceError, RespondError, Response,
     ServiceEvent, ServiceId,
 };
+use crate::node::PreparedInbound;
 use crate::packet::Address;
 use crate::request::RequestId;
 use crate::stats::StatsSnapshot;
@@ -33,6 +34,54 @@ fn hdlc_frame(data: &[u8]) -> Vec<u8> {
     result.extend(escaped);
     result.push(HDLC_FLAG);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packet::{LinkContext, LinkDataDestination, Packet};
+
+    struct TestTransport;
+
+    impl Transport for TestTransport {
+        fn send(&mut self, _: &[u8]) {}
+
+        fn recv(&mut self) -> Option<Vec<u8>> {
+            None
+        }
+
+        fn bandwidth_available(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parallel_packet_preparation_preserves_input_order() {
+        let packets: Vec<_> = (0..128)
+            .map(|index| Packet::LinkData {
+                hops: 0,
+                destination: LinkDataDestination::Direct([index as u8; 16]),
+                context: LinkContext::Resource,
+                data: vec![index as u8; 512],
+            })
+            .collect();
+        let raw = packets
+            .iter()
+            .enumerate()
+            .map(|(index, packet)| (packet.to_bytes(), index))
+            .collect();
+
+        let prepared = Node::<TestTransport>::prepare_received(raw).await;
+
+        assert_eq!(prepared.len(), packets.len());
+        for (index, (prepared, expected)) in prepared.into_iter().zip(packets).enumerate() {
+            let expected_hash = expected.packet_hash();
+            let (packet, packet_hash, _, source) = prepared.into_parts();
+            assert_eq!(source, index);
+            assert_eq!(packet_hash, expected_hash);
+            assert_eq!(packet, expected);
+        }
+    }
 }
 
 #[cfg(feature = "tcp")]
@@ -73,6 +122,8 @@ pub struct AsyncTcpTransport {
     outbox: Outbox,
     connected: Arc<StdMutex<bool>>,
     shutdown_tx: Option<mpsc::Sender<()>>,
+    io_task: Option<tokio::task::JoinHandle<()>>,
+    inbound_notifier: Arc<StdMutex<Option<Arc<Notify>>>>,
 }
 
 #[cfg(feature = "tcp")]
@@ -88,12 +139,14 @@ impl AsyncTcpTransport {
         let outbox: Outbox = Arc::new(StdMutex::new(VecDeque::new()));
         let connected = Arc::new(StdMutex::new(true));
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let inbound_notifier = Arc::new(StdMutex::new(None));
 
-        tokio::spawn(tcp_io_task(
+        let io_task = tokio::spawn(tcp_io_task(
             stream,
             inbox.clone(),
             outbox.clone(),
             connected.clone(),
+            inbound_notifier.clone(),
             shutdown_rx,
         ));
 
@@ -103,12 +156,19 @@ impl AsyncTcpTransport {
             outbox,
             connected,
             shutdown_tx: Some(shutdown_tx),
+            io_task: Some(io_task),
+            inbound_notifier,
         })
     }
 
     pub async fn reconnect(&mut self) -> std::io::Result<()> {
         if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(()).await;
+            match tx.send(()).await {
+                Ok(()) | Err(_) => {}
+            }
+        }
+        if let Some(io_task) = self.io_task.take() {
+            io_task.await.map_err(std::io::Error::other)?;
         }
 
         let stream = TcpStream::connect(&self.addr).await?;
@@ -121,15 +181,25 @@ impl AsyncTcpTransport {
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         self.shutdown_tx = Some(shutdown_tx);
 
-        tokio::spawn(tcp_io_task(
+        self.io_task = Some(tokio::spawn(tcp_io_task(
             stream,
             self.inbox.clone(),
             self.outbox.clone(),
             self.connected.clone(),
+            self.inbound_notifier.clone(),
             shutdown_rx,
-        ));
+        )));
 
         Ok(())
+    }
+}
+
+#[cfg(feature = "tcp")]
+impl Drop for AsyncTcpTransport {
+    fn drop(&mut self) {
+        if let Some(io_task) = self.io_task.take() {
+            io_task.abort();
+        }
     }
 }
 
@@ -150,6 +220,10 @@ impl Transport for AsyncTcpTransport {
     fn is_connected(&self) -> bool {
         *self.connected.lock().unwrap()
     }
+
+    fn set_inbound_notifier(&mut self, notifier: Arc<Notify>) {
+        *self.inbound_notifier.lock().unwrap() = Some(notifier);
+    }
 }
 
 #[cfg(feature = "tcp")]
@@ -158,6 +232,7 @@ async fn tcp_io_task(
     inbox: Inbox,
     outbox: Outbox,
     connected: Arc<StdMutex<bool>>,
+    inbound_notifier: Arc<StdMutex<Option<Arc<Notify>>>>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
     let (mut reader, mut writer) = stream.into_split();
@@ -174,6 +249,9 @@ async fn tcp_io_task(
                     hdlc_buf.extend_from_slice(&buf[..n]);
                     while let Some(frame) = hdlc_extract_frame(&mut hdlc_buf) {
                         inbox_clone.lock().unwrap().push_back(frame);
+                        if let Some(notifier) = inbound_notifier.lock().unwrap().as_ref() {
+                            notifier.notify_one();
+                        }
                     }
                 }
                 Err(_) => break,
@@ -297,16 +375,9 @@ enum Command<T: Transport> {
     },
     SendBuffer {
         link: crate::LinkHandle,
-        stream_id: u16,
-        data: Vec<u8>,
-        eof: bool,
+        raw: Vec<u8>,
+        processed: usize,
         reply: oneshot::Sender<Result<usize, crate::BufferError>>,
-    },
-    GetDestinations {
-        reply: oneshot::Sender<Vec<Destination>>,
-    },
-    GetStats {
-        reply: oneshot::Sender<StatsSnapshot>,
     },
     CreateLink {
         service: ServiceId,
@@ -365,53 +436,67 @@ enum Command<T: Transport> {
     },
 }
 
-struct AsyncNodeInner<T: Transport> {
-    node: crate::node::Node<T, StdRng>,
+struct Runtime<T: Transport> {
+    protocol: crate::node::Protocol<T, StdRng>,
     command_rx: mpsc::UnboundedReceiver<Command<T>>,
     link_waiters: LinkWaiters,
     path_waiters: PathWaiters,
+    destinations_changed_tx: watch::Sender<()>,
+    destinations_tx: watch::Sender<Vec<Destination>>,
+    stats_tx: watch::Sender<StatsSnapshot>,
+    inbound_ready: Arc<Notify>,
 }
 
-pub struct AsyncNode<T: Transport> {
+pub struct Node<T: Transport> {
     services: Arc<StdMutex<HashMap<ServiceId, ServiceChannels>>>,
     service_addresses: Arc<StdMutex<HashMap<ServiceId, Address>>>,
     command_tx: mpsc::UnboundedSender<Command<T>>,
     destinations_changed_rx: watch::Receiver<()>,
-    inner: Option<(AsyncNodeInner<T>, watch::Sender<()>)>,
+    destinations_rx: watch::Receiver<Vec<Destination>>,
+    stats_rx: watch::Receiver<StatsSnapshot>,
+    inner: Option<Runtime<T>>,
 }
 
-impl<T: Transport> Clone for AsyncNode<T> {
+impl<T: Transport> Clone for Node<T> {
     fn clone(&self) -> Self {
         Self {
             services: self.services.clone(),
             service_addresses: self.service_addresses.clone(),
             command_tx: self.command_tx.clone(),
             destinations_changed_rx: self.destinations_changed_rx.clone(),
+            destinations_rx: self.destinations_rx.clone(),
+            stats_rx: self.stats_rx.clone(),
             inner: None,
         }
     }
 }
 
-impl<T: Transport> AsyncNode<T> {
+impl<T: Transport> Node<T> {
     pub fn new(transport: bool) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (destinations_tx, destinations_rx) = watch::channel(());
+        let (destinations_changed_tx, destinations_changed_rx) = watch::channel(());
+        let (destinations_tx, destinations_rx) = watch::channel(Vec::new());
+        let (stats_tx, stats_rx) = watch::channel(StatsSnapshot::default());
+        let inbound_ready = Arc::new(Notify::new());
         let rng = StdRng::from_entropy();
 
         Self {
             services: Arc::new(StdMutex::new(HashMap::new())),
             service_addresses: Arc::new(StdMutex::new(HashMap::new())),
             command_tx,
-            destinations_changed_rx: destinations_rx,
-            inner: Some((
-                AsyncNodeInner {
-                    node: crate::node::Node::with_rng(rng, transport),
-                    command_rx,
-                    link_waiters: HashMap::new(),
-                    path_waiters: HashMap::new(),
-                },
+            destinations_changed_rx,
+            destinations_rx,
+            stats_rx,
+            inner: Some(Runtime {
+                protocol: crate::node::Protocol::with_rng(rng, transport),
+                command_rx,
+                link_waiters: HashMap::new(),
+                path_waiters: HashMap::new(),
+                destinations_changed_tx,
                 destinations_tx,
-            )),
+                stats_tx,
+                inbound_ready,
+            }),
         }
     }
 
@@ -422,10 +507,10 @@ impl<T: Transport> AsyncNode<T> {
     }
 
     pub fn add_service(&mut self, name: &str, paths: &[&str], identity: &Identity) -> ServiceId {
-        let (inner, _) = self
+        let inner = self
             .inner
             .as_mut()
-            .expect("add_service requires the original AsyncNode");
+            .expect("add_service requires the original Node");
 
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let (raw_tx, raw_rx) = mpsc::unbounded_channel();
@@ -436,8 +521,8 @@ impl<T: Transport> AsyncNode<T> {
         let request_waiters: RequestWaiters = Arc::new(StdMutex::new(HashMap::new()));
         let respond_waiters: RespondWaiters = Arc::new(StdMutex::new(HashMap::new()));
 
-        let service_id = inner.node.add_service(name, paths, identity);
-        let address = inner.node.service_address(service_id).unwrap();
+        let service_id = inner.protocol.add_service(name, paths, identity);
+        let address = inner.protocol.service_address(service_id).unwrap();
 
         self.services.lock().unwrap().insert(
             service_id,
@@ -568,12 +653,19 @@ impl<T: Transport> AsyncNode<T> {
         data: &[u8],
         eof: bool,
     ) -> Result<usize, crate::BufferError> {
+        let encoded = if data.len() < 1024 {
+            crate::buffer::encode(stream_id, data, eof)?
+        } else {
+            let data = data.to_vec();
+            tokio::task::spawn_blocking(move || crate::buffer::encode(stream_id, &data, eof))
+                .await
+                .map_err(|_| crate::BufferError::DecompressionFailed)??
+        };
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.command_tx.send(Command::SendBuffer {
             link,
-            stream_id,
-            data: data.to_vec(),
-            eof,
+            raw: encoded.0,
+            processed: encoded.1,
             reply: reply_tx,
         });
         reply_rx.await.unwrap_or(Err(crate::BufferError::Channel(
@@ -595,17 +687,11 @@ impl<T: Transport> AsyncNode<T> {
     }
 
     pub async fn known_destinations(&self) -> Vec<Destination> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self
-            .command_tx
-            .send(Command::GetDestinations { reply: reply_tx });
-        reply_rx.await.unwrap_or_else(|_| Vec::new())
+        self.destinations_rx.borrow().clone()
     }
 
     pub async fn stats(&self) -> StatsSnapshot {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.command_tx.send(Command::GetStats { reply: reply_tx });
-        reply_rx.await.unwrap_or_default()
+        self.stats_rx.borrow().clone()
     }
 
     pub async fn request(
@@ -887,8 +973,8 @@ impl<T: Transport> AsyncNode<T> {
     }
 
     pub async fn run(mut self) {
-        let Some((mut inner, destinations_tx)) = self.inner.take() else {
-            panic!("run() can only be called on the original AsyncNode, not a clone");
+        let Some(mut inner) = self.inner.take() else {
+            panic!("run() can only be called on the original Node, not a clone");
         };
 
         let mut next_wake: Option<Instant> = None;
@@ -903,21 +989,23 @@ impl<T: Transport> AsyncNode<T> {
             tokio::select! {
                 biased;
                 Some(cmd) = inner.command_rx.recv() => {
-                    Self::handle_command(&mut inner, &self.services, &destinations_tx, cmd, Instant::now());
+                    Self::handle_command(&mut inner, cmd, Instant::now());
                 }
+                _ = inner.inbound_ready.notified() => {}
                 _ = tokio::time::sleep(sleep_duration) => {}
             }
-            next_wake = Self::poll(&mut inner, &self.services, &destinations_tx);
+            next_wake = Self::poll(&mut inner, &self.services).await;
         }
     }
 
-    fn poll(
-        inner: &mut AsyncNodeInner<T>,
+    async fn poll(
+        inner: &mut Runtime<T>,
         services: &Arc<StdMutex<HashMap<ServiceId, ServiceChannels>>>,
-        destinations_tx: &watch::Sender<()>,
     ) -> Option<Instant> {
         let now = Instant::now();
-        let (events, next_wake) = inner.node.poll(now);
+        let received = inner.protocol.drain_received();
+        let received = Self::prepare_received(received).await;
+        let (events, next_wake) = inner.protocol.poll_prepared(now, received);
 
         for event in &events {
             if let ServiceEvent::PathRequestResult { destination, found } = event
@@ -929,10 +1017,19 @@ impl<T: Transport> AsyncNode<T> {
             }
         }
 
-        Self::dispatch_events(services, destinations_tx, events);
+        let destinations_changed = events
+            .iter()
+            .any(|event| matches!(event, ServiceEvent::DestinationsChanged));
+        Self::dispatch_events(services, &inner.destinations_changed_tx, events);
+        if destinations_changed {
+            inner
+                .destinations_tx
+                .send_replace(inner.protocol.known_destinations());
+        }
+        inner.stats_tx.send_replace(inner.protocol.stats());
 
         inner.link_waiters.retain(|link, waiters| {
-            let status = inner.node.link_status(*link);
+            let status = inner.protocol.link_status(*link);
             if status == crate::LinkStatus::Active {
                 for tx in waiters.drain(..) {
                     let _ = tx.send(Ok(()));
@@ -949,6 +1046,48 @@ impl<T: Transport> AsyncNode<T> {
         });
 
         next_wake
+    }
+
+    async fn prepare_received(received: Vec<(Vec<u8>, usize)>) -> Vec<PreparedInbound> {
+        if received.len() < 32
+            || received.iter().map(|(raw, _)| raw.len()).sum::<usize>() / received.len() < 256
+        {
+            return received
+                .into_iter()
+                .filter_map(|(raw, source)| PreparedInbound::parse(raw, source))
+                .collect();
+        }
+
+        let workers = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .min(received.len());
+        let chunk_size = received.len().div_ceil(workers);
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut chunks: Vec<Vec<_>> = (0..workers)
+            .map(|_| Vec::with_capacity(chunk_size))
+            .collect();
+        for (index, item) in received.into_iter().enumerate() {
+            chunks[index / chunk_size].push((index, item));
+        }
+        for chunk in chunks.into_iter().filter(|chunk| !chunk.is_empty()) {
+            tasks.spawn_blocking(move || {
+                chunk
+                    .into_iter()
+                    .filter_map(|(index, (raw, source))| {
+                        PreparedInbound::parse(raw, source).map(|packet| (index, packet))
+                    })
+                    .collect::<Vec<_>>()
+            });
+        }
+
+        let mut prepared = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            let mut chunk = result.expect("packet preparation task failed");
+            prepared.append(&mut chunk);
+        }
+        prepared.sort_unstable_by_key(|(index, _)| *index);
+        prepared.into_iter().map(|(_, packet)| packet).collect()
     }
 
     fn dispatch_events(
@@ -1057,22 +1196,17 @@ impl<T: Transport> AsyncNode<T> {
         }
     }
 
-    fn handle_command(
-        inner: &mut AsyncNodeInner<T>,
-        services: &Arc<StdMutex<HashMap<ServiceId, ServiceChannels>>>,
-        destinations_tx: &watch::Sender<()>,
-        cmd: Command<T>,
-        now: Instant,
-    ) {
+    fn handle_command(inner: &mut Runtime<T>, cmd: Command<T>, now: Instant) {
         match cmd {
-            Command::AddInterface { interface } => {
-                inner.node.add_interface(*interface);
+            Command::AddInterface { mut interface } => {
+                interface.set_inbound_notifier(inner.inbound_ready.clone());
+                inner.protocol.add_interface(*interface);
             }
             Command::Announce { service, app_data } => {
                 if let Some(data) = app_data {
-                    inner.node.announce_with_app_data(service, Some(data));
+                    inner.protocol.announce_with_app_data(service, Some(data));
                 } else {
-                    inner.node.announce(service);
+                    inner.protocol.announce(service);
                 }
             }
             Command::EnableRatchets {
@@ -1081,11 +1215,11 @@ impl<T: Transport> AsyncNode<T> {
                 existing_ratchets,
             } => {
                 inner
-                    .node
+                    .protocol
                     .enable_ratchets(service, interval, existing_ratchets, now);
             }
             Command::ExportRatchets { service, reply } => {
-                let _ = reply.send(inner.node.export_ratchets(service));
+                let _ = reply.send(inner.protocol.export_ratchets(service));
             }
             Command::Request {
                 service,
@@ -1094,7 +1228,7 @@ impl<T: Transport> AsyncNode<T> {
                 data,
                 reply,
             } => {
-                if let Some(request_id) = inner.node.request(service, link, &path, &data) {
+                if let Some(request_id) = inner.protocol.request(service, link, &path, &data) {
                     let _ = reply.send(request_id);
                 }
             }
@@ -1105,55 +1239,54 @@ impl<T: Transport> AsyncNode<T> {
                 compress,
             } => {
                 inner
-                    .node
+                    .protocol
                     .respond(request_id, &data, metadata.as_deref(), compress);
             }
             Command::SendRaw { dest, data, reply } => {
-                let _ = reply.send(inner.node.send_raw(dest, &data));
+                let _ = reply.send(inner.protocol.send_raw(dest, &data));
             }
             Command::SendLinkData { link, data } => {
-                inner.node.send_link_data(link, &data);
+                inner.protocol.send_link_data(link, &data);
             }
             Command::SendChannel {
                 link,
                 message,
                 reply,
             } => {
-                let _ = reply.send(inner.node.send_channel(link, message));
+                let _ = reply.send(inner.protocol.send_channel(link, message));
             }
             Command::SendBuffer {
                 link,
-                stream_id,
-                data,
-                eof,
+                raw,
+                processed,
                 reply,
             } => {
-                let _ = reply.send(inner.node.send_buffer(link, stream_id, &data, eof));
-            }
-            Command::GetDestinations { reply } => {
-                let _ = reply.send(inner.node.known_destinations());
-            }
-            Command::GetStats { reply } => {
-                let _ = reply.send(inner.node.stats());
+                let _ = reply.send(
+                    inner
+                        .protocol
+                        .send_buffer_data(link, &raw)
+                        .map(|()| processed)
+                        .map_err(crate::BufferError::from),
+                );
             }
             Command::CreateLink {
                 service,
                 destination,
                 reply,
             } => {
-                let _ = reply.send(inner.node.create_link(service, destination, now));
+                let _ = reply.send(inner.protocol.create_link(service, destination, now));
             }
             Command::LinkStatus { link, reply } => {
-                let _ = reply.send(inner.node.link_status(link));
+                let _ = reply.send(inner.protocol.link_status(link));
             }
             Command::LinkRtt { link, reply } => {
-                let _ = reply.send(inner.node.link_rtt(link));
+                let _ = reply.send(inner.protocol.link_rtt(link));
             }
             Command::CloseLink { link } => {
-                inner.node.close_link(link);
+                inner.protocol.close_link(link);
             }
             Command::SelfIdentify { link, identity } => {
-                inner.node.self_identify(link, &identity);
+                inner.protocol.self_identify(link, &identity);
             }
             Command::LinkRequest {
                 link,
@@ -1161,7 +1294,7 @@ impl<T: Transport> AsyncNode<T> {
                 data,
                 reply,
             } => {
-                let _ = reply.send(inner.node.link_request(link, &path, &data, now));
+                let _ = reply.send(inner.protocol.link_request(link, &path, &data, now));
             }
             Command::AdvertiseResource {
                 link,
@@ -1172,24 +1305,24 @@ impl<T: Transport> AsyncNode<T> {
             } => {
                 let _ = reply.send(
                     inner
-                        .node
+                        .protocol
                         .advertise_resource(link, data, metadata, compress),
                 );
             }
             Command::AwaitLinkActive { link, reply } => {
-                if inner.node.link_status(link) == crate::LinkStatus::Active {
+                if inner.protocol.link_status(link) == crate::LinkStatus::Active {
                     let _ = reply.send(Ok(()));
-                } else if inner.node.link_status(link) == crate::LinkStatus::Closed {
+                } else if inner.protocol.link_status(link) == crate::LinkStatus::Closed {
                     let _ = reply.send(Err(LinkError::Timeout));
                 } else {
                     inner.link_waiters.entry(link).or_default().push(reply);
                 }
             }
             Command::RequestPath { destination, reply } => {
-                if inner.node.has_path(destination) {
+                if inner.protocol.has_path(destination) {
                     let _ = reply.send(true);
                 } else {
-                    inner.node.request_path(destination, now);
+                    inner.protocol.request_path(destination, now);
                     inner
                         .path_waiters
                         .entry(destination)
@@ -1201,23 +1334,22 @@ impl<T: Transport> AsyncNode<T> {
                 service,
                 packet_data,
             } => {
-                inner.node.prove_packet(service, &packet_data);
+                inner.protocol.prove_packet(service, &packet_data);
             }
             Command::AppEncryptFor {
                 destination,
                 data,
                 reply,
             } => {
-                let _ = reply.send(inner.node.app_encrypt_for(destination, &data));
+                let _ = reply.send(inner.protocol.app_encrypt_for(destination, &data));
             }
             Command::AppDecryptAs {
                 service,
                 data,
                 reply,
             } => {
-                let _ = reply.send(inner.node.app_decrypt_as(service, &data));
+                let _ = reply.send(inner.protocol.app_decrypt_as(service, &data));
             }
         }
-        Self::poll(inner, services, destinations_tx);
     }
 }

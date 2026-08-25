@@ -5,8 +5,7 @@ edition = "2024"
 
 [features]
 default = []
-tokio = ["dep:tokio"]
-tcp = ["tokio"]
+tcp = []
 config = ["dep:toml"]
 relay = ["config", "dep:serde_json", "dep:simplelog", "dep:ratatui", "dep:crossterm"]
 
@@ -26,7 +25,7 @@ serde_bytes = "0.11"
 sha2 = "0.10.9"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 bzip2 = "0.5"
-tokio = { version = "1", features = ["sync", "time", "io-util", "net", "rt", "rt-multi-thread", "macros", "fs", "signal"], optional = true }
+tokio = { version = "1", features = ["sync", "time", "io-util", "net", "rt", "rt-multi-thread", "macros", "fs", "signal"] }
 env_logger = "0.11"
 toml = { version = "0.8", optional = true }
 
@@ -52,6 +51,10 @@ required-features = ["config", "tcp"]
 [[example]]
 name = "page"
 required-features = ["config", "tcp"]
+
+[[bench]]
+name = "throughput"
+harness = false
 
 [dev-dependencies]
 env_logger = "0.11"

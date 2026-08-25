@@ -18,7 +18,6 @@ mod request;
 mod resource;
 mod stats;
 
-#[cfg(feature = "tokio")]
 mod async_io;
 
 #[cfg(feature = "tcp")]
@@ -42,10 +41,7 @@ pub use request::RequestId;
 pub(crate) use request::WireRequestId;
 pub use stats::StatsSnapshot;
 
-#[cfg(feature = "tokio")]
-pub use async_io::AsyncNode as Node;
-#[cfg(not(feature = "tokio"))]
-pub use node::Node;
+pub use async_io::Node;
 
 #[cfg(feature = "tcp")]
 pub use async_io::AsyncTcpTransport as TcpTransport;

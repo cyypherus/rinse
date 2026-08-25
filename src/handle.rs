@@ -62,6 +62,7 @@ pub struct Progress {
     pub total_bytes: usize,
 }
 
+#[derive(Clone)]
 pub struct Destination {
     pub address: Address,
     pub app_data: Option<Vec<u8>>,
@@ -70,7 +71,6 @@ pub struct Destination {
     pub last_seen: Instant,
 }
 
-#[cfg_attr(not(feature = "tokio"), derive(Debug))]
 pub enum ServiceEvent {
     Request {
         service: ServiceId,

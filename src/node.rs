@@ -152,7 +152,43 @@ struct OutboundMultiSegment {
     current_segment: usize,
 }
 
-pub struct Node<T, R = ThreadRng> {
+pub(crate) struct PreparedInbound {
+    packet: Packet,
+    packet_hash: [u8; 32],
+    raw: Vec<u8>,
+    source: usize,
+}
+
+impl PreparedInbound {
+    pub(crate) fn parse(raw: Vec<u8>, source: usize) -> Option<Self> {
+        match Packet::from_bytes(&raw) {
+            Ok(packet) => {
+                let packet_hash = packet.packet_hash();
+                Some(Self {
+                    packet,
+                    packet_hash,
+                    raw,
+                    source,
+                })
+            }
+            Err(error) => {
+                log::debug!(
+                    "Failed to parse packet: {:?} raw={} (len={})",
+                    error,
+                    hex::encode(&raw[..raw.len().min(64)]),
+                    raw.len()
+                );
+                None
+            }
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (Packet, [u8; 32], Vec<u8>, usize) {
+        (self.packet, self.packet_hash, self.raw, self.source)
+    }
+}
+
+pub(crate) struct Protocol<T, R = ThreadRng> {
     transport: bool,
     max_hops: u8,
     retries: u8,
@@ -194,7 +230,7 @@ pub struct Node<T, R = ThreadRng> {
     channels: HashMap<LinkId, ChannelState>,
 }
 
-impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
+impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
     pub fn with_rng(mut rng: R, transport: bool) -> Self {
         let mut transport_id = [0u8; 16];
         rng.fill_bytes(&mut transport_id);
@@ -858,6 +894,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
         )
     }
 
+    #[cfg(test)]
     pub fn send_buffer(
         &mut self,
         link: crate::LinkHandle,
@@ -866,14 +903,22 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
         eof: bool,
     ) -> Result<usize, crate::BufferError> {
         let (raw, processed) = crate::buffer::encode(stream_id, data, eof)?;
+        self.send_buffer_data(link, &raw)?;
+        Ok(processed)
+    }
+
+    pub(crate) fn send_buffer_data(
+        &mut self,
+        link: crate::LinkHandle,
+        raw: &[u8],
+    ) -> Result<(), ChannelError> {
         self.send_channel_data(
             link.0,
             crate::buffer::STREAM_MESSAGE_TYPE,
-            &raw,
+            raw,
             true,
             Instant::now(),
-        )?;
-        Ok(processed)
+        )
     }
 
     fn send_channel_data(
@@ -1266,7 +1311,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
         Some(link_id)
     }
 
-    fn accept_packet(&self, packet: &Packet) -> bool {
+    fn accept_packet(&self, packet: &Packet, packet_hash: &[u8; 32]) -> bool {
         use crate::packet::LinkContext;
 
         if !matches!(packet, Packet::Announce { .. })
@@ -1313,8 +1358,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
         }
 
         // Duplicate detection for remaining packets
-        let packet_hash = packet.packet_hash();
-        if self.seen_packets.contains(&packet_hash) {
+        if self.seen_packets.contains(packet_hash) {
             // SINGLE announces are allowed even if duplicate (re-announcements)
             if matches!(packet, Packet::Announce { .. }) {
                 return true;
@@ -1328,6 +1372,8 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
 
     fn inbound(
         &mut self,
+        mut packet: Packet,
+        packet_hash: [u8; 32],
         raw: &[u8],
         interface_index: usize,
         now: Instant,
@@ -1335,26 +1381,11 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
         let mut notifications: Vec<Notification> = Vec::new();
         let mut pending_next_segments: Vec<(LinkId, [u8; 32])> = Vec::new();
 
-        let mut packet = match Packet::from_bytes(raw) {
-            Ok(p) => p,
-            Err(e) => {
-                log::debug!(
-                    "Failed to parse packet: {:?} raw={} (len={})",
-                    e,
-                    hex::encode(&raw[..raw.len().min(64)]),
-                    raw.len()
-                );
-                return None;
-            }
-        };
-
-        if !self.accept_packet(&packet) {
+        if !self.accept_packet(&packet, &packet_hash) {
             return None;
         }
 
         packet.increment_hops();
-
-        let packet_hash = sha256(&packet.hashable_part());
 
         // By default, remember packet hashes to avoid routing
         // loops in the network, using the packet filter.
@@ -2699,13 +2730,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
         sent
     }
 
-    pub fn poll(&mut self, now: Instant) -> (Vec<ServiceEvent>, Option<Instant>) {
-        let mut next_wake: Option<Instant> = None;
-        let mut update_wake = |t: Instant| {
-            next_wake = Some(next_wake.map_or(t, |w| w.min(t)));
-        };
-
-        // Receive from all interfaces
+    pub(crate) fn drain_received(&mut self) -> Vec<(Vec<u8>, usize)> {
         let mut received = Vec::new();
         for (i, iface) in self.interfaces.iter_mut().enumerate() {
             while let Some(raw) = iface.recv() {
@@ -2714,8 +2739,22 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
                 received.push((raw, i));
             }
         }
-        for (raw, source) in received {
-            self.inbound(&raw, source, now);
+        received
+    }
+
+    pub(crate) fn poll_prepared(
+        &mut self,
+        now: Instant,
+        received: Vec<PreparedInbound>,
+    ) -> (Vec<ServiceEvent>, Option<Instant>) {
+        let mut next_wake: Option<Instant> = None;
+        let mut update_wake = |t: Instant| {
+            next_wake = Some(next_wake.map_or(t, |w| w.min(t)));
+        };
+
+        for received in received {
+            let (packet, packet_hash, raw, source) = received.into_parts();
+            self.inbound(packet, packet_hash, &raw, source, now);
         }
 
         // Process batched resource requests (deduplicated)
@@ -2840,6 +2879,16 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
         }
 
         (std::mem::take(&mut self.pending_events), next_wake)
+    }
+
+    #[cfg(test)]
+    pub fn poll(&mut self, now: Instant) -> (Vec<ServiceEvent>, Option<Instant>) {
+        let received = self
+            .drain_received()
+            .into_iter()
+            .filter_map(|(raw, source)| PreparedInbound::parse(raw, source))
+            .collect();
+        self.poll_prepared(now, received)
     }
 
     fn maintain_links(&mut self, now: Instant) -> Option<Instant> {
@@ -3854,6 +3903,8 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
+
+    type Node<T, R = ThreadRng> = Protocol<T, R>;
 
     struct MockTransport {
         outbox: std::collections::VecDeque<Vec<u8>>,
