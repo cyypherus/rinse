@@ -175,13 +175,23 @@ impl<T: Transport> Interface<T> {
                     self.closed = true;
                     return Poll::Ready(None);
                 }
-                Poll::Ready(Err(_)) => {
+                Poll::Ready(Err(error)) => {
+                    log::debug!("Interface receive failed: {error}");
                     self.closed = true;
                     return Poll::Ready(None);
                 }
                 Poll::Pending => return Poll::Pending,
             };
             if let Some(data) = self.validate_and_strip_ifac(&raw) {
+                if let Ok(pkt) = Packet::from_bytes(&data) {
+                    log::trace!("[RECV] {}", pkt.log_format());
+                } else {
+                    log::trace!(
+                        "[RECV] raw {} bytes: {}",
+                        data.len(),
+                        hex::encode(&data[..data.len().min(32)])
+                    );
+                }
                 return Poll::Ready(Some(data));
             }
         }
@@ -237,6 +247,7 @@ impl<T: Transport> Interface<T> {
             let frame = self.apply_ifac(&raw);
             match self.transport.poll_send(cx, &frame) {
                 Poll::Ready(Ok(())) => {
+                    log::trace!("[SEND] {}", queued.packet.log_format());
                     self.queue.pop();
                 }
                 Poll::Ready(Err(error)) => {
@@ -253,7 +264,7 @@ impl<T: Transport> Interface<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet::RoutedDestination;
+    use crate::packet::AnnounceDestination;
     use std::sync::{Arc, Mutex};
     use std::task::Waker;
 
@@ -293,7 +304,7 @@ mod tests {
     fn make_packet(dest: [u8; 16], hops: u8) -> Packet {
         Packet::Announce {
             hops,
-            destination: RoutedDestination::direct(dest),
+            destination: AnnounceDestination::Single(dest),
             has_ratchet: false,
             is_path_response: false,
             data: vec![],

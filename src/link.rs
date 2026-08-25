@@ -470,7 +470,7 @@ mod tests {
 
     #[test]
     fn full_link_establishment_flow() {
-        use crate::packet::{Packet, RoutedDestination};
+        use crate::packet::{LinkRequestDestination, Packet};
 
         let mut rng = test_rng();
         let now = Instant::now();
@@ -486,7 +486,7 @@ mod tests {
         let request_data = request.to_bytes();
         let packet = Packet::LinkRequest {
             hops: 0,
-            destination: RoutedDestination::direct(dest),
+            destination: LinkRequestDestination::Direct(dest),
             data: request_data.clone(),
         };
         let link_id = LinkRequest::link_id_from_packet(&packet.hashable_part(), request_data.len());

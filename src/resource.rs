@@ -217,7 +217,8 @@ pub(crate) struct InboundResource {
     pub(crate) window: usize,
     pub(crate) window_max: usize,
     pub(crate) window_min: usize,
-    completed_prefix: usize,
+    waiting_for_hmu: bool,
+    consecutive_completed_height: i32,
     bytes_received: usize,
     #[cfg(test)]
     total_bytes: usize,
@@ -229,13 +230,19 @@ pub(crate) struct InboundResource {
 
 impl InboundResource {
     pub fn from_advertisement(adv: &ResourceAdvertisement) -> Self {
+        let received_hashes: Vec<[u8; MAPHASH_LEN]> = adv
+            .hashmap
+            .chunks_exact(MAPHASH_LEN)
+            .map(|c| [c[0], c[1], c[2], c[3]])
+            .collect();
+
+        let hashmap_height = received_hashes.len();
+
         let mut hashmap: Vec<Option<[u8; MAPHASH_LEN]>> = vec![None; adv.num_parts];
-        let hashmap_height = adv.hashmap.chunks_exact(MAPHASH_LEN).count();
-        for (slot, hash) in hashmap
-            .iter_mut()
-            .zip(adv.hashmap.chunks_exact(MAPHASH_LEN))
-        {
-            *slot = Some(hash.try_into().unwrap());
+        for (i, hash) in received_hashes.iter().enumerate() {
+            if i < hashmap.len() {
+                hashmap[i] = Some(*hash);
+            }
         }
 
         Self {
@@ -260,7 +267,8 @@ impl InboundResource {
             window: WINDOW_DEFAULT,
             window_max: WINDOW_MAX_SLOW,
             window_min: WINDOW_MIN,
-            completed_prefix: 0,
+            waiting_for_hmu: false,
+            consecutive_completed_height: -1,
             bytes_received: 0,
             #[cfg(test)]
             total_bytes: adv.transfer_size,
@@ -271,28 +279,40 @@ impl InboundResource {
         }
     }
 
-    pub fn receive_part(&mut self, data: Vec<u8>) -> bool {
+    fn get_map_hash(&self, data: &[u8]) -> [u8; MAPHASH_LEN] {
         let mut hasher_input = data.to_vec();
         hasher_input.extend(&self.random_hash);
         let h = sha256(&hasher_input);
-        let part_hash = [h[0], h[1], h[2], h[3]];
+        [h[0], h[1], h[2], h[3]]
+    }
+
+    pub fn receive_part(&mut self, data: Vec<u8>) -> bool {
+        let part_hash = self.get_map_hash(&data);
 
         // Must align with needed_hashes() which uses cch+1 as start
-        let search_start = self.completed_prefix;
+        let search_start = (self.consecutive_completed_height + 1) as usize;
         let search_end = (search_start + self.window).min(self.hashmap_height);
 
         for i in search_start..search_end {
-            if self.hashmap[i] == Some(part_hash) && self.parts[i].is_none() {
+            if i < self.hashmap.len()
+                && self.hashmap[i] == Some(part_hash)
+                && self.parts[i].is_none()
+            {
                 self.bytes_received += data.len();
                 self.parts[i] = Some(data);
                 self.received_count += 1;
                 self.outstanding_parts = self.outstanding_parts.saturating_sub(1);
 
                 // Update consecutive completed height
-                while self.completed_prefix < self.parts.len()
-                    && self.parts[self.completed_prefix].is_some()
-                {
-                    self.completed_prefix += 1;
+                if i as i32 == self.consecutive_completed_height + 1 {
+                    self.consecutive_completed_height = i as i32;
+                }
+
+                // Advance consecutive height past any already-received parts
+                let mut cp = (self.consecutive_completed_height + 1) as usize;
+                while cp < self.parts.len() && self.parts[cp].is_some() {
+                    self.consecutive_completed_height = cp as i32;
+                    cp += 1;
                 }
 
                 return true;
@@ -303,11 +323,23 @@ impl InboundResource {
     }
 
     pub fn receive_hashmap_update(&mut self, start_index: usize, data: &[u8]) {
+        let new_hashes: Vec<[u8; MAPHASH_LEN]> = data
+            .chunks_exact(MAPHASH_LEN)
+            .map(|c| [c[0], c[1], c[2], c[3]])
+            .collect();
+
+        log::debug!(
+            "HMU: received {} hashes at start_index={}, current height={}",
+            new_hashes.len(),
+            start_index,
+            self.hashmap_height
+        );
+
         // Write hashes at the specified start index
-        for (i, hash) in data.chunks_exact(MAPHASH_LEN).enumerate() {
+        for (i, hash) in new_hashes.iter().enumerate() {
             let idx = start_index + i;
             if idx < self.hashmap.len() {
-                self.hashmap[idx] = Some(hash.try_into().unwrap());
+                self.hashmap[idx] = Some(*hash);
             }
         }
 
@@ -318,13 +350,15 @@ impl InboundResource {
         {
             self.hashmap_height += 1;
         }
+
+        self.waiting_for_hmu = false;
     }
 
     pub fn needed_hashes(&mut self) -> (Vec<[u8; MAPHASH_LEN]>, bool) {
         let mut needed = Vec::new();
         let mut hashmap_exhausted = false;
 
-        let search_start = self.completed_prefix;
+        let search_start = (self.consecutive_completed_height + 1) as usize;
         let search_end = (search_start + self.window).min(self.parts.len());
 
         for i in search_start..search_end {
@@ -348,17 +382,27 @@ impl InboundResource {
             }
         }
 
+        if hashmap_exhausted {
+            self.waiting_for_hmu = true;
+        }
+
         (needed, hashmap_exhausted)
     }
 
     pub fn last_hashmap_hash(&self) -> Option<[u8; MAPHASH_LEN]> {
-        self.hashmap_height
-            .checked_sub(1)
-            .and_then(|index| self.hashmap[index])
+        if self.hashmap_height > 0 {
+            self.hashmap[self.hashmap_height - 1]
+        } else {
+            None
+        }
     }
 
     pub fn is_complete(&self) -> bool {
         self.received_count == self.num_parts
+    }
+
+    pub fn outstanding_parts(&self) -> usize {
+        self.outstanding_parts
     }
 
     pub fn batch_complete(&self) -> bool {
@@ -366,12 +410,10 @@ impl InboundResource {
         self.received_count - self.last_batch_received_count >= self.batch_window
     }
 
-    #[cfg(test)]
     pub fn received_count(&self) -> usize {
         self.received_count
     }
 
-    #[cfg(test)]
     pub fn num_parts(&self) -> usize {
         self.num_parts
     }
@@ -392,20 +434,51 @@ impl InboundResource {
 
     pub fn assemble_segment(&self, link: &EstablishedLink) -> Option<(Vec<u8>, [u8; 32])> {
         if !self.is_complete() {
+            log::warn!("Resource assemble_segment called but not complete");
             return None;
         }
 
-        let encrypted: Vec<u8> = self.parts.iter().flatten().flatten().copied().collect();
+        let encrypted: Vec<u8> = self
+            .parts
+            .iter()
+            .filter_map(|p| p.as_ref())
+            .flat_map(|p| p.iter().copied())
+            .collect();
 
-        let plaintext = link.decrypt(&encrypted)?;
+        let plaintext = match link.decrypt(&encrypted) {
+            Some(p) => p,
+            None => {
+                log::warn!(
+                    "Resource assemble_segment: stream decryption failed ({} bytes)",
+                    encrypted.len()
+                );
+                return None;
+            }
+        };
+
+        log::debug!(
+            "Decrypted {} bytes, first 16: {:02x?}",
+            plaintext.len(),
+            &plaintext[..plaintext.len().min(16)]
+        );
 
         if plaintext.len() < 4 {
+            log::warn!(
+                "Resource assemble_segment: plaintext too short ({})",
+                plaintext.len()
+            );
             return None;
         }
         let data = &plaintext[4..];
 
         let result = if self.compressed {
-            bz2_decompress(data)?
+            match bz2_decompress(data) {
+                Some(d) => d,
+                None => {
+                    log::warn!("Resource assemble_segment: bz2 decompression failed");
+                    return None;
+                }
+            }
         } else {
             data.to_vec()
         };
@@ -414,12 +487,25 @@ impl InboundResource {
         hash_input.extend(&self.random_hash);
         let calculated_hash = sha256(&hash_input);
         if calculated_hash != self.hash {
+            log::warn!(
+                "Resource assemble_segment: hash mismatch (calculated {} expected {})",
+                hex::encode(calculated_hash),
+                hex::encode(self.hash)
+            );
             return None;
         }
 
         let mut proof_input = result.clone();
         proof_input.extend(&self.hash);
         let proof = sha256(&proof_input);
+
+        log::info!(
+            "Segment {}/{} assembled: {} bytes compressed={}",
+            self.segment_index,
+            self.total_segments,
+            result.len(),
+            self.compressed
+        );
 
         Some((result, proof))
     }
@@ -458,10 +544,24 @@ impl InboundResource {
                 0.0
             };
 
+            log::debug!(
+                "complete_batch: rtt={:.4}s bytes={} rate={:.0} B/s fast_rounds={} window_max={}",
+                rtt_secs,
+                bytes_this_batch,
+                rate,
+                self.fast_rate_rounds,
+                self.window_max
+            );
+
             if rate > RATE_FAST && self.fast_rate_rounds < FAST_RATE_THRESHOLD {
                 self.fast_rate_rounds += 1;
+                log::debug!(
+                    "Fast rate detected, fast_rate_rounds={}",
+                    self.fast_rate_rounds
+                );
                 if self.fast_rate_rounds == FAST_RATE_THRESHOLD {
                     self.window_max = WINDOW_MAX_FAST;
+                    log::debug!("Reached fast threshold, window_max={}", self.window_max);
                 }
             }
 
@@ -511,23 +611,51 @@ impl ResourceAdvertisement {
             | if self.is_response { 1 << 4 } else { 0 }
             | if self.has_metadata { 1 << 5 } else { 0 };
 
-        let field = |key: &'static str, value| (Value::String(key.into()), value);
-        let map = Value::Map(vec![
-            field("t", Value::from(self.transfer_size as u64)),
-            field("d", Value::from(self.data_size as u64)),
-            field("n", Value::from(self.num_parts as u64)),
-            field("h", Value::Binary(self.hash.to_vec())),
-            field("r", Value::Binary(self.random_hash.to_vec())),
-            field("o", Value::Binary(self.original_hash.to_vec())),
-            field("i", Value::from(self.segment_index as u64)),
-            field("l", Value::from(self.total_segments as u64)),
-            field(
-                "q",
-                self.request_id.clone().map_or(Value::Nil, Value::Binary),
+        let pairs = vec![
+            (
+                Value::String("t".into()),
+                Value::Integer((self.transfer_size as u64).into()),
             ),
-            field("f", Value::from(flags)),
-            field("m", Value::Binary(self.hashmap.clone())),
-        ]);
+            (
+                Value::String("d".into()),
+                Value::Integer((self.data_size as u64).into()),
+            ),
+            (
+                Value::String("n".into()),
+                Value::Integer((self.num_parts as u64).into()),
+            ),
+            (Value::String("h".into()), Value::Binary(self.hash.to_vec())),
+            (
+                Value::String("r".into()),
+                Value::Binary(self.random_hash.to_vec()),
+            ),
+            (
+                Value::String("o".into()),
+                Value::Binary(self.original_hash.to_vec()),
+            ),
+            (
+                Value::String("i".into()),
+                Value::Integer((self.segment_index as u64).into()),
+            ),
+            (
+                Value::String("l".into()),
+                Value::Integer((self.total_segments as u64).into()),
+            ),
+            (
+                Value::String("q".into()),
+                match &self.request_id {
+                    Some(id) => Value::Binary(id.clone()),
+                    None => Value::Nil,
+                },
+            ),
+            (Value::String("f".into()), Value::Integer(flags.into())),
+            (
+                Value::String("m".into()),
+                Value::Binary(self.hashmap.clone()),
+            ),
+        ];
+
+        let map = Value::Map(pairs);
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, &map).expect("encoding should not fail");
         buf
@@ -555,31 +683,52 @@ impl ResourceAdvertisement {
             request_id: None,
         };
 
-        for (key, value) in map {
-            match key.as_str()? {
-                "t" => adv.transfer_size = value.as_u64()? as usize,
-                "d" => adv.data_size = value.as_u64()? as usize,
-                "n" => adv.num_parts = value.as_u64()? as usize,
-                "h" => adv.hash.copy_from_slice(value.as_slice()?.get(..32)?),
-                "r" => adv.random_hash.copy_from_slice(value.as_slice()?.get(..4)?),
-                "o" => adv
-                    .original_hash
-                    .copy_from_slice(value.as_slice()?.get(..32)?),
-                "i" => adv.segment_index = value.as_u64()? as usize,
-                "l" => adv.total_segments = value.as_u64()? as usize,
-                "q" if !value.is_nil() => adv.request_id = Some(value.as_slice()?.to_vec()),
+        for (key, val) in map {
+            let key_str = key.as_str()?;
+            match key_str {
+                "t" => adv.transfer_size = val.as_u64()? as usize,
+                "d" => adv.data_size = val.as_u64()? as usize,
+                "n" => adv.num_parts = val.as_u64()? as usize,
+                "h" => {
+                    let bytes = val.as_slice()?;
+                    if bytes.len() >= 32 {
+                        adv.hash.copy_from_slice(&bytes[..32]);
+                    }
+                }
+                "r" => {
+                    let bytes = val.as_slice()?;
+                    if bytes.len() >= 4 {
+                        adv.random_hash.copy_from_slice(&bytes[..4]);
+                    }
+                }
+                "o" => {
+                    let bytes = val.as_slice()?;
+                    if bytes.len() >= 32 {
+                        adv.original_hash.copy_from_slice(&bytes[..32]);
+                    }
+                }
+                "i" => adv.segment_index = val.as_u64()? as usize,
+                "l" => adv.total_segments = val.as_u64()? as usize,
+                "q" => {
+                    if !val.is_nil() {
+                        adv.request_id = Some(val.as_slice()?.to_vec());
+                    }
+                }
                 "f" => {
-                    let flags = value.as_u64()? as u8;
+                    let flags = val.as_u64()? as u8;
                     adv.compressed = (flags & (1 << 1)) != 0;
                     adv.split = (flags & (1 << 2)) != 0;
                     adv.is_request = (flags & (1 << 3)) != 0;
                     adv.is_response = (flags & (1 << 4)) != 0;
                     adv.has_metadata = (flags & (1 << 5)) != 0;
                 }
-                "m" => adv.hashmap = value.as_slice()?.to_vec(),
+                "m" => {
+                    adv.hashmap = val.as_slice()?.to_vec();
+                }
                 _ => {}
             }
         }
+
         Some(adv)
     }
 }

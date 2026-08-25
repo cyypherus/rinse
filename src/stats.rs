@@ -1,36 +1,43 @@
 use std::time::Instant;
 
+#[derive(Debug, Default)]
 pub struct Stats {
-    started_at: Instant,
-    lifetime: LifetimeStats,
+    start_time: Option<Instant>,
+    pub packets_received: u64,
+    pub bytes_received: u64,
+    pub packets_sent: u64,
+    pub bytes_sent: u64,
+    pub packets_relayed: u64,
+    pub bytes_relayed: u64,
+    pub announces_received: u64,
+    pub announces_relayed: u64,
+    pub proofs_relayed: u64,
+    pub link_packets_relayed: u64,
 }
 
 impl Stats {
     pub fn new() -> Self {
         Self {
-            started_at: Instant::now(),
-            lifetime: LifetimeStats::default(),
+            start_time: Some(Instant::now()),
+            ..Default::default()
         }
     }
 
     pub fn snapshot(&self) -> LifetimeStats {
-        let mut snapshot = self.lifetime.clone();
-        snapshot.uptime_secs = self.started_at.elapsed().as_secs();
-        snapshot
-    }
-}
-
-impl std::ops::Deref for Stats {
-    type Target = LifetimeStats;
-
-    fn deref(&self) -> &Self::Target {
-        &self.lifetime
-    }
-}
-
-impl std::ops::DerefMut for Stats {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.lifetime
+        let uptime_secs = self.start_time.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+        LifetimeStats {
+            uptime_secs,
+            packets_received: self.packets_received,
+            bytes_received: self.bytes_received,
+            packets_sent: self.packets_sent,
+            bytes_sent: self.bytes_sent,
+            packets_relayed: self.packets_relayed,
+            bytes_relayed: self.bytes_relayed,
+            announces_received: self.announces_received,
+            announces_relayed: self.announces_relayed,
+            proofs_relayed: self.proofs_relayed,
+            link_packets_relayed: self.link_packets_relayed,
+        }
     }
 }
 

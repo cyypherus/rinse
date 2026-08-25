@@ -33,7 +33,7 @@ use crate::transports::hdlc::{HDLC_FLAG, hdlc_escape, hdlc_unescape};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet::{LinkContext, Packet, RoutedDestination};
+    use crate::packet::{LinkContext, LinkDataDestination, Packet};
 
     struct TestTransport {
         inbound: mpsc::UnboundedReceiver<Vec<u8>>,
@@ -86,9 +86,12 @@ mod tests {
         let packets: Vec<_> = (0..128)
             .map(|index| {
                 let destination = if index % 2 == 0 {
-                    RoutedDestination::direct([index as u8; 16])
+                    LinkDataDestination::Direct([index as u8; 16])
                 } else {
-                    RoutedDestination::via([255 - index as u8; 16], [index as u8; 16])
+                    LinkDataDestination::Transport {
+                        transport_id: [255 - index as u8; 16],
+                        link_id: [index as u8; 16],
+                    }
                 };
                 Packet::LinkData {
                     hops: 0,
@@ -282,7 +285,7 @@ mod tests {
 
         let packet = Packet::LinkData {
             hops: 0,
-            destination: RoutedDestination::direct([1; 16]),
+            destination: LinkDataDestination::Direct([1; 16]),
             context: LinkContext::Resource,
             data: vec![1],
         };
@@ -706,15 +709,6 @@ impl<T: Transport> NodeBuilder<T> {
 }
 
 impl<T: Transport> Node<T> {
-    async fn command<R>(
-        &self,
-        command: impl FnOnce(oneshot::Sender<R>) -> Command<T>,
-    ) -> Option<R> {
-        let (reply, result) = oneshot::channel();
-        self.command_tx.send(command(reply)).ok()?;
-        result.await.ok()
-    }
-
     pub fn begin_link_buffer_stream(
         &self,
         link: crate::LinkHandle,
@@ -772,26 +766,34 @@ impl<T: Transport> Node<T> {
         minimum_rotation_interval: Duration,
         restored_keys: Option<RatchetKeysForRestart>,
     ) -> Result<(), RatchetConfigurationError> {
-        self.command(|reply| Command::ConfigureAnnouncementRatchets {
-            service: local_service,
-            interval: minimum_rotation_interval,
-            restored_keys,
-            reply,
-        })
-        .await
-        .unwrap_or(Err(RatchetConfigurationError::RuntimeStopped))
+        let (reply, result) = oneshot::channel();
+        self.command_tx
+            .send(Command::ConfigureAnnouncementRatchets {
+                service: local_service,
+                interval: minimum_rotation_interval,
+                restored_keys,
+                reply,
+            })
+            .map_err(|_| RatchetConfigurationError::RuntimeStopped)?;
+        result
+            .await
+            .unwrap_or(Err(RatchetConfigurationError::RuntimeStopped))
     }
 
     pub async fn export_ratchet_keys_for_restart(
         &self,
         local_service: ServiceId,
     ) -> Result<RatchetKeysForRestart, RatchetKeysForRestartError> {
-        self.command(|reply| Command::ExportRatchetKeysForRestart {
-            service: local_service,
-            reply,
-        })
-        .await
-        .unwrap_or(Err(RatchetKeysForRestartError::RuntimeStopped))
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(Command::ExportRatchetKeysForRestart {
+                service: local_service,
+                reply: reply_tx,
+            })
+            .map_err(|_| RatchetKeysForRestartError::RuntimeStopped)?;
+        reply_rx
+            .await
+            .unwrap_or(Err(RatchetKeysForRestartError::RuntimeStopped))
     }
 
     pub async fn send_destination_datagram(
@@ -799,13 +801,15 @@ impl<T: Transport> Node<T> {
         destination: DestinationAddress,
         data: &[u8],
     ) -> Result<(), crate::handle::SendDestinationDatagramError> {
-        self.command(|reply| Command::SendDestinationDatagram {
-            destination,
-            data: data.to_vec(),
-            reply,
-        })
-        .await
-        .unwrap_or(Err(
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(Command::SendDestinationDatagram {
+                destination,
+                data: data.to_vec(),
+                reply: reply_tx,
+            })
+            .map_err(|_| crate::handle::SendDestinationDatagramError::RuntimeStopped)?;
+        reply_rx.await.unwrap_or(Err(
             crate::handle::SendDestinationDatagramError::RuntimeStopped,
         ))
     }
@@ -815,13 +819,17 @@ impl<T: Transport> Node<T> {
         link: crate::LinkHandle,
         data: &[u8],
     ) -> Result<(), crate::SendLinkDatagramError> {
-        self.command(|reply| Command::SendLinkDatagram {
-            link,
-            data: data.to_vec(),
-            reply,
-        })
-        .await
-        .unwrap_or(Err(crate::SendLinkDatagramError::RuntimeStopped))
+        let (reply, result) = oneshot::channel();
+        self.command_tx
+            .send(Command::SendLinkDatagram {
+                link,
+                data: data.to_vec(),
+                reply,
+            })
+            .map_err(|_| crate::SendLinkDatagramError::RuntimeStopped)?;
+        result
+            .await
+            .unwrap_or(Err(crate::SendLinkDatagramError::RuntimeStopped))
     }
 
     pub async fn queue_channel_message(
@@ -829,13 +837,17 @@ impl<T: Transport> Node<T> {
         link: crate::LinkHandle,
         message: crate::ChannelMessage,
     ) -> Result<(), crate::ChannelSendError> {
-        self.command(|reply| Command::SendChannel {
-            link,
-            message,
-            reply,
-        })
-        .await
-        .unwrap_or(Err(crate::ChannelSendError::RuntimeStopped))
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(Command::SendChannel {
+                link,
+                message,
+                reply: reply_tx,
+            })
+            .map_err(|_| crate::ChannelSendError::RuntimeStopped)?;
+        reply_rx
+            .await
+            .unwrap_or(Err(crate::ChannelSendError::RuntimeStopped))
     }
 
     pub async fn recv_channel_message(
@@ -860,14 +872,18 @@ impl<T: Transport> Node<T> {
         data: &[u8],
     ) -> Result<crate::QueuedLinkBufferStreamData, crate::ChannelSendError> {
         let encoded = crate::buffer::encode(stream_id, data, false);
-        self.command(|reply| Command::SendBuffer {
-            link,
-            raw: encoded.0,
-            processed: encoded.1,
-            reply,
-        })
-        .await
-        .unwrap_or(Err(crate::ChannelSendError::RuntimeStopped))
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(Command::SendBuffer {
+                link,
+                raw: encoded.0,
+                processed: encoded.1,
+                reply: reply_tx,
+            })
+            .map_err(|_| crate::ChannelSendError::RuntimeStopped)?;
+        reply_rx
+            .await
+            .unwrap_or(Err(crate::ChannelSendError::RuntimeStopped))
     }
 
     async fn queue_link_buffer_stream_end(
@@ -876,15 +892,19 @@ impl<T: Transport> Node<T> {
         stream_id: crate::LinkBufferStreamId,
     ) -> Result<(), crate::ChannelSendError> {
         let (raw, _) = crate::buffer::encode(stream_id, &[], true);
-        self.command(|reply| Command::SendBuffer {
-            link,
-            raw,
-            processed: 0,
-            reply,
-        })
-        .await
-        .unwrap_or(Err(crate::ChannelSendError::RuntimeStopped))
-        .map(|_| ())
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(Command::SendBuffer {
+                link,
+                raw,
+                processed: 0,
+                reply: reply_tx,
+            })
+            .map_err(|_| crate::ChannelSendError::RuntimeStopped)?;
+        reply_rx
+            .await
+            .unwrap_or(Err(crate::ChannelSendError::RuntimeStopped))
+            .map(|_| ())
     }
 
     pub async fn recv_link_buffer_stream_chunk(
@@ -916,15 +936,19 @@ impl<T: Transport> Node<T> {
         path: &str,
         data: &[u8],
     ) -> Result<Response, RequestError> {
-        self.command(|completion| Command::Request {
-            link,
-            path: path.to_string(),
-            data: data.to_vec(),
-            completion,
-        })
-        .await
-        .unwrap_or(Err(RequestError::RuntimeStopped))
-        .map(|(data, metadata)| Response { data, metadata })
+        let (completion, result) = oneshot::channel();
+        self.command_tx
+            .send(Command::Request {
+                link,
+                path: path.to_string(),
+                data: data.to_vec(),
+                completion,
+            })
+            .map_err(|_| RequestError::RuntimeStopped)?;
+        result
+            .await
+            .unwrap_or(Err(RequestError::RuntimeStopped))
+            .map(|(data, metadata)| Response { data, metadata })
     }
 
     pub async fn respond(
@@ -934,15 +958,17 @@ impl<T: Transport> Node<T> {
         metadata: Option<&[u8]>,
         compress: bool,
     ) -> Result<(), RespondError> {
-        self.command(|completion| Command::Respond {
-            request_id,
-            data: data.to_vec(),
-            metadata: metadata.map(|m| m.to_vec()),
-            compress,
-            completion,
-        })
-        .await
-        .unwrap_or(Err(RespondError::RuntimeStopped))
+        let (completion, result) = oneshot::channel();
+        self.command_tx
+            .send(Command::Respond {
+                request_id,
+                data: data.to_vec(),
+                metadata: metadata.map(|m| m.to_vec()),
+                compress,
+                completion,
+            })
+            .map_err(|_| RespondError::RuntimeStopped)?;
+        result.await.unwrap_or(Err(RespondError::RuntimeStopped))
     }
 
     pub async fn recv_request(&self, service: ServiceId) -> Result<IncomingRequest, ReceiveError> {
@@ -990,10 +1016,16 @@ impl<T: Transport> Node<T> {
         &self,
         destination: DestinationAddress,
     ) -> Result<KnownDestination, crate::handle::RouteDiscoveryError> {
-        if !self
-            .command(|reply| Command::RequestPath { destination, reply })
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(Command::RequestPath {
+                destination,
+                reply: reply_tx,
+            })
+            .map_err(|_| crate::handle::RouteDiscoveryError::RuntimeStopped)?;
+        if !reply_rx
             .await
-            .ok_or(crate::handle::RouteDiscoveryError::RuntimeStopped)?
+            .map_err(|_| crate::handle::RouteDiscoveryError::RuntimeStopped)?
         {
             return Err(crate::handle::RouteDiscoveryError::NotFound);
         }
@@ -1016,28 +1048,41 @@ impl<T: Transport> Node<T> {
                 crate::RouteDiscoveryError::NotFound => EstablishLinkError::DestinationUnreachable,
                 crate::RouteDiscoveryError::RuntimeStopped => EstablishLinkError::RuntimeStopped,
             })?;
-        let link = self
-            .command(|reply| Command::CreateLink {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(Command::CreateLink {
                 service: local_service,
                 destination: remote_destination,
-                reply,
+                reply: reply_tx,
             })
+            .map_err(|_| EstablishLinkError::RuntimeStopped)?;
+        let link = reply_rx
             .await
+            .ok()
             .flatten()
             .ok_or(EstablishLinkError::DestinationUnreachable)?;
 
-        self.command(|reply| Command::AwaitLinkActive { link, reply })
+        let (active_tx, active_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::AwaitLinkActive {
+            link,
+            reply: active_tx,
+        });
+        active_rx
             .await
+            .ok()
             .and_then(|r| r.ok())
             .ok_or(EstablishLinkError::Timeout)?;
         Ok(link)
     }
 
     pub async fn close_link(&self, link: crate::LinkHandle) -> Result<(), crate::LinkLookupError> {
-        if self
-            .command(|reply| Command::CloseLink { link, reply })
+        let (reply, result) = oneshot::channel();
+        self.command_tx
+            .send(Command::CloseLink { link, reply })
+            .map_err(|_| crate::LinkLookupError::RuntimeStopped)?;
+        if result
             .await
-            .ok_or(crate::LinkLookupError::RuntimeStopped)?
+            .map_err(|_| crate::LinkLookupError::RuntimeStopped)?
         {
             Ok(())
         } else {
@@ -1049,16 +1094,28 @@ impl<T: Transport> Node<T> {
         &self,
         link: crate::LinkHandle,
     ) -> Result<crate::LinkStatus, crate::LinkLookupError> {
-        self.command(|reply| Command::LinkStatus { link, reply })
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(Command::LinkStatus {
+                link,
+                reply: reply_tx,
+            })
+            .map_err(|_| crate::LinkLookupError::RuntimeStopped)?;
+        reply_rx
             .await
-            .ok_or(crate::LinkLookupError::RuntimeStopped)?
+            .map_err(|_| crate::LinkLookupError::RuntimeStopped)?
             .ok_or(crate::LinkLookupError::LinkNotFound)
     }
 
     pub async fn link_rtt(&self, link: crate::LinkHandle) -> Result<Duration, LinkRttError> {
-        self.command(|reply| Command::LinkRtt { link, reply })
-            .await
-            .unwrap_or(Err(LinkRttError::RuntimeStopped))
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(Command::LinkRtt {
+                link,
+                reply: reply_tx,
+            })
+            .map_err(|_| LinkRttError::RuntimeStopped)?;
+        reply_rx.await.unwrap_or(Err(LinkRttError::RuntimeStopped))
     }
 
     pub async fn authenticate_to_link_peer_as(
@@ -1066,13 +1123,17 @@ impl<T: Transport> Node<T> {
         link: crate::LinkHandle,
         identity: &crate::PrivateIdentity,
     ) -> Result<(), crate::LinkPeerAuthenticationError> {
-        self.command(|reply| Command::AuthenticateToLinkPeer {
-            link,
-            identity: Box::new(identity.clone()),
-            reply,
-        })
-        .await
-        .unwrap_or(Err(crate::LinkPeerAuthenticationError::RuntimeStopped))
+        let (reply, result) = oneshot::channel();
+        self.command_tx
+            .send(Command::AuthenticateToLinkPeer {
+                link,
+                identity: Box::new(identity.clone()),
+                reply,
+            })
+            .map_err(|_| crate::LinkPeerAuthenticationError::RuntimeStopped)?;
+        result
+            .await
+            .unwrap_or(Err(crate::LinkPeerAuthenticationError::RuntimeStopped))
     }
 
     pub async fn encrypt_payload_for_later_delivery(
@@ -1080,14 +1141,18 @@ impl<T: Transport> Node<T> {
         destination: DestinationAddress,
         plaintext: &[u8],
     ) -> Result<crate::DestinationCiphertext, EncryptForLaterDeliveryError> {
-        self.command(|reply| Command::EncryptForLaterDelivery {
-            destination,
-            data: plaintext.to_vec(),
-            reply,
-        })
-        .await
-        .unwrap_or(Err(EncryptForLaterDeliveryError::RuntimeStopped))
-        .map(crate::DestinationCiphertext::from_validated_bytes)
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(Command::EncryptForLaterDelivery {
+                destination,
+                data: plaintext.to_vec(),
+                reply: reply_tx,
+            })
+            .map_err(|_| EncryptForLaterDeliveryError::RuntimeStopped)?;
+        reply_rx
+            .await
+            .unwrap_or(Err(EncryptForLaterDeliveryError::RuntimeStopped))
+            .map(crate::DestinationCiphertext::from_validated_bytes)
     }
 
     pub async fn decrypt_later_delivered_payload(
@@ -1095,13 +1160,17 @@ impl<T: Transport> Node<T> {
         local_service: ServiceId,
         ciphertext: &crate::DestinationCiphertext,
     ) -> Result<Vec<u8>, DecryptLaterDeliveredPayloadError> {
-        self.command(|reply| Command::DecryptLaterDeliveredPayload {
-            service: local_service,
-            data: ciphertext.as_bytes().to_vec(),
-            reply,
-        })
-        .await
-        .unwrap_or(Err(DecryptLaterDeliveredPayloadError::RuntimeStopped))
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(Command::DecryptLaterDeliveredPayload {
+                service: local_service,
+                data: ciphertext.as_bytes().to_vec(),
+                reply: reply_tx,
+            })
+            .map_err(|_| DecryptLaterDeliveredPayloadError::RuntimeStopped)?;
+        reply_rx
+            .await
+            .unwrap_or(Err(DecryptLaterDeliveredPayloadError::RuntimeStopped))
     }
 }
 
