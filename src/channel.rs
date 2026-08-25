@@ -6,18 +6,18 @@ const MAX_WINDOW: u16 = 48;
 const MAX_TRIES: u8 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinkChannelMessage {
-    message_type: u16,
+pub struct ChannelMessage {
+    message_type: ChannelMessageType,
     data: Vec<u8>,
 }
 
-impl LinkChannelMessage {
-    pub fn new(message_type: u16, data: Vec<u8>) -> Result<Self, LinkChannelError> {
-        if message_type >= 0xf000 {
-            return Err(LinkChannelError::ReservedMessageType);
-        }
+impl ChannelMessage {
+    pub fn new(
+        message_type: ChannelMessageType,
+        data: Vec<u8>,
+    ) -> Result<Self, ChannelMessageTooLarge> {
         if data.len() > CHANNEL_MDU {
-            return Err(LinkChannelError::MessageTooLarge {
+            return Err(ChannelMessageTooLarge {
                 size: data.len(),
                 max: CHANNEL_MDU,
             });
@@ -25,7 +25,7 @@ impl LinkChannelMessage {
         Ok(Self { message_type, data })
     }
 
-    pub fn message_type(&self) -> u16 {
+    pub fn message_type(&self) -> ChannelMessageType {
         self.message_type
     }
 
@@ -34,13 +34,43 @@ impl LinkChannelMessage {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelMessageType(u16);
+
+impl ChannelMessageType {
+    pub fn new(value: u16) -> Result<Self, InvalidChannelMessageType> {
+        if value >= 0xf000 {
+            return Err(InvalidChannelMessageType);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_u16(self) -> u16 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidChannelMessageType;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelMessageTooLarge {
+    pub size: usize,
+    pub max: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LinkChannelError {
+pub enum ChannelSendError {
     LinkNotFound,
     LinkNotActive,
-    SendWindowFull,
-    ReservedMessageType,
-    MessageTooLarge { size: usize, max: usize },
+    RuntimeStopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum QueueChannelError {
+    LinkNotFound,
+    LinkNotActive,
+    WindowFull,
 }
 
 pub(crate) struct OutboundEnvelope {
@@ -53,7 +83,7 @@ pub(crate) struct OutboundEnvelope {
 pub(crate) struct ChannelState {
     next_sequence: u16,
     next_rx_sequence: u16,
-    rx: BTreeMap<u16, LinkChannelMessage>,
+    rx: BTreeMap<u16, (u16, Vec<u8>)>,
     pub(crate) outbound: VecDeque<OutboundEnvelope>,
     window: usize,
 }
@@ -73,19 +103,10 @@ impl ChannelState {
         &mut self,
         message_type: u16,
         data: &[u8],
-        system: bool,
-    ) -> Result<Vec<u8>, LinkChannelError> {
-        if !system && message_type >= 0xf000 {
-            return Err(LinkChannelError::ReservedMessageType);
-        }
-        if data.len() > CHANNEL_MDU {
-            return Err(LinkChannelError::MessageTooLarge {
-                size: data.len(),
-                max: CHANNEL_MDU,
-            });
-        }
+    ) -> Result<Vec<u8>, QueueChannelError> {
+        debug_assert!(data.len() <= CHANNEL_MDU);
         if self.outbound.len() >= self.window {
-            return Err(LinkChannelError::SendWindowFull);
+            return Err(QueueChannelError::WindowFull);
         }
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.wrapping_add(1);
@@ -124,7 +145,7 @@ impl ChannelState {
         true
     }
 
-    pub(crate) fn receive(&mut self, raw: &[u8]) -> Vec<LinkChannelMessage> {
+    pub(crate) fn receive(&mut self, raw: &[u8]) -> Vec<(u16, Vec<u8>)> {
         if raw.len() < 6 {
             return Vec::new();
         }
@@ -138,13 +159,7 @@ impl ChannelState {
         if ahead > MAX_WINDOW {
             return Vec::new();
         }
-        self.rx.insert(
-            sequence,
-            LinkChannelMessage {
-                message_type,
-                data: raw[6..].to_vec(),
-            },
-        );
+        self.rx.insert(sequence, (message_type, raw[6..].to_vec()));
         let mut messages = Vec::new();
         while let Some(message) = self.rx.remove(&self.next_rx_sequence) {
             messages.push(message);
@@ -199,7 +214,7 @@ mod tests {
     fn python_envelope_layout() {
         let mut channel = ChannelState::new();
         assert_eq!(
-            channel.prepare(0x0101, b"hello", false).unwrap(),
+            channel.prepare(0x0101, b"hello").unwrap(),
             [0x01, 0x01, 0, 0, 0, 5, b'h', b'e', b'l', b'l', b'o']
         );
     }
@@ -212,40 +227,20 @@ mod tests {
         assert!(channel.receive(&second).is_empty());
         assert_eq!(
             channel.receive(&first),
-            [
-                LinkChannelMessage {
-                    message_type: 2,
-                    data: b"a".to_vec()
-                },
-                LinkChannelMessage {
-                    message_type: 2,
-                    data: b"b".to_vec()
-                }
-            ]
+            [(2, b"a".to_vec()), (2, b"b".to_vec())]
         );
     }
 
     #[test]
     fn rejects_reserved_and_oversized_user_messages() {
-        let mut channel = ChannelState::new();
         assert_eq!(
-            channel.prepare(0xf000, &[], false),
-            Err(LinkChannelError::ReservedMessageType)
+            ChannelMessageType::new(0xf000),
+            Err(InvalidChannelMessageType)
         );
+        let message_type = ChannelMessageType::new(1).unwrap();
         assert_eq!(
-            channel.prepare(1, &vec![0; CHANNEL_MDU + 1], false),
-            Err(LinkChannelError::MessageTooLarge {
-                size: CHANNEL_MDU + 1,
-                max: CHANNEL_MDU,
-            })
-        );
-        assert_eq!(
-            LinkChannelMessage::new(0xf000, Vec::new()),
-            Err(LinkChannelError::ReservedMessageType)
-        );
-        assert_eq!(
-            LinkChannelMessage::new(1, vec![0; CHANNEL_MDU + 1]),
-            Err(LinkChannelError::MessageTooLarge {
+            ChannelMessage::new(message_type, vec![0; CHANNEL_MDU + 1]),
+            Err(ChannelMessageTooLarge {
                 size: CHANNEL_MDU + 1,
                 max: CHANNEL_MDU,
             })

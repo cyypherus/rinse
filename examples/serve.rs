@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rinse::config::{Config, InterfaceConfig, load_or_create_persistent_identity};
-use rinse::{IncomingRequest, Interface, Node, ServiceId, TcpTransport};
+use rinse::{IncomingRequest, Interface, Node, NodeBuilder, TcpTransport};
 use tokio::net::TcpListener;
 
 fn load_directory(base: &Path, current: &Path, files: &mut HashMap<String, Vec<u8>>) {
@@ -33,8 +33,9 @@ fn load_directory(base: &Path, current: &Path, files: &mut HashMap<String, Vec<u
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let config = Config::load().expect("failed to load config");
-    let identity = load_or_create_persistent_identity().expect("failed to load identity");
+    let config = Config::load_from(".rinse/config.toml").expect("failed to load config");
+    let identity =
+        load_or_create_persistent_identity(".rinse/identity").expect("failed to load identity");
 
     let mut args = std::env::args().skip(1);
     let dir_str = args
@@ -59,17 +60,19 @@ async fn main() {
     log::info!("Loaded {} files from {}", files.len(), dir.display());
     let files = Arc::new(files);
 
-    let mut node: Node<TcpTransport> = if config.network.relay {
-        Node::relay()
+    let mut builder: NodeBuilder<TcpTransport> = if config.network.relay {
+        NodeBuilder::packet_forwarding_relay()
     } else {
-        Node::endpoint()
+        NodeBuilder::non_forwarding_endpoint()
     };
 
     let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-    let service = node.add_service(&aspect, &path_refs, &identity).unwrap();
-    let addr = node.service_address(service).unwrap();
+    let service = builder.register_local_service(&aspect, &path_refs, &identity);
+    let addr = service.destination_address;
+    let service = service.id;
     log::info!("Node: {} ({}) aspect={}", name, hex::encode(addr), aspect);
 
+    let mut listeners = Vec::new();
     for (iface_name, iface_config) in config.enabled_interfaces() {
         match iface_config {
             InterfaceConfig::TCPClientInterface {
@@ -81,7 +84,7 @@ async fn main() {
                 log::info!("Connecting to {} ({})", iface_name, addr);
                 match TcpTransport::connect(&addr).await {
                     Ok(transport) => {
-                        node.add_interface(Interface::new(transport));
+                        builder.add_initial_interface(Interface::new(transport));
                     }
                     Err(e) => {
                         log::warn!("Failed to connect to {}: {}", iface_name, e);
@@ -97,7 +100,7 @@ async fn main() {
                 log::info!("Listening on {} ({})", iface_name, addr);
                 match TcpListener::bind(&addr).await {
                     Ok(listener) => {
-                        tokio::spawn(accept_loop(listener, node.clone()));
+                        listeners.push(listener);
                     }
                     Err(e) => {
                         log::warn!("Failed to bind {}: {}", iface_name, e);
@@ -105,6 +108,11 @@ async fn main() {
                 }
             }
         }
+    }
+
+    let (node, runtime) = builder.build();
+    for listener in listeners {
+        tokio::spawn(accept_loop(listener, node.clone()));
     }
 
     let name_bytes = name.into_bytes();
@@ -115,18 +123,19 @@ async fn main() {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    node_clone.announce_with_app_data(service, name_bytes.clone());
+                    let _ = node_clone
+                        .queue_service_announcement_with_data(service, name_bytes.clone());
                     log::debug!("Announced service");
                 }
                 request = node_clone.recv_request(service) => {
                     let Ok(request) = request else { break };
-                    handle_request(&node_clone, service, &files, request).await;
+                    handle_request(&node_clone, &files, request).await;
                 }
             }
         }
     });
 
-    node.run().await;
+    runtime.run().await;
 }
 
 async fn accept_loop(listener: TcpListener, node: Node<TcpTransport>) {
@@ -134,9 +143,11 @@ async fn accept_loop(listener: TcpListener, node: Node<TcpTransport>) {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 log::info!("Accepted connection from {}", peer);
-                match TcpTransport::from_stream(peer.to_string(), stream) {
+                match TcpTransport::from_accepted_stream(stream) {
                     Ok(transport) => {
-                        node.add_interface(Interface::new(transport));
+                        if node.attach_interface(Interface::new(transport)).is_err() {
+                            return;
+                        }
                     }
                     Err(e) => {
                         log::warn!("Failed to create transport: {}", e);
@@ -152,7 +163,6 @@ async fn accept_loop(listener: TcpListener, node: Node<TcpTransport>) {
 
 async fn handle_request(
     node: &Node<TcpTransport>,
-    service: ServiceId,
     files: &HashMap<String, Vec<u8>>,
     request: IncomingRequest,
 ) {
@@ -180,7 +190,7 @@ async fn handle_request(
     };
 
     if let Err(e) = node
-        .respond(service, request.request_id, &response, None, true)
+        .respond(request.request_id, &response, None, true)
         .await
     {
         log::warn!("Failed to respond: {:?}", e);

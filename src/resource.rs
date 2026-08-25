@@ -235,6 +235,7 @@ pub(crate) struct InboundResource {
     waiting_for_hmu: bool,
     consecutive_completed_height: i32,
     bytes_received: usize,
+    #[cfg(test)]
     total_bytes: usize,
     bytes_at_req_sent: usize,
     fast_rate_rounds: usize,
@@ -285,6 +286,7 @@ impl InboundResource {
             waiting_for_hmu: false,
             consecutive_completed_height: -1,
             bytes_received: 0,
+            #[cfg(test)]
             total_bytes: adv.transfer_size,
             bytes_at_req_sent: 0,
             fast_rate_rounds: 0,
@@ -432,10 +434,12 @@ impl InboundResource {
         self.num_parts
     }
 
+    #[cfg(test)]
     pub fn bytes_received(&self) -> usize {
         self.bytes_received
     }
 
+    #[cfg(test)]
     pub fn total_bytes(&self) -> usize {
         self.total_bytes
     }

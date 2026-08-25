@@ -261,6 +261,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
+#[cfg(test)]
 pub(crate) fn create_proof(signing_key: &SigningKey, packet_data: &[u8]) -> Signature {
     let hash = sha256(packet_data);
     sign(signing_key, &hash)

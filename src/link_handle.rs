@@ -3,6 +3,7 @@ use crate::link::LinkId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LinkHandle(pub(crate) LinkId);
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ResourceHandle(pub(crate) [u8; 32]);
 

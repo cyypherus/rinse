@@ -19,8 +19,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Gauge, Paragraph},
 };
-use rinse::config::{Config, InterfaceConfig, data_dir, load_or_create_persistent_identity};
-use rinse::{Interface, LifetimeStats, Node, TcpTransport};
+use rinse::config::{Config, InterfaceConfig, load_or_create_persistent_identity};
+use rinse::{Interface, LifetimeStats, Node, NodeBuilder, NodeRuntime, TcpTransport};
 use serde::{Deserialize, Serialize};
 use simplelog::{
     ColorChoice, Config as LogConfig, SharedLogger, TermLogger, TerminalMode, WriteLogger,
@@ -647,6 +647,10 @@ fn stats_path() -> PathBuf {
     data_dir().join("relay_stats.json")
 }
 
+fn data_dir() -> PathBuf {
+    PathBuf::from(".rinse")
+}
+
 fn format_uptime(secs: u64) -> String {
     if secs >= 86400 {
         format!("{}d {}h", secs / 86400, (secs % 86400) / 3600)
@@ -706,8 +710,9 @@ async fn main() {
         log::set_max_level(log_level);
     }
 
-    let config = Config::load().expect("failed to load config");
-    let identity = load_or_create_persistent_identity().expect("failed to load identity");
+    let config = Config::load_from(data_dir().join("config.toml")).expect("failed to load config");
+    let identity = load_or_create_persistent_identity(data_dir().join("identity"))
+        .expect("failed to load identity");
 
     let stats_file = stats_path();
     let persisted = PersistedStats::load(&stats_file);
@@ -717,8 +722,10 @@ async fn main() {
         format_uptime(persisted.total_uptime_secs)
     );
 
-    let mut node: Node<TcpTransport> = Node::relay();
-    let service = node.add_service("relay.stats", &[], &identity).unwrap();
+    let mut builder: NodeBuilder<TcpTransport> = NodeBuilder::packet_forwarding_relay();
+    let service = builder
+        .register_local_service("relay.stats", &[], &identity)
+        .id;
 
     let enabled_interfaces = config.enabled_interfaces();
     if enabled_interfaces.is_empty() {
@@ -736,6 +743,7 @@ async fn main() {
     }
 
     let mut upstreams = Vec::new();
+    let mut listeners = Vec::new();
 
     for (name, iface_config) in &enabled_interfaces {
         match iface_config {
@@ -748,7 +756,7 @@ async fn main() {
                 log::info!("Connecting to {} ({})", name, addr);
                 match TcpTransport::connect(&addr).await {
                     Ok(transport) => {
-                        node.add_interface(Interface::new(transport));
+                        builder.add_initial_interface(Interface::new(transport));
                         upstreams.push(addr);
                     }
                     Err(e) => {
@@ -765,24 +773,7 @@ async fn main() {
                 log::info!("Listening on {} ({})", name, addr);
                 match TcpListener::bind(&addr).await {
                     Ok(listener) => {
-                        let node_clone = node.clone();
-                        tokio::spawn(async move {
-                            loop {
-                                match listener.accept().await {
-                                    Ok((stream, peer)) => {
-                                        log::info!("Accepted connection from {}", peer);
-                                        if let Ok(transport) =
-                                            TcpTransport::from_stream(peer.to_string(), stream)
-                                        {
-                                            node_clone.add_interface(Interface::new(transport));
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log::warn!("Accept error: {}", e);
-                                    }
-                                }
-                            }
-                        });
+                        listeners.push(listener);
                     }
                     Err(e) => {
                         log::warn!("Failed to listen on {}: {}", addr, e);
@@ -792,25 +783,49 @@ async fn main() {
         }
     }
 
+    let (node, runtime) = builder.build();
+    for listener in listeners {
+        let node = node.clone();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, peer)) => {
+                        log::info!("Accepted connection from {}", peer);
+                        if let Ok(transport) = TcpTransport::from_accepted_stream(stream)
+                            && node.attach_interface(Interface::new(transport)).is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Accept error: {}", e);
+                    }
+                }
+            }
+        });
+    }
+
     if headless {
-        run_headless(node, service, persisted, stats_file).await;
+        run_headless(node, runtime, service, persisted, stats_file).await;
     } else {
-        run_tui(node, service, persisted, stats_file, log_buffer, upstreams).await;
+        run_tui(
+            node, runtime, service, persisted, stats_file, log_buffer, upstreams,
+        )
+        .await;
     }
 }
 
 async fn run_headless(
     node: Node<TcpTransport>,
-    service: rinse::ServiceId,
+    runtime: NodeRuntime<TcpTransport>,
+    service: rinse::LocalServiceId,
     mut persisted: PersistedStats,
     stats_file: PathBuf,
 ) {
     eprintln!("Relay running in headless mode (Ctrl+C to stop)");
 
     let node_handle = node.clone();
-    tokio::spawn(async move {
-        node.run().await;
-    });
+    tokio::spawn(runtime.run());
 
     let save_interval = Duration::from_secs(60);
     let mut last_save = std::time::Instant::now();
@@ -825,7 +840,7 @@ async fn run_headless(
     loop {
         tokio::select! {
             _ = announce_tick.tick() => {
-                node_handle.announce(service);
+                let _ = node_handle.queue_service_announcement(service);
                 log::debug!("Announced relay");
             }
             _ = stats_tick.tick() => {
@@ -858,7 +873,8 @@ async fn run_headless(
 
 async fn run_tui(
     node: Node<TcpTransport>,
-    service: rinse::ServiceId,
+    runtime: NodeRuntime<TcpTransport>,
+    service: rinse::LocalServiceId,
     mut persisted: PersistedStats,
     stats_file: PathBuf,
     log_buffer: Arc<Mutex<VecDeque<LogEntry>>>,
@@ -874,9 +890,7 @@ async fn run_tui(
     let mut achievements: Vec<String> = Vec::new();
 
     let node_handle = node.clone();
-    tokio::spawn(async move {
-        node.run().await;
-    });
+    tokio::spawn(runtime.run());
 
     let mut tick = tokio::time::interval(stats_interval);
     let mut announce_tick = tokio::time::interval_at(
@@ -887,7 +901,7 @@ async fn run_tui(
     loop {
         tokio::select! {
             _ = announce_tick.tick() => {
-                node_handle.announce(service);
+                let _ = node_handle.queue_service_announcement(service);
                 log::debug!("Announced relay");
             }
             _ = tick.tick() => {

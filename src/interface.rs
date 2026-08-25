@@ -1,4 +1,5 @@
 use std::collections::BinaryHeap;
+use std::io;
 use std::task::{Context, Poll};
 
 use ed25519_dalek::SigningKey;
@@ -13,54 +14,46 @@ pub struct InterfaceAccessCode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InterfaceAccessCodeError {
-    EmptySharedKey,
-    InvalidTransmittedBytes { bytes: usize, max: usize },
+    EmptyPacketMaskingKey,
+    InvalidTransmittedAuthenticationBytes { bytes: usize, max: usize },
 }
 
 impl InterfaceAccessCode {
     pub fn new(
-        signing_secret: [u8; 32],
-        shared_key: Vec<u8>,
-        transmitted_bytes: usize,
+        interface_signing_secret: [u8; 32],
+        packet_masking_key: Vec<u8>,
+        transmitted_authentication_bytes: usize,
     ) -> Result<Self, InterfaceAccessCodeError> {
-        if shared_key.is_empty() {
-            return Err(InterfaceAccessCodeError::EmptySharedKey);
+        if packet_masking_key.is_empty() {
+            return Err(InterfaceAccessCodeError::EmptyPacketMaskingKey);
         }
-        if !(1..=64).contains(&transmitted_bytes) {
-            return Err(InterfaceAccessCodeError::InvalidTransmittedBytes {
-                bytes: transmitted_bytes,
-                max: 64,
-            });
+        if !(1..=64).contains(&transmitted_authentication_bytes) {
+            return Err(
+                InterfaceAccessCodeError::InvalidTransmittedAuthenticationBytes {
+                    bytes: transmitted_authentication_bytes,
+                    max: 64,
+                },
+            );
         }
         Ok(Self {
-            signing_key: SigningKey::from_bytes(&signing_secret),
-            shared_key,
-            transmitted_bytes,
+            signing_key: SigningKey::from_bytes(&interface_signing_secret),
+            shared_key: packet_masking_key,
+            transmitted_bytes: transmitted_authentication_bytes,
         })
     }
 }
 
 pub trait Transport: Send {
-    fn send(&mut self, data: &[u8]);
-    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>>;
-    fn send_ready(&self) -> bool;
-    fn is_connected(&self) -> bool {
-        true
-    }
+    fn poll_send(&mut self, cx: &mut Context<'_>, frame: &[u8]) -> Poll<io::Result<()>>;
+    fn poll_receive(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Vec<u8>>>>;
 }
 
 impl Transport for Box<dyn Transport> {
-    fn send(&mut self, data: &[u8]) {
-        (**self).send(data)
+    fn poll_send(&mut self, cx: &mut Context<'_>, frame: &[u8]) -> Poll<io::Result<()>> {
+        (**self).poll_send(cx, frame)
     }
-    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
-        (**self).poll_recv(cx)
-    }
-    fn send_ready(&self) -> bool {
-        (**self).send_ready()
-    }
-    fn is_connected(&self) -> bool {
-        (**self).is_connected()
+    fn poll_receive(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Vec<u8>>>> {
+        (**self).poll_receive(cx)
     }
 }
 
@@ -91,8 +84,9 @@ impl Ord for QueuedPacket {
 }
 
 pub struct Interface<T> {
-    pub transport: T,
+    pub(crate) transport: T,
     queue: BinaryHeap<QueuedPacket>,
+    closed: bool,
     pub(crate) ifac_size: usize,
     pub(crate) ifac_identity: Option<SigningKey>,
     pub(crate) ifac_key: Option<Vec<u8>>,
@@ -103,6 +97,7 @@ impl<T: Transport> Interface<T> {
         Self {
             transport,
             queue: BinaryHeap::new(),
+            closed: false,
             ifac_size: 0,
             ifac_identity: None,
             ifac_key: None,
@@ -116,12 +111,8 @@ impl<T: Transport> Interface<T> {
         self
     }
 
-    fn send_ready(&self) -> bool {
-        self.transport.send_ready()
-    }
-
-    pub(crate) fn is_connected(&self) -> bool {
-        self.transport.is_connected()
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed
     }
 
     pub(crate) fn send(&mut self, packet: Packet, priority: u8) {
@@ -187,11 +178,22 @@ impl<T: Transport> Interface<T> {
         }
     }
 
-    pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
+    pub(crate) fn poll_receive(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
+        if self.closed {
+            return Poll::Pending;
+        }
         loop {
-            let raw = match self.transport.poll_recv(cx) {
-                Poll::Ready(Some(raw)) => raw,
-                Poll::Ready(None) => return Poll::Ready(None),
+            let raw = match self.transport.poll_receive(cx) {
+                Poll::Ready(Ok(Some(raw))) => raw,
+                Poll::Ready(Ok(None)) => {
+                    self.closed = true;
+                    return Poll::Ready(None);
+                }
+                Poll::Ready(Err(error)) => {
+                    log::debug!("Interface receive failed: {error}");
+                    self.closed = true;
+                    return Poll::Ready(None);
+                }
                 Poll::Pending => return Poll::Pending,
             };
             if let Some(data) = self.validate_and_strip_ifac(&raw) {
@@ -252,17 +254,29 @@ impl<T: Transport> Interface<T> {
         }
     }
 
-    pub(crate) fn poll(&mut self) {
-        while self.send_ready() {
-            if let Some(queued) = self.queue.pop() {
-                log::trace!("[SEND] {}", queued.packet.log_format());
-                let raw = queued.packet.to_bytes();
-                let out = self.apply_ifac(&raw);
-                self.transport.send(&out);
-            } else {
-                break;
+    pub(crate) fn poll_send(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.closed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "interface is closed",
+            )));
+        }
+        while let Some(queued) = self.queue.peek() {
+            let raw = queued.packet.to_bytes();
+            let frame = self.apply_ifac(&raw);
+            match self.transport.poll_send(cx, &frame) {
+                Poll::Ready(Ok(())) => {
+                    log::trace!("[SEND] {}", queued.packet.log_format());
+                    self.queue.pop();
+                }
+                Poll::Ready(Err(error)) => {
+                    self.closed = true;
+                    return Poll::Ready(Err(error));
+                }
+                Poll::Pending => return Poll::Pending,
             }
         }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -271,6 +285,7 @@ mod tests {
     use super::*;
     use crate::packet::AnnounceDestination;
     use std::sync::{Arc, Mutex};
+    use std::task::Waker;
 
     struct MockTransport {
         sent: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -291,16 +306,17 @@ mod tests {
     }
 
     impl Transport for MockTransport {
-        fn send(&mut self, data: &[u8]) {
-            self.sent.lock().unwrap().push(data.to_vec());
+        fn poll_send(&mut self, _: &mut Context<'_>, frame: &[u8]) -> Poll<io::Result<()>> {
+            if self.bandwidth {
+                self.sent.lock().unwrap().push(frame.to_vec());
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
         }
 
-        fn poll_recv(&mut self, _: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
+        fn poll_receive(&mut self, _: &mut Context<'_>) -> Poll<io::Result<Option<Vec<u8>>>> {
             Poll::Pending
-        }
-
-        fn send_ready(&self) -> bool {
-            self.bandwidth
         }
     }
 
@@ -315,29 +331,28 @@ mod tests {
     }
 
     #[test]
-    fn bandwidth_delegates_to_transport() {
-        let (t_with, _) = MockTransport::new(true);
-        let (t_without, _) = MockTransport::new(false);
-        let iface_with = Interface::new(t_with);
-        let iface_without = Interface::new(t_without);
-
-        assert!(iface_with.send_ready());
-        assert!(!iface_without.send_ready());
-    }
-
-    #[test]
     fn access_code_rejects_invalid_inputs() {
         assert!(matches!(
             InterfaceAccessCode::new([0; 32], Vec::new(), 8),
-            Err(InterfaceAccessCodeError::EmptySharedKey)
+            Err(InterfaceAccessCodeError::EmptyPacketMaskingKey)
         ));
         assert!(matches!(
             InterfaceAccessCode::new([0; 32], vec![1], 0),
-            Err(InterfaceAccessCodeError::InvalidTransmittedBytes { bytes: 0, max: 64 })
+            Err(
+                InterfaceAccessCodeError::InvalidTransmittedAuthenticationBytes {
+                    bytes: 0,
+                    max: 64
+                }
+            )
         ));
         assert!(matches!(
             InterfaceAccessCode::new([0; 32], vec![1], 65),
-            Err(InterfaceAccessCodeError::InvalidTransmittedBytes { bytes: 65, max: 64 })
+            Err(
+                InterfaceAccessCodeError::InvalidTransmittedAuthenticationBytes {
+                    bytes: 65,
+                    max: 64
+                }
+            )
         ));
     }
 
@@ -350,7 +365,11 @@ mod tests {
         iface.send(make_packet([2u8; 16], 2), 2);
         iface.send(make_packet([3u8; 16], 5), 5);
 
-        iface.poll();
+        assert!(
+            iface
+                .poll_send(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
 
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 3);
@@ -373,7 +392,11 @@ mod tests {
         iface.send(packet, 5);
 
         assert_eq!(sent.lock().unwrap().len(), 0);
-        iface.poll();
+        assert!(
+            iface
+                .poll_send(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
         assert_eq!(sent.lock().unwrap().len(), 1);
     }
 
@@ -385,7 +408,11 @@ mod tests {
         let packet = make_packet([1u8; 16], 5);
         iface.send(packet, 5);
 
-        iface.poll();
+        assert!(
+            iface
+                .poll_send(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
 
         assert_eq!(sent.lock().unwrap().len(), 0);
         assert_eq!(iface.queue.len(), 1);

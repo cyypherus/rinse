@@ -3,20 +3,18 @@ use std::hint::black_box;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use rinse::{Interface, Node, Transport};
+use rinse::{Interface, NodeBuilder, Transport};
 use tokio::task::JoinSet;
 
 struct IdleTransport;
 
 impl Transport for IdleTransport {
-    fn send(&mut self, _: &[u8]) {}
-
-    fn poll_recv(&mut self, _: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
-        Poll::Pending
+    fn poll_send(&mut self, _: &mut Context<'_>, _: &[u8]) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 
-    fn send_ready(&self) -> bool {
-        true
+    fn poll_receive(&mut self, _: &mut Context<'_>) -> Poll<std::io::Result<Option<Vec<u8>>>> {
+        Poll::Pending
     }
 }
 
@@ -25,24 +23,23 @@ struct BurstTransport {
 }
 
 impl Transport for BurstTransport {
-    fn send(&mut self, _: &[u8]) {}
-
-    fn poll_recv(&mut self, _: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
-        self.packets
-            .pop_front()
-            .map_or(Poll::Pending, |packet| Poll::Ready(Some(packet)))
+    fn poll_send(&mut self, _: &mut Context<'_>, _: &[u8]) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 
-    fn send_ready(&self) -> bool {
-        true
+    fn poll_receive(&mut self, _: &mut Context<'_>) -> Poll<std::io::Result<Option<Vec<u8>>>> {
+        self.packets
+            .pop_front()
+            .map_or(Poll::Pending, |packet| Poll::Ready(Ok(Some(packet))))
     }
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let node: Node<IdleTransport> = Node::endpoint();
+    let builder: NodeBuilder<IdleTransport> = NodeBuilder::non_forwarding_endpoint();
+    let (node, node_runtime) = builder.build();
     let client = node.clone();
-    let runtime = tokio::spawn(node.run());
+    let runtime = tokio::spawn(node_runtime.run());
     let clients = 256;
     let reads = 10_000;
     let started = Instant::now();
@@ -75,7 +72,7 @@ async fn main() {
         let node = client.clone();
         tasks.spawn(async move {
             for _ in 0..reads {
-                black_box(node.destination_snapshot());
+                black_box(node.known_destinations());
             }
         });
     }
@@ -84,7 +81,7 @@ async fn main() {
     }
     let elapsed = started.elapsed();
     println!(
-        "destination_snapshot {operations} operations {:?} {:.0} ops/s",
+        "known_destinations {operations} operations {:?} {:.0} ops/s",
         elapsed,
         operations as f64 / elapsed.as_secs_f64()
     );
@@ -101,11 +98,12 @@ async fn main() {
         inbound.push_back(raw);
     }
 
-    let node = Node::endpoint();
-    node.add_interface(Interface::new(BurstTransport { packets: inbound }));
+    let mut builder = NodeBuilder::non_forwarding_endpoint();
+    builder.add_initial_interface(Interface::new(BurstTransport { packets: inbound }));
+    let (node, node_runtime) = builder.build();
     let client = node.clone();
     let started = Instant::now();
-    let runtime = tokio::spawn(node.run());
+    let runtime = tokio::spawn(node_runtime.run());
     loop {
         if client.lifetime_stats().packets_received == packets as u64 {
             break;

@@ -1,12 +1,13 @@
 use rinse::config::{Config, InterfaceConfig, load_or_create_persistent_identity};
-use rinse::{Interface, Node, TcpTransport};
+use rinse::{Interface, NodeBuilder, TcpTransport};
 
 #[tokio::main]
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let config = Config::load().expect("failed to load config");
-    let identity = load_or_create_persistent_identity().expect("failed to load identity");
+    let config = Config::load_from(".rinse/config.toml").expect("failed to load config");
+    let identity =
+        load_or_create_persistent_identity(".rinse/identity").expect("failed to load identity");
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -56,14 +57,14 @@ async fn main() {
             std::process::exit(1);
         });
 
-    let mut node: Node<TcpTransport> = if config.network.relay {
-        Node::relay()
+    let mut builder: NodeBuilder<TcpTransport> = if config.network.relay {
+        NodeBuilder::packet_forwarding_relay()
     } else {
-        Node::endpoint()
+        NodeBuilder::non_forwarding_endpoint()
     };
-    let service = node
-        .add_service("nomadnetwork.node", &[], &identity)
-        .unwrap();
+    let service = builder
+        .register_local_service("nomadnetwork.node", &[], &identity)
+        .id;
 
     for (name, iface) in config.enabled_interfaces() {
         if let InterfaceConfig::TCPClientInterface {
@@ -76,7 +77,7 @@ async fn main() {
             log::info!("[{}] Connecting to {}", name, addr);
             match TcpTransport::connect(&addr).await {
                 Ok(transport) => {
-                    node.add_interface(Interface::new(transport));
+                    builder.add_initial_interface(Interface::new(transport));
                 }
                 Err(e) => {
                     log::warn!("[{}] Failed to connect: {}", name, e);
@@ -91,39 +92,15 @@ async fn main() {
         hex::encode(node_id)
     );
 
+    let (node, runtime) = builder.build();
     let node_clone = node.clone();
-    let node_task = tokio::spawn(async move {
-        node.run().await;
-    });
-
-    let node_for_progress = node_clone.clone();
-    let progress_task = tokio::spawn(async move {
-        loop {
-            let Ok(progress) = node_for_progress
-                .recv_response_transfer_progress(service)
-                .await
-            else {
-                break;
-            };
-            let pct = if progress.total_bytes > 0 {
-                (progress.received_bytes as f64 / progress.total_bytes as f64) * 100.0
-            } else {
-                0.0
-            };
-            eprint!(
-                "\rProgress: {}/{} bytes ({:.1}%)    ",
-                progress.received_bytes, progress.total_bytes, pct
-            );
-        }
-    });
+    let node_task = tokio::spawn(runtime.run());
 
     let link = node_clone
-        .establish_link(service, node_id)
+        .establish_link_from(service, node_id)
         .await
         .expect("Failed to establish link");
-    let response = node_clone.request(service, link, &path, &[]).await;
-
-    progress_task.abort();
+    let response = node_clone.request(link, &path, &[]).await;
 
     match response {
         Ok(resp) => {

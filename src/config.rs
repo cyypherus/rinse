@@ -1,15 +1,16 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::identity::PrivateIdentity;
+use crate::{DestinationAddress, identity::PrivateIdentity};
 
 #[derive(Debug)]
 pub enum ConfigError {
     Io(std::io::Error),
-    Parse(toml::de::Error),
+    InvalidToml(toml::de::Error),
+    TomlSerialization(toml::ser::Error),
     InvalidIdentity,
     InvalidRatchetSecrets,
 }
@@ -18,7 +19,8 @@ impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConfigError::Io(e) => write!(f, "io error: {}", e),
-            ConfigError::Parse(e) => write!(f, "parse error: {}", e),
+            ConfigError::InvalidToml(e) => write!(f, "invalid toml: {}", e),
+            ConfigError::TomlSerialization(e) => write!(f, "toml serialization error: {}", e),
             ConfigError::InvalidIdentity => write!(f, "invalid identity data"),
             ConfigError::InvalidRatchetSecrets => write!(f, "invalid ratchet secret data"),
         }
@@ -35,12 +37,14 @@ impl From<std::io::Error> for ConfigError {
 
 impl From<toml::de::Error> for ConfigError {
     fn from(e: toml::de::Error) -> Self {
-        ConfigError::Parse(e)
+        ConfigError::InvalidToml(e)
     }
 }
 
-pub fn data_dir() -> PathBuf {
-    PathBuf::from(".rinse")
+impl From<toml::ser::Error> for ConfigError {
+    fn from(e: toml::ser::Error) -> Self {
+        ConfigError::TomlSerialization(e)
+    }
 }
 
 const DEFAULT_CONFIG: &str = r#"#
@@ -121,17 +125,15 @@ impl InterfaceConfig {
 }
 
 impl Config {
-    pub fn load() -> Result<Self, ConfigError> {
-        let config_path = Self::config_path();
+    pub fn load_from(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let path = path.as_ref();
 
-        if config_path.exists() {
-            let contents = fs::read_to_string(&config_path)?;
+        if path.exists() {
+            let contents = fs::read_to_string(path)?;
             Ok(toml::from_str(&contents)?)
         } else {
-            if let Some(parent) = config_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&config_path, DEFAULT_CONFIG)?;
+            create_parent_directory(path)?;
+            fs::write(path, DEFAULT_CONFIG)?;
             Ok(Config::default())
         }
     }
@@ -144,57 +146,49 @@ impl Config {
             .collect()
     }
 
-    pub fn save(&self) -> Result<(), ConfigError> {
-        let config_path = Self::config_path();
-
-        if let Some(parent) = config_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let contents = toml::to_string_pretty(self).unwrap();
-        fs::write(&config_path, contents)?;
+    pub fn save_to(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
+        let path = path.as_ref();
+        create_parent_directory(path)?;
+        let contents = toml::to_string_pretty(self)?;
+        fs::write(path, contents)?;
         Ok(())
-    }
-
-    fn config_path() -> PathBuf {
-        data_dir().join("config.toml")
     }
 }
 
-pub fn load_or_create_persistent_identity() -> Result<PrivateIdentity, ConfigError> {
-    let path = data_dir().join("identity");
+pub fn load_or_create_persistent_identity(
+    path: impl AsRef<Path>,
+) -> Result<PrivateIdentity, ConfigError> {
+    let path = path.as_ref();
 
     if path.exists() {
-        let hex_str = fs::read_to_string(&path)?;
+        let hex_str = fs::read_to_string(path)?;
         let bytes = hex::decode(hex_str.trim()).map_err(|_| ConfigError::InvalidIdentity)?;
-        PrivateIdentity::from_secret_bytes(&bytes).ok_or(ConfigError::InvalidIdentity)
+        PrivateIdentity::from_secret_bytes(&bytes).map_err(|_| ConfigError::InvalidIdentity)
     } else {
         let identity = PrivateIdentity::generate(&mut rand::thread_rng());
-        save_private_identity(&identity)?;
+        save_private_identity(path, &identity)?;
         Ok(identity)
     }
 }
 
-pub fn save_private_identity(identity: &PrivateIdentity) -> Result<(), ConfigError> {
-    let path = data_dir().join("identity");
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
+pub fn save_private_identity(
+    path: impl AsRef<Path>,
+    identity: &PrivateIdentity,
+) -> Result<(), ConfigError> {
+    let path = path.as_ref();
+    create_parent_directory(path)?;
     let hex_str = hex::encode(identity.to_secret_bytes());
     fs::write(path, hex_str)?;
     Ok(())
 }
 
-pub fn ratchet_secrets_path(service_address: &[u8; 16]) -> PathBuf {
-    data_dir()
-        .join("ratchets")
-        .join(hex::encode(service_address))
-}
-
-pub fn load_ratchet_secrets(service_address: &[u8; 16]) -> Result<Vec<[u8; 32]>, ConfigError> {
-    let path = ratchet_secrets_path(service_address);
+pub fn load_ratchet_keys_for_restart(
+    storage_directory: impl AsRef<Path>,
+    service_address: DestinationAddress,
+) -> Result<crate::RatchetKeysForRestart, ConfigError> {
+    let path = storage_directory
+        .as_ref()
+        .join(hex::encode(service_address));
 
     if path.exists() {
         let contents = fs::read_to_string(&path)?;
@@ -210,27 +204,102 @@ pub fn load_ratchet_secrets(service_address: &[u8; 16]) -> Result<Vec<[u8; 32]>,
             }
             ratchets.push(bytes.try_into().unwrap());
         }
-        Ok(ratchets)
+        Ok(crate::RatchetKeysForRestart(ratchets))
     } else {
-        Ok(Vec::new())
+        Ok(crate::RatchetKeysForRestart(Vec::new()))
     }
 }
 
-pub fn save_ratchet_secrets(
-    service_address: &[u8; 16],
-    ratchet_secrets: &[[u8; 32]],
+pub fn save_ratchet_keys_for_restart(
+    storage_directory: impl AsRef<Path>,
+    service_address: DestinationAddress,
+    ratchet_keys: &crate::RatchetKeysForRestart,
 ) -> Result<(), ConfigError> {
-    let path = ratchet_secrets_path(service_address);
+    let path = storage_directory
+        .as_ref()
+        .join(hex::encode(service_address));
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let contents: String = ratchet_secrets
+    create_parent_directory(&path)?;
+    let contents: String = ratchet_keys
+        .0
         .iter()
         .map(hex::encode)
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(path, contents)?;
     Ok(())
+}
+
+fn create_parent_directory(path: &Path) -> Result<(), std::io::Error> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn test_directory() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "rinse-config-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn config_path_is_selected_by_caller() {
+        let directory = test_directory();
+        let path = directory.join("node.toml");
+        let mut config = Config::load_from(&path).unwrap();
+        config.name = Some("named node".into());
+        config.save_to(&path).unwrap();
+
+        assert_eq!(
+            Config::load_from(&path).unwrap().name.as_deref(),
+            Some("named node")
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn identity_path_is_selected_by_caller() {
+        let directory = test_directory();
+        let path = directory.join("node.identity");
+        let generated = load_or_create_persistent_identity(&path).unwrap();
+        let loaded = load_or_create_persistent_identity(&path).unwrap();
+
+        assert_eq!(generated.to_secret_bytes(), loaded.to_secret_bytes());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ratchet_files_are_bound_to_service_address() {
+        let directory = test_directory();
+        let first_service = [1; 16];
+        let second_service = [2; 16];
+        let persisted = crate::RatchetKeysForRestart(vec![[3; 32]]);
+
+        save_ratchet_keys_for_restart(&directory, first_service, &persisted).unwrap();
+
+        assert_eq!(
+            load_ratchet_keys_for_restart(&directory, first_service).unwrap(),
+            persisted
+        );
+        assert_eq!(
+            load_ratchet_keys_for_restart(&directory, second_service).unwrap(),
+            crate::RatchetKeysForRestart(Vec::new())
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

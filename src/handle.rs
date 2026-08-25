@@ -5,26 +5,42 @@ use crate::packet::DestinationAddress;
 use crate::request::RequestId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ServiceId(pub(crate) usize);
+pub struct LocalServiceId(pub(crate) usize);
+
+pub struct RegisteredLocalService {
+    pub id: LocalServiceId,
+    pub destination_address: DestinationAddress,
+}
+
+pub(crate) use LocalServiceId as ServiceId;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnnounceError {
+    ServiceNotFound,
+    RuntimeStopped,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestError {
     Timeout,
-    LinkEstablishmentFailed,
+    LinkNotFound,
+    LinkClosed,
     RuntimeStopped,
-    ServiceNotFound,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RespondError {
+    RequestNotFound,
     LinkClosed,
     TransferFailed,
+    RuntimeStopped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EstablishLinkError {
     DestinationUnreachable,
     Timeout,
+    RuntimeStopped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,23 +51,75 @@ pub enum LinkRttError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RatchetSnapshotError {
+pub enum LinkLookupError {
+    LinkNotFound,
+    RuntimeStopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkPeerAuthenticationError {
+    LinkNotFound,
+    LinkNotActive,
+    LocalNodeDidNotInitiateLink,
+    RuntimeStopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RatchetKeysForRestartError {
     ServiceNotFound,
     RuntimeStopped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AppEncryptError {
+pub struct RatchetKeysForRestart(pub(crate) Vec<[u8; 32]>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RatchetConfigurationError {
+    ServiceNotFound,
+    RuntimeStopped,
+    ZeroRotationInterval,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncryptForLaterDeliveryError {
     DestinationUnknown,
     RuntimeStopped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AppDecryptError {
+pub enum DecryptLaterDeliveredPayloadError {
     ServiceNotFound,
     InvalidCiphertext,
     RuntimeStopped,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DestinationCiphertext(Vec<u8>);
+
+impl DestinationCiphertext {
+    pub(crate) fn from_validated_bytes(bytes: Vec<u8>) -> Self {
+        debug_assert!(bytes.len() >= 32);
+        Self(bytes)
+    }
+
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, InvalidDestinationCiphertext> {
+        if bytes.len() < 32 {
+            return Err(InvalidDestinationCiphertext);
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidDestinationCiphertext;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiveError {
@@ -59,16 +127,8 @@ pub enum ReceiveError {
     RuntimeStopped,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ServiceRegistrationError {
-    RuntimeStarted,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResourceError {
-    LinkClosed,
-    InvalidLink,
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeStopped;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteDiscoveryError {
@@ -77,17 +137,28 @@ pub enum RouteDiscoveryError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SendError {
+pub enum SendDestinationDatagramError {
     PayloadTooLarge { size: usize, max: usize },
     DestinationUnknown,
+    RuntimeStopped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SendUnreliableError {
+pub enum SendLinkDatagramError {
     LinkNotFound,
     LinkNotActive,
     PayloadTooLarge { size: usize, max: usize },
     RuntimeStopped,
+}
+
+pub enum ReceivedDatagram {
+    Destination {
+        data: Vec<u8>,
+    },
+    Link {
+        link: crate::LinkHandle,
+        data: Vec<u8>,
+    },
 }
 
 pub struct IncomingRequest {
@@ -102,21 +173,13 @@ pub struct Response {
     pub metadata: Option<Vec<u8>>,
 }
 
-pub struct ResponseTransferProgress {
-    pub request_id: RequestId,
-    pub received_parts: usize,
-    pub total_parts: usize,
-    pub received_bytes: usize,
-    pub total_bytes: usize,
-}
-
-#[derive(Clone)]
-pub struct Destination {
+#[derive(Clone, PartialEq, Eq)]
+pub struct KnownDestination {
     pub address: DestinationAddress,
-    pub app_data: Option<Vec<u8>>,
-    pub hops: u8,
+    pub announcement_data: Option<Vec<u8>>,
+    pub hop_count: u8,
     pub service_name_hash: ServiceNameHash,
-    pub last_seen: Instant,
+    pub route_refreshed_at: Instant,
 }
 
 pub(crate) enum ServiceEvent {
@@ -128,41 +191,34 @@ pub(crate) enum ServiceEvent {
         remote_identity: Option<DestinationAddress>,
     },
     RequestResult {
-        service: ServiceId,
         request_id: RequestId,
         result: Result<(DestinationAddress, Vec<u8>, Option<Vec<u8>>), RequestError>,
     },
     RespondResult {
-        service: ServiceId,
         request_id: RequestId,
         result: Result<(), RespondError>,
     },
+    #[cfg(test)]
     ResourceProgress {
-        service: ServiceId,
         request_id: RequestId,
-        received_parts: usize,
         total_parts: usize,
         received_bytes: usize,
         total_bytes: usize,
     },
     Raw {
         service: ServiceId,
+        link: Option<crate::LinkHandle>,
         data: Vec<u8>,
     },
     Channel {
         service: ServiceId,
         link: crate::LinkHandle,
-        message: crate::LinkChannelMessage,
+        message: crate::ChannelMessage,
     },
     Buffer {
         service: ServiceId,
         link: crate::LinkHandle,
-        chunk: crate::BufferStreamChunk,
-    },
-    Resource {
-        service: ServiceId,
-        link: crate::LinkHandle,
-        data: Vec<u8>,
+        chunk: crate::LinkBufferStreamChunk,
     },
     DestinationsChanged,
     PathRequestResult {

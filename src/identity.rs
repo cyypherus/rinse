@@ -10,6 +10,12 @@ pub struct PrivateIdentity {
     pub(crate) signing_key: SigningKey,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidPrivateIdentityBytes {
+    pub bytes: usize,
+    pub expected: usize,
+}
+
 impl PrivateIdentity {
     pub fn generate<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
         let mut enc_bytes = [0u8; 32];
@@ -28,19 +34,22 @@ impl PrivateIdentity {
         }
     }
 
-    pub fn from_secret_bytes(bytes: &[u8]) -> Option<Self> {
+    pub fn from_secret_bytes(bytes: &[u8]) -> Result<Self, InvalidPrivateIdentityBytes> {
         if bytes.len() != 64 {
-            return None;
+            return Err(InvalidPrivateIdentityBytes {
+                bytes: bytes.len(),
+                expected: 64,
+            });
         }
 
-        let enc_bytes: [u8; 32] = bytes[..32].try_into().ok()?;
-        let sig_bytes: [u8; 32] = bytes[32..64].try_into().ok()?;
+        let enc_bytes: [u8; 32] = bytes[..32].try_into().unwrap();
+        let sig_bytes: [u8; 32] = bytes[32..64].try_into().unwrap();
 
         let encryption_secret = StaticSecret::from(enc_bytes);
         let encryption_public = X25519Public::from(&encryption_secret);
         let signing_key = SigningKey::from_bytes(&sig_bytes);
 
-        Some(Self {
+        Ok(Self {
             encryption_secret,
             encryption_public,
             signing_key,

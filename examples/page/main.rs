@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use rinse::config::{Config, InterfaceConfig, load_or_create_persistent_identity};
-use rinse::{IdentityAddress, IncomingRequest, Interface, Node, ServiceId, TcpTransport};
+use rinse::{IdentityAddress, IncomingRequest, Interface, Node, NodeBuilder, TcpTransport};
 use tokio::net::TcpListener;
 
 mod pages;
@@ -35,8 +35,9 @@ impl PageState {
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let config = Config::load().expect("Failed to load config");
-    let identity = load_or_create_persistent_identity().expect("Failed to load identity");
+    let config = Config::load_from(".rinse/config.toml").expect("Failed to load config");
+    let identity =
+        load_or_create_persistent_identity(".rinse/identity").expect("Failed to load identity");
     let state = Arc::new(Mutex::new(PageState::new()));
 
     let node_name = config
@@ -44,19 +45,19 @@ async fn main() {
         .clone()
         .unwrap_or_else(|| "Page Server".to_string());
 
-    let mut node: Node<TcpTransport> = if config.network.relay {
-        Node::relay()
+    let mut builder: NodeBuilder<TcpTransport> = if config.network.relay {
+        NodeBuilder::packet_forwarding_relay()
     } else {
-        Node::endpoint()
+        NodeBuilder::non_forwarding_endpoint()
     };
 
     let paths = vec!["/page/index.mu", "/page/guestbook.mu", "/page/about.mu"];
-    let service = node
-        .add_service("nomadnetwork.node", &paths, &identity)
-        .unwrap();
-    let addr = node.service_address(service).unwrap();
+    let service = builder.register_local_service("nomadnetwork.node", &paths, &identity);
+    let addr = service.destination_address;
+    let service = service.id;
     log::info!("Node: {} ({})", node_name, hex::encode(addr));
 
+    let mut listeners = Vec::new();
     for (name, iface) in config.enabled_interfaces() {
         match iface {
             InterfaceConfig::TCPClientInterface {
@@ -68,7 +69,7 @@ async fn main() {
                 log::info!("[{}] Connecting to {}", name, addr);
                 match TcpTransport::connect(&addr).await {
                     Ok(transport) => {
-                        node.add_interface(Interface::new(transport));
+                        builder.add_initial_interface(Interface::new(transport));
                     }
                     Err(e) => {
                         log::warn!("[{}] Failed to connect: {}", name, e);
@@ -84,7 +85,7 @@ async fn main() {
                 log::info!("[{}] Listening on {}", name, addr);
                 match TcpListener::bind(&addr).await {
                     Ok(listener) => {
-                        tokio::spawn(accept_loop(name.to_string(), listener, node.clone()));
+                        listeners.push((name.to_string(), listener));
                     }
                     Err(e) => {
                         log::warn!("[{}] Failed to bind: {}", name, e);
@@ -94,6 +95,11 @@ async fn main() {
         }
     }
 
+    let (node, runtime) = builder.build();
+    for (name, listener) in listeners {
+        tokio::spawn(accept_loop(name, listener, node.clone()));
+    }
+
     let name = node_name.clone();
     let name_bytes = node_name.into_bytes();
     let node_clone = node.clone();
@@ -101,7 +107,7 @@ async fn main() {
 
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        node_clone.announce_with_app_data(service, name_bytes.clone());
+        let _ = node_clone.queue_service_announcement_with_data(service, name_bytes.clone());
         log::info!("Announced service");
 
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -109,18 +115,19 @@ async fn main() {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    node_clone.announce_with_app_data(service, name_bytes.clone());
+                    let _ = node_clone
+                        .queue_service_announcement_with_data(service, name_bytes.clone());
                     log::info!("Re-announced service");
                 }
                 request = node_clone.recv_request(service) => {
                     let Ok(request) = request else { break };
-                    handle_request(&node_clone, service, &state_clone, &name, request).await;
+                    handle_request(&node_clone, &state_clone, &name, request).await;
                 }
             }
         }
     });
 
-    node.run().await;
+    runtime.run().await;
 }
 
 async fn accept_loop(name: String, listener: TcpListener, node: Node<TcpTransport>) {
@@ -128,9 +135,11 @@ async fn accept_loop(name: String, listener: TcpListener, node: Node<TcpTranspor
         match listener.accept().await {
             Ok((stream, peer)) => {
                 log::info!("[{}] Connection from {}", name, peer);
-                match TcpTransport::from_stream(peer.to_string(), stream) {
+                match TcpTransport::from_accepted_stream(stream) {
                     Ok(transport) => {
-                        node.add_interface(Interface::new(transport));
+                        if node.attach_interface(Interface::new(transport)).is_err() {
+                            return;
+                        }
                     }
                     Err(e) => {
                         log::warn!("[{}] Failed to create transport: {}", name, e);
@@ -153,7 +162,6 @@ fn parse_form_data(data: &[u8]) -> HashMap<String, String> {
 
 async fn handle_request(
     node: &Node<TcpTransport>,
-    service: ServiceId,
     state: &Arc<Mutex<PageState>>,
     name: &str,
     request: IncomingRequest,
@@ -181,7 +189,7 @@ async fn handle_request(
     };
 
     if let Err(e) = node
-        .respond(service, request.request_id, response.as_bytes(), None, true)
+        .respond(request.request_id, response.as_bytes(), None, true)
         .await
     {
         log::warn!("Failed to respond: {:?}", e);
