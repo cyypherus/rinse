@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::ThreadRng;
 use rand::{Rng, RngCore};
+use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 use crate::announce::{AnnounceBuilder, AnnounceData};
@@ -163,7 +164,15 @@ impl PreparedInbound {
     pub(crate) fn parse(raw: Vec<u8>, source: usize) -> Option<Self> {
         match Packet::from_bytes(&raw) {
             Ok(packet) => {
-                let packet_hash = packet.packet_hash();
+                let mut hasher = Sha256::new();
+                hasher.update([raw[0] & 0b0000_1111]);
+                let skip = if raw[0] & 0b0100_0000 != 0 {
+                    2 + std::mem::size_of::<Address>()
+                } else {
+                    2
+                };
+                hasher.update(&raw[skip..]);
+                let packet_hash = hasher.finalize().into();
                 Some(Self {
                     packet,
                     packet_hash,

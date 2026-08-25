@@ -58,11 +58,21 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn parallel_packet_preparation_preserves_input_order() {
         let packets: Vec<_> = (0..128)
-            .map(|index| Packet::LinkData {
-                hops: 0,
-                destination: LinkDataDestination::Direct([index as u8; 16]),
-                context: LinkContext::Resource,
-                data: vec![index as u8; 512],
+            .map(|index| {
+                let destination = if index % 2 == 0 {
+                    LinkDataDestination::Direct([index as u8; 16])
+                } else {
+                    LinkDataDestination::Transport {
+                        transport_id: [255 - index as u8; 16],
+                        link_id: [index as u8; 16],
+                    }
+                };
+                Packet::LinkData {
+                    hops: 0,
+                    destination,
+                    context: LinkContext::Resource,
+                    data: vec![index as u8; 512],
+                }
             })
             .collect();
         let raw = packets
