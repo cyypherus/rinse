@@ -228,6 +228,10 @@ type IncomingRequestReceiver = Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingRe
 type RawReceiver = Arc<TokioMutex<mpsc::UnboundedReceiver<Vec<u8>>>>;
 type ResourceReceiver = Arc<TokioMutex<mpsc::UnboundedReceiver<(crate::LinkHandle, Vec<u8>)>>>;
 type ProgressReceiver = Arc<TokioMutex<mpsc::UnboundedReceiver<crate::handle::Progress>>>;
+type ChannelReceiver =
+    Arc<TokioMutex<mpsc::UnboundedReceiver<(crate::LinkHandle, crate::ChannelMessage)>>>;
+type BufferReceiver =
+    Arc<TokioMutex<mpsc::UnboundedReceiver<(crate::LinkHandle, crate::BufferChunk)>>>;
 
 #[derive(Clone)]
 struct ServiceChannels {
@@ -239,6 +243,10 @@ struct ServiceChannels {
     resource_rx: ResourceReceiver,
     progress_tx: mpsc::UnboundedSender<crate::handle::Progress>,
     progress_rx: ProgressReceiver,
+    channel_tx: mpsc::UnboundedSender<(crate::LinkHandle, crate::ChannelMessage)>,
+    channel_rx: ChannelReceiver,
+    buffer_tx: mpsc::UnboundedSender<(crate::LinkHandle, crate::BufferChunk)>,
+    buffer_rx: BufferReceiver,
     request_waiters: RequestWaiters,
     respond_waiters: RespondWaiters,
 }
@@ -281,6 +289,18 @@ enum Command<T: Transport> {
     SendLinkData {
         link: crate::LinkHandle,
         data: Vec<u8>,
+    },
+    SendChannel {
+        link: crate::LinkHandle,
+        message: crate::ChannelMessage,
+        reply: oneshot::Sender<Result<(), crate::ChannelError>>,
+    },
+    SendBuffer {
+        link: crate::LinkHandle,
+        stream_id: u16,
+        data: Vec<u8>,
+        eof: bool,
+        reply: oneshot::Sender<Result<usize, crate::BufferError>>,
     },
     GetDestinations {
         reply: oneshot::Sender<Vec<Destination>>,
@@ -411,6 +431,8 @@ impl<T: Transport> AsyncNode<T> {
         let (raw_tx, raw_rx) = mpsc::unbounded_channel();
         let (resource_tx, resource_rx) = mpsc::unbounded_channel();
         let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+        let (channel_tx, channel_rx) = mpsc::unbounded_channel();
+        let (buffer_tx, buffer_rx) = mpsc::unbounded_channel();
         let request_waiters: RequestWaiters = Arc::new(StdMutex::new(HashMap::new()));
         let respond_waiters: RespondWaiters = Arc::new(StdMutex::new(HashMap::new()));
 
@@ -428,6 +450,10 @@ impl<T: Transport> AsyncNode<T> {
                 resource_rx: Arc::new(TokioMutex::new(resource_rx)),
                 progress_tx,
                 progress_rx: Arc::new(TokioMutex::new(progress_rx)),
+                channel_tx,
+                channel_rx: Arc::new(TokioMutex::new(channel_rx)),
+                buffer_tx,
+                buffer_rx: Arc::new(TokioMutex::new(buffer_rx)),
                 request_waiters,
                 respond_waiters,
             },
@@ -504,6 +530,68 @@ impl<T: Transport> AsyncNode<T> {
             link,
             data: data.to_vec(),
         });
+    }
+
+    pub async fn send_channel(
+        &self,
+        link: crate::LinkHandle,
+        message: crate::ChannelMessage,
+    ) -> Result<(), crate::ChannelError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::SendChannel {
+            link,
+            message,
+            reply: reply_tx,
+        });
+        reply_rx
+            .await
+            .unwrap_or(Err(crate::ChannelError::InvalidLink))
+    }
+
+    pub async fn recv_channel(
+        &self,
+        service: ServiceId,
+    ) -> Option<(crate::LinkHandle, crate::ChannelMessage)> {
+        let receiver = self
+            .services
+            .lock()
+            .unwrap()
+            .get(&service)
+            .map(|channels| channels.channel_rx.clone())?;
+        receiver.lock().await.recv().await
+    }
+
+    pub async fn send_buffer(
+        &self,
+        link: crate::LinkHandle,
+        stream_id: u16,
+        data: &[u8],
+        eof: bool,
+    ) -> Result<usize, crate::BufferError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.command_tx.send(Command::SendBuffer {
+            link,
+            stream_id,
+            data: data.to_vec(),
+            eof,
+            reply: reply_tx,
+        });
+        reply_rx.await.unwrap_or(Err(crate::BufferError::Channel(
+            crate::ChannelError::InvalidLink,
+        )))
+    }
+
+    pub async fn recv_buffer(
+        &self,
+        service: ServiceId,
+    ) -> Option<(crate::LinkHandle, crate::BufferChunk)> {
+        let receiver = self
+            .services
+            .lock()
+            .unwrap()
+            .get(&service)
+            .map(|channels| channels.buffer_rx.clone())?;
+        receiver.lock().await.recv().await
     }
 
     pub async fn known_destinations(&self) -> Vec<Destination> {
@@ -809,6 +897,7 @@ impl<T: Transport> AsyncNode<T> {
             let sleep_duration = next_wake
                 .map(|t| t.saturating_duration_since(Instant::now()))
                 .unwrap_or(Duration::from_millis(10))
+                .min(Duration::from_millis(10))
                 .max(Duration::from_millis(1));
 
             tokio::select! {
@@ -889,6 +978,24 @@ impl<T: Transport> AsyncNode<T> {
                 ServiceEvent::Raw { service, data } => {
                     if let Some(channels) = services.get(&service) {
                         let _ = channels.raw_tx.send(data);
+                    }
+                }
+                ServiceEvent::Channel {
+                    service,
+                    link,
+                    message,
+                } => {
+                    if let Some(channels) = services.get(&service) {
+                        let _ = channels.channel_tx.send((link, message));
+                    }
+                }
+                ServiceEvent::Buffer {
+                    service,
+                    link,
+                    chunk,
+                } => {
+                    if let Some(channels) = services.get(&service) {
+                        let _ = channels.buffer_tx.send((link, chunk));
                     }
                 }
                 ServiceEvent::Resource {
@@ -1006,6 +1113,22 @@ impl<T: Transport> AsyncNode<T> {
             }
             Command::SendLinkData { link, data } => {
                 inner.node.send_link_data(link, &data);
+            }
+            Command::SendChannel {
+                link,
+                message,
+                reply,
+            } => {
+                let _ = reply.send(inner.node.send_channel(link, message));
+            }
+            Command::SendBuffer {
+                link,
+                stream_id,
+                data,
+                eof,
+                reply,
+            } => {
+                let _ = reply.send(inner.node.send_buffer(link, stream_id, &data, eof));
             }
             Command::GetDestinations { reply } => {
                 let _ = reply.send(inner.node.known_destinations());

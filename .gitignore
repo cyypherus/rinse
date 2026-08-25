@@ -7,3 +7,4 @@ traces/
 *.DS_Store
 .cargo/
 .rinse*
+ref/

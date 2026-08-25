@@ -206,6 +206,8 @@ pub(crate) fn decode_rtt(data: &[u8]) -> Option<f64> {
 pub(crate) struct PendingLink {
     pub link_id: LinkId,
     pub initiator_encryption_secret: StaticSecret,
+    pub initiator_signing_key: SigningKey,
+    pub responder_signing_key: VerifyingKey,
     pub destination: Address,
     pub local_service: Option<ServiceId>,
     pub request_time: Instant,
@@ -231,6 +233,8 @@ pub(crate) struct EstablishedLink {
     pub rtt_ms: Option<u64>,
     pub remote_identity: Option<Address>,
     pub receiving_interface: usize,
+    pub signing_key: SigningKey,
+    pub peer_signing_key: VerifyingKey,
     keys: LinkKeys,
     pub(crate) pending_requests:
         std::collections::HashMap<crate::WireRequestId, (ServiceId, crate::RequestId)>,
@@ -271,6 +275,8 @@ impl EstablishedLink {
             rtt_ms: Some(rtt_ms),
             remote_identity: None,
             receiving_interface,
+            signing_key: pending.initiator_signing_key,
+            peer_signing_key: pending.responder_signing_key,
             keys,
             pending_requests: std::collections::HashMap::new(),
         }
@@ -282,6 +288,8 @@ impl EstablishedLink {
         initiator_public: &X25519Public,
         destination: Address,
         local_service: ServiceId,
+        responder_signing_key: SigningKey,
+        initiator_signing_key: VerifyingKey,
         receiving_interface: usize,
         now: Instant,
     ) -> Self {
@@ -305,6 +313,8 @@ impl EstablishedLink {
             rtt_ms: None,
             remote_identity: None,
             receiving_interface,
+            signing_key: responder_signing_key,
+            peer_signing_key: initiator_signing_key,
             keys,
             pending_requests: std::collections::HashMap::new(),
         }
@@ -428,6 +438,8 @@ mod tests {
         let mut rng = test_rng();
         let initiator_keypair = EphemeralKeyPair::generate(&mut rng);
         let responder_keypair = EphemeralKeyPair::generate(&mut rng);
+        let initiator_signing_key = SigningKey::generate(&mut rng);
+        let responder_signing_key = SigningKey::generate(&mut rng);
         let dest: Address = [0xAB; 16];
         let link_id: LinkId = [0xCD; 16];
         let now = Instant::now();
@@ -435,6 +447,8 @@ mod tests {
         let pending = PendingLink {
             link_id,
             initiator_encryption_secret: initiator_keypair.secret,
+            initiator_signing_key,
+            responder_signing_key: responder_signing_key.verifying_key(),
             destination: dest,
             local_service: None,
             request_time: now,
@@ -448,6 +462,8 @@ mod tests {
             &initiator_keypair.public,
             dest,
             ServiceId(0),
+            responder_signing_key,
+            initiator_link.signing_key.verifying_key(),
             0,
             now,
         );
@@ -497,6 +513,8 @@ mod tests {
         let pending = PendingLink {
             link_id,
             initiator_encryption_secret: initiator_enc.secret,
+            initiator_signing_key: initiator_sig,
+            responder_signing_key: responder_sig.verifying_key(),
             destination: dest,
             local_service: None,
             request_time: now,
@@ -510,6 +528,8 @@ mod tests {
             &initiator_enc.public,
             dest,
             ServiceId(0),
+            responder_sig,
+            initiator_link.signing_key.verifying_key(),
             0,
             now,
         );
@@ -550,6 +570,8 @@ mod tests {
         let mut rng = test_rng();
         let initiator_keypair = EphemeralKeyPair::generate(&mut rng);
         let responder_keypair = EphemeralKeyPair::generate(&mut rng);
+        let initiator_signing_key = SigningKey::generate(&mut rng);
+        let responder_signing_key = SigningKey::generate(&mut rng);
         let dest: Address = [0xAB; 16];
         let link_id: LinkId = [0xCD; 16];
 
@@ -560,6 +582,8 @@ mod tests {
         let pending = PendingLink {
             link_id,
             initiator_encryption_secret: initiator_keypair.secret,
+            initiator_signing_key,
+            responder_signing_key: responder_signing_key.verifying_key(),
             destination: dest,
             local_service: None,
             request_time,
@@ -577,6 +601,8 @@ mod tests {
         let mut rng = test_rng();
         let initiator_keypair = EphemeralKeyPair::generate(&mut rng);
         let responder_keypair = EphemeralKeyPair::generate(&mut rng);
+        let initiator_signing_key = SigningKey::generate(&mut rng);
+        let responder_signing_key = SigningKey::generate(&mut rng);
         let dest: Address = [0xAB; 16];
         let link_id: LinkId = [0xCD; 16];
         let now = Instant::now();
@@ -584,6 +610,8 @@ mod tests {
         let pending = PendingLink {
             link_id,
             initiator_encryption_secret: initiator_keypair.secret,
+            initiator_signing_key,
+            responder_signing_key: responder_signing_key.verifying_key(),
             destination: dest,
             local_service: None,
             request_time: now,

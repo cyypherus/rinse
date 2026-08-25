@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::ThreadRng;
@@ -8,6 +8,7 @@ use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 use crate::announce::{AnnounceBuilder, AnnounceData};
 use crate::aspect::AspectHash;
+use crate::channel::{ChannelError, ChannelMessage, ChannelState};
 use crate::crypto::{EphemeralKeyPair, sha256};
 use crate::handle::{Destination, RequestError, RespondError, ServiceEvent, ServiceId};
 use crate::stats::{Stats, StatsSnapshot};
@@ -29,6 +30,8 @@ const PATHFINDER_RW_MS: u64 = 500;
 const ESTABLISHMENT_TIMEOUT_PER_HOP_SECS: u64 = 6;
 const ESTABLISHMENT_TIMEOUT_BASE_SECS: u64 = 60;
 const PATH_REQUEST_TIMEOUT_SECS: u64 = 60;
+const PATH_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const REVERSE_TIMEOUT: Duration = Duration::from_secs(8 * 60);
 
 enum Notification {
     Request {
@@ -52,6 +55,16 @@ enum Notification {
     Raw {
         service: ServiceId,
         data: Vec<u8>,
+    },
+    Channel {
+        service: ServiceId,
+        link: crate::LinkHandle,
+        message: ChannelMessage,
+    },
+    Buffer {
+        service: ServiceId,
+        link: crate::LinkHandle,
+        chunk: crate::BufferChunk,
     },
     DestinationsChanged,
     PathRequestResult {
@@ -114,6 +127,7 @@ struct LinkTableEntry {
 }
 
 struct ReverseTableEntry {
+    timestamp: Instant,
     receiving_interface: usize,
 }
 
@@ -177,6 +191,7 @@ pub struct Node<T, R = ThreadRng> {
     stats: Stats,
     pending_events: Vec<ServiceEvent>,
     pending_resource_requests: Vec<(LinkId, [u8; 32])>,
+    channels: HashMap<LinkId, ChannelState>,
 }
 
 impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
@@ -217,6 +232,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
             stats: Stats::new(),
             pending_events: Vec::new(),
             pending_resource_requests: Vec::new(),
+            channels: HashMap::new(),
         }
     }
 
@@ -597,6 +613,24 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
                     self.pending_events
                         .push(ServiceEvent::Raw { service, data });
                 }
+                Notification::Channel {
+                    service,
+                    link,
+                    message,
+                } => self.pending_events.push(ServiceEvent::Channel {
+                    service,
+                    link,
+                    message,
+                }),
+                Notification::Buffer {
+                    service,
+                    link,
+                    chunk,
+                } => self.pending_events.push(ServiceEvent::Buffer {
+                    service,
+                    link,
+                    chunk,
+                }),
                 Notification::DestinationsChanged => {
                     self.pending_events.push(ServiceEvent::DestinationsChanged);
                 }
@@ -808,6 +842,71 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
             return;
         }
         self.advertise_resource(link, data.to_vec(), None, false);
+    }
+
+    pub fn send_channel(
+        &mut self,
+        link: crate::LinkHandle,
+        message: ChannelMessage,
+    ) -> Result<(), ChannelError> {
+        self.send_channel_data(
+            link.0,
+            message.message_type,
+            &message.data,
+            false,
+            Instant::now(),
+        )
+    }
+
+    pub fn send_buffer(
+        &mut self,
+        link: crate::LinkHandle,
+        stream_id: u16,
+        data: &[u8],
+        eof: bool,
+    ) -> Result<usize, crate::BufferError> {
+        let (raw, processed) = crate::buffer::encode(stream_id, data, eof)?;
+        self.send_channel_data(
+            link.0,
+            crate::buffer::STREAM_MESSAGE_TYPE,
+            &raw,
+            true,
+            Instant::now(),
+        )?;
+        Ok(processed)
+    }
+
+    fn send_channel_data(
+        &mut self,
+        link_id: LinkId,
+        message_type: u16,
+        data: &[u8],
+        system: bool,
+        now: Instant,
+    ) -> Result<(), ChannelError> {
+        if self
+            .established_links
+            .get(&link_id)
+            .is_none_or(|link| link.state != LinkState::Active)
+        {
+            return Err(ChannelError::InvalidLink);
+        }
+        let raw = self
+            .channels
+            .entry(link_id)
+            .or_insert_with(ChannelState::new)
+            .prepare(message_type, data, system)?;
+        let packet = self.make_encrypted_link_packet(link_id, LinkContext::Channel, &raw)?;
+        let packet_hash = packet.packet_hash();
+        let target_interface = self.established_links[&link_id].receiving_interface;
+        if let Some(interface) = self.interfaces.get_mut(target_interface) {
+            interface.send(packet.clone(), 0);
+        }
+        self.channels
+            .get_mut(&link_id)
+            .unwrap()
+            .track(packet, packet_hash, now);
+        Ok(())
     }
 
     pub fn create_link(
@@ -1146,6 +1245,8 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
             PendingLink {
                 link_id,
                 initiator_encryption_secret: ephemeral.secret,
+                initiator_signing_key: signing_key,
+                responder_signing_key: path_entry.signing_key,
                 destination,
                 local_service: service,
                 request_time: now,
@@ -1439,6 +1540,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
                         self.reverse_table.insert(
                             destination_hash,
                             ReverseTableEntry {
+                                timestamp: now,
                                 receiving_interface: interface_index,
                             },
                         );
@@ -1781,6 +1883,8 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
                         &request.encryption_public,
                         destination_hash,
                         ServiceId(service_idx),
+                        self.services[service_idx].signing_key.clone(),
+                        VerifyingKey::from_bytes(&request.signing_public).ok()?,
                         interface_index,
                         now,
                     );
@@ -1999,10 +2103,51 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
                         }
                     }
 
-                    LinkContext::None
-                    | LinkContext::Command
-                    | LinkContext::CommandStatus
-                    | LinkContext::Channel => {
+                    LinkContext::Channel => {
+                        if let Some(plaintext) = decrypt(link, &data) {
+                            let packet_hash = packet.packet_hash();
+                            let signature = crate::crypto::sign(&link.signing_key, &packet_hash);
+                            let mut proof_data = packet_hash.to_vec();
+                            proof_data.extend_from_slice(&signature.to_bytes());
+                            let proof = Packet::Proof {
+                                hops: 0,
+                                destination: crate::packet::ProofDestination::Link(link_id),
+                                context: crate::packet::ProofContext::None,
+                                data: proof_data,
+                            };
+                            let target_interface = link.receiving_interface;
+                            let service = link.local_service;
+                            if let Some(interface) = self.interfaces.get_mut(target_interface) {
+                                interface.send(proof, 0);
+                            }
+                            let messages = self
+                                .channels
+                                .entry(link_id)
+                                .or_insert_with(ChannelState::new)
+                                .receive(&plaintext);
+                            if let Some(service) = service {
+                                for message in messages {
+                                    if message.message_type == crate::buffer::STREAM_MESSAGE_TYPE {
+                                        if let Ok(chunk) = crate::buffer::decode(&message.data) {
+                                            notifications.push(Notification::Buffer {
+                                                service,
+                                                link: crate::LinkHandle(link_id),
+                                                chunk,
+                                            });
+                                        }
+                                    } else {
+                                        notifications.push(Notification::Channel {
+                                            service,
+                                            link: crate::LinkHandle(link_id),
+                                            message,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    LinkContext::None | LinkContext::Command | LinkContext::CommandStatus => {
                         if let Some(plaintext) = decrypt(link, &data) {
                             if let Some(service) = link.local_service {
                                 notifications.push(Notification::Raw {
@@ -2271,6 +2416,17 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
                     if !signature_bytes.is_empty()
                         && let Ok(signature) = Signature::from_slice(signature_bytes)
                     {
+                        if let Some(Some(proof_hash)) = proof_hash
+                            && let Some(link) = self.established_links.get(&destination_hash)
+                            && crate::crypto::verify(
+                                &link.peer_signing_key,
+                                &proof_hash,
+                                &signature,
+                            )
+                            && let Some(channel) = self.channels.get_mut(&destination_hash)
+                        {
+                            channel.delivered(&proof_hash);
+                        }
                         self.receipts.retain(|receipt| {
                             // For explicit proofs, check hash matches
                             if let Some(Some(ph)) = proof_hash
@@ -2397,25 +2553,35 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
     }
 
     fn send_link_packet(&mut self, link_id: LinkId, context: LinkContext, plaintext: &[u8]) {
-        use crate::packet::LinkDataDestination;
-
-        let Some(link) = self.established_links.get_mut(&link_id) else {
+        let Ok(packet) = self.make_encrypted_link_packet(link_id, context, plaintext) else {
             return;
         };
-
-        let ciphertext = link.encrypt(&mut self.rng, plaintext);
-        let target_interface = link.receiving_interface;
-
-        let packet = Packet::LinkData {
-            hops: 0,
-            destination: LinkDataDestination::Direct(link_id),
-            context,
-            data: ciphertext,
-        };
+        let target_interface = self.established_links[&link_id].receiving_interface;
 
         if let Some(iface) = self.interfaces.get_mut(target_interface) {
             iface.send(packet, 0);
         }
+    }
+
+    fn make_encrypted_link_packet(
+        &mut self,
+        link_id: LinkId,
+        context: LinkContext,
+        plaintext: &[u8],
+    ) -> Result<Packet, ChannelError> {
+        use crate::packet::LinkDataDestination;
+
+        let link = self
+            .established_links
+            .get(&link_id)
+            .ok_or(ChannelError::InvalidLink)?;
+        let data = link.encrypt(&mut self.rng, plaintext);
+        Ok(Packet::LinkData {
+            hops: 0,
+            destination: LinkDataDestination::Direct(link_id),
+            context,
+            data,
+        })
     }
 
     fn send_link_packet_with_activity(
@@ -2609,6 +2775,52 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Node<T, R> {
             self.stats.bytes_relayed += (packet_len * num_interfaces) as u64;
             self.stats.announces_relayed += num_interfaces as u64;
             self.outbound(packet, Some(source), now);
+        }
+
+        let path_count = self.path_table.len();
+        self.path_table
+            .retain(|_, entry| now.saturating_duration_since(entry.timestamp) <= PATH_TIMEOUT);
+        if self.path_table.len() != path_count {
+            self.pending_events.push(ServiceEvent::DestinationsChanged);
+        }
+        for entry in self.path_table.values() {
+            update_wake(entry.timestamp + PATH_TIMEOUT);
+        }
+
+        self.reverse_table
+            .retain(|_, entry| now.saturating_duration_since(entry.timestamp) <= REVERSE_TIMEOUT);
+        for entry in self.reverse_table.values() {
+            update_wake(entry.timestamp + REVERSE_TIMEOUT);
+        }
+
+        let mut channel_retries = Vec::new();
+        let mut failed_channels = Vec::new();
+        for (link_id, channel) in &mut self.channels {
+            let rtt = self
+                .established_links
+                .get(link_id)
+                .and_then(|link| link.rtt_ms)
+                .map(Duration::from_millis)
+                .unwrap_or(Duration::from_millis(25));
+            let (packets, failed) = channel.retries(now, rtt);
+            for packet in packets {
+                channel_retries.push((*link_id, packet));
+            }
+            if failed {
+                failed_channels.push(*link_id);
+            } else if let Some(next) = channel.next_retry(rtt) {
+                update_wake(next);
+            }
+        }
+        for (link_id, packet) in channel_retries {
+            let target_interface = self.established_links[&link_id].receiving_interface;
+            if let Some(interface) = self.interfaces.get_mut(target_interface) {
+                interface.send(packet, 0);
+            }
+        }
+        for link_id in failed_channels {
+            self.close_link(crate::LinkHandle(link_id));
+            self.channels.remove(&link_id);
         }
 
         if let Some(t) = self.maintain_links(now) {
@@ -3782,6 +3994,96 @@ mod tests {
 
         assert!(a.established_links.contains_key(&link_id));
         assert!(b.established_links.contains_key(&link_id));
+    }
+
+    #[test]
+    fn channel_messages_are_ordered_and_proved() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_b = b.add_service("server", &[], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let now = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        let link_id = a.link(Some(svc_a), addr_b, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        a.send_channel(
+            crate::LinkHandle(link_id),
+            ChannelMessage::new(0x0101, b"hello".to_vec()).unwrap(),
+        )
+        .unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        let (events, _) = b.poll(now);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ServiceEvent::Channel { service, link, message }
+                if *service == svc_b
+                    && *link == crate::LinkHandle(link_id)
+                    && message.message_type == 0x0101
+                    && message.data == b"hello"
+        )));
+
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        assert!(a.channels[&link_id].outbound.is_empty());
+    }
+
+    #[test]
+    fn buffer_data_roundtrips_over_channel() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let svc_a = a.add_service("client", &[], &id(0));
+        let svc_b = b.add_service("server", &[], &id(1));
+        let addr_b = b.service_address(svc_b).unwrap();
+        let now = Instant::now();
+
+        b.announce(svc_b);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+        let link_id = a.link(Some(svc_a), addr_b, now).unwrap();
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(now);
+        transfer(&mut b, 0, &mut a, 0);
+        a.poll(now);
+
+        let data = vec![b'x'; 4096];
+        assert_eq!(
+            a.send_buffer(crate::LinkHandle(link_id), 3, &data, true)
+                .unwrap(),
+            data.len()
+        );
+        a.poll(now);
+        transfer(&mut a, 0, &mut b, 0);
+        let (events, _) = b.poll(now);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ServiceEvent::Buffer { service, link, chunk }
+                if *service == svc_b
+                    && *link == crate::LinkHandle(link_id)
+                    && chunk.stream_id == 3
+                    && chunk.data == data
+                    && chunk.eof
+        )));
     }
 
     #[test]
@@ -6387,6 +6689,8 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(12345);
         let initiator_keypair = EphemeralKeyPair::generate(&mut rng);
         let responder_keypair = EphemeralKeyPair::generate(&mut rng);
+        let responder_signing_key = SigningKey::generate(&mut rng);
+        let initiator_signing_key = SigningKey::generate(&mut rng);
         let dest: Address = [0xAB; 16];
         let link_id: LinkId = [0xCD; 16];
         let now = Instant::now();
@@ -6397,6 +6701,8 @@ mod tests {
             &initiator_keypair.public,
             dest,
             ServiceId(0),
+            responder_signing_key,
+            initiator_signing_key.verifying_key(),
             0,
             now,
         )
@@ -7477,6 +7783,54 @@ mod tests {
         a.poll(t1);
 
         assert!(a.path_table.contains_key(&addr_c));
+    }
+
+    #[test]
+    fn learned_path_expires_after_seven_days() {
+        let mut a = test_node(true);
+        let mut b = test_node(true);
+        a.add_interface(test_interface());
+        b.add_interface(test_interface());
+
+        let service = a.add_service("server", &[], &id(1));
+        let address = a.service_address(service).unwrap();
+        let learned_at = Instant::now();
+
+        a.announce(service);
+        a.poll(learned_at);
+        transfer(&mut a, 0, &mut b, 0);
+        b.poll(learned_at);
+        assert!(b.path_table.contains_key(&address));
+
+        let expired_at = learned_at + std::time::Duration::from_secs(7 * 24 * 60 * 60 + 1);
+        let (events, _) = b.poll(expired_at);
+
+        assert!(!b.path_table.contains_key(&address));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ServiceEvent::DestinationsChanged))
+        );
+    }
+
+    #[test]
+    fn reverse_route_expires_after_eight_minutes() {
+        let mut node = test_node(true);
+        let created_at = Instant::now();
+        let packet_hash = [7; 16];
+        node.reverse_table.insert(
+            packet_hash,
+            ReverseTableEntry {
+                timestamp: created_at,
+                receiving_interface: 0,
+            },
+        );
+
+        node.poll(created_at + REVERSE_TIMEOUT);
+        assert!(node.reverse_table.contains_key(&packet_hash));
+
+        node.poll(created_at + REVERSE_TIMEOUT + Duration::from_nanos(1));
+        assert!(!node.reverse_table.contains_key(&packet_hash));
     }
 
     #[test]

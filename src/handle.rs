@@ -101,6 +101,16 @@ pub enum ServiceEvent {
         service: ServiceId,
         data: Vec<u8>,
     },
+    Channel {
+        service: ServiceId,
+        link: crate::LinkHandle,
+        message: crate::ChannelMessage,
+    },
+    Buffer {
+        service: ServiceId,
+        link: crate::LinkHandle,
+        chunk: crate::BufferChunk,
+    },
     Resource {
         service: ServiceId,
         link: crate::LinkHandle,

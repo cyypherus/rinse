@@ -3,6 +3,8 @@
 
 mod announce;
 mod aspect;
+mod buffer;
+mod channel;
 mod crypto;
 mod handle;
 mod identity;
@@ -26,6 +28,8 @@ mod transports;
 pub mod config;
 
 pub use aspect::AspectHash;
+pub use buffer::{BufferChunk, BufferError};
+pub use channel::{ChannelError, ChannelMessage};
 pub use handle::{
     Destination, IncomingRequest, LinkError, PathNotFound, Progress, RequestError, ResourceError,
     RespondError, Response, SendError, ServiceEvent, ServiceId,
