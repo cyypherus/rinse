@@ -6,7 +6,6 @@ use crate::crypto::sha256;
 
 pub struct PrivateIdentity {
     pub(crate) encryption_secret: StaticSecret,
-    pub(crate) encryption_public: X25519Public,
     pub(crate) signing_key: SigningKey,
 }
 
@@ -21,7 +20,6 @@ impl PrivateIdentity {
         let mut enc_bytes = [0u8; 32];
         rng.fill_bytes(&mut enc_bytes);
         let encryption_secret = StaticSecret::from(enc_bytes);
-        let encryption_public = X25519Public::from(&encryption_secret);
 
         let mut sig_bytes = [0u8; 32];
         rng.fill_bytes(&mut sig_bytes);
@@ -29,7 +27,6 @@ impl PrivateIdentity {
 
         Self {
             encryption_secret,
-            encryption_public,
             signing_key,
         }
     }
@@ -46,12 +43,10 @@ impl PrivateIdentity {
         let sig_bytes: [u8; 32] = bytes[32..64].try_into().unwrap();
 
         let encryption_secret = StaticSecret::from(enc_bytes);
-        let encryption_public = X25519Public::from(&encryption_secret);
         let signing_key = SigningKey::from_bytes(&sig_bytes);
 
         Ok(Self {
             encryption_secret,
-            encryption_public,
             signing_key,
         })
     }
@@ -65,7 +60,7 @@ impl PrivateIdentity {
 
     pub(crate) fn public_key(&self) -> [u8; 64] {
         let mut out = [0u8; 64];
-        out[..32].copy_from_slice(self.encryption_public.as_bytes());
+        out[..32].copy_from_slice(X25519Public::from(&self.encryption_secret).as_bytes());
         out[32..].copy_from_slice(self.signing_key.verifying_key().as_bytes());
         out
     }
@@ -94,10 +89,7 @@ mod tests {
         let bytes = id.to_secret_bytes();
         let id2 = PrivateIdentity::from_secret_bytes(&bytes).unwrap();
 
-        assert_eq!(
-            id.encryption_public.as_bytes(),
-            id2.encryption_public.as_bytes()
-        );
+        assert_eq!(id.public_key(), id2.public_key());
         assert_eq!(id.signing_key.as_bytes(), id2.signing_key.as_bytes());
     }
 
@@ -107,7 +99,10 @@ mod tests {
         let id = PrivateIdentity::generate(&mut rng);
         let pub_key = id.public_key();
 
-        assert_eq!(&pub_key[..32], id.encryption_public.as_bytes());
+        assert_eq!(
+            &pub_key[..32],
+            X25519Public::from(&id.encryption_secret).as_bytes()
+        );
         assert_eq!(&pub_key[32..], id.signing_key.verifying_key().as_bytes());
     }
 }

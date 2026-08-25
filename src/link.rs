@@ -254,12 +254,6 @@ impl EstablishedLink {
             .initiator_encryption_secret
             .diffie_hellman(responder_public)
             .to_bytes();
-        log::debug!(
-            "from_initiator: link_id={} shared_key={} responder_pub={}",
-            hex::encode(pending.link_id),
-            hex::encode(shared_key),
-            hex::encode(responder_public.as_bytes())
-        );
         let keys = LinkEncryption::derive_keys(&shared_key, &pending.link_id);
         let rtt_ms = now.duration_since(pending.request_time).as_millis() as u64;
         Self {
@@ -293,12 +287,6 @@ impl EstablishedLink {
         now: Instant,
     ) -> Self {
         let shared_key = responder_secret.diffie_hellman(initiator_public).to_bytes();
-        log::debug!(
-            "from_responder: link_id={} shared_key={} initiator_pub={}",
-            hex::encode(link_id),
-            hex::encode(shared_key),
-            hex::encode(initiator_public.as_bytes())
-        );
         let keys = LinkEncryption::derive_keys(&shared_key, &link_id);
         Self {
             destination,

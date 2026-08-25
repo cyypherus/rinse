@@ -16,7 +16,7 @@ use crate::handle::{
     RatchetKeysForRestart, RatchetKeysForRestartError, ReceiveError, RequestError, RespondError,
     Response, RuntimeStopped, ServiceEvent, ServiceId,
 };
-use crate::node::{PreparedInbound, ProtocolTimer, ProtocolTimerKey, ScheduledTimer};
+use crate::node::{PreparedInbound, ProtocolTimer, ScheduledTimer};
 use crate::packet::DestinationAddress;
 use crate::request::RequestId;
 use crate::stats::LifetimeStats;
@@ -260,18 +260,13 @@ mod tests {
             let timestamp = Instant::now();
             let event = ProtocolTimerFuture::new(ScheduledTimer {
                 at: timestamp + Duration::from_millis(1),
-                event: ProtocolTimer::ReversePathExpiry {
-                    destination,
-                    timestamp,
-                },
+                event: ProtocolTimer::ReversePathExpiry(destination),
             })
             .await;
+            assert_eq!(event.at, timestamp + Duration::from_millis(1));
             assert!(matches!(
-                event,
-                ProtocolTimer::ReversePathExpiry {
-                    destination: expired,
-                    timestamp: created,
-                } if expired == destination && created == timestamp
+                event.event,
+                ProtocolTimer::ReversePathExpiry(expired) if expired == destination
             ));
         });
     }
@@ -536,7 +531,7 @@ enum Command<T: Transport> {
 
 struct ProtocolTimerFuture {
     timer: embassy_time::Timer,
-    event: Option<ProtocolTimer>,
+    scheduled: ScheduledTimer,
 }
 
 impl ProtocolTimerFuture {
@@ -546,23 +541,23 @@ impl ProtocolTimerFuture {
             timer: embassy_time::Timer::after(embassy_time::Duration::from_micros(
                 remaining.as_micros().min(u64::MAX as u128) as u64,
             )),
-            event: Some(scheduled.event),
+            scheduled,
         }
     }
 }
 
 impl Future for ProtocolTimerFuture {
-    type Output = ProtocolTimer;
+    type Output = ScheduledTimer;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match Pin::new(&mut self.timer).poll(cx) {
-            Poll::Ready(()) => Poll::Ready(self.event.take().unwrap()),
+            Poll::Ready(()) => Poll::Ready(self.scheduled),
             Poll::Pending => Poll::Pending,
         }
     }
 }
 
-struct Runtime<T: Transport> {
+pub struct NodeRuntime<T: Transport> {
     protocol: crate::node::Protocol<T, StdRng>,
     command_rx: mpsc::UnboundedReceiver<Command<T>>,
     link_waiters: HashMap<crate::LinkHandle, Vec<oneshot::Sender<Result<(), EstablishLinkError>>>>,
@@ -583,7 +578,8 @@ struct Runtime<T: Transport> {
         oneshot::Sender<Result<crate::QueuedLinkBufferStreamData, crate::ChannelSendError>>,
     )>,
     timers: FuturesUnordered<Abortable<ProtocolTimerFuture>>,
-    timer_abort_handles: HashMap<ProtocolTimerKey, (ProtocolTimer, AbortHandle)>,
+    timer_abort_handles: HashMap<ProtocolTimer, AbortHandle>,
+    services: HashMap<ServiceId, ServiceSenders>,
 }
 
 pub struct NodeBuilder<T: Transport> {
@@ -596,11 +592,6 @@ pub struct Node<T: Transport> {
     command_tx: mpsc::UnboundedSender<Command<T>>,
     destinations_rx: watch::Receiver<Vec<KnownDestination>>,
     stats_rx: watch::Receiver<LifetimeStats>,
-}
-
-pub struct NodeRuntime<T: Transport> {
-    runtime: Runtime<T>,
-    services: HashMap<ServiceId, ServiceSenders>,
 }
 
 pub struct OutboundLinkBufferStream<'a, T: Transport> {
@@ -699,20 +690,18 @@ impl<T: Transport> NodeBuilder<T> {
                 stats_rx,
             },
             NodeRuntime {
-                runtime: Runtime {
-                    protocol,
-                    command_rx,
-                    link_waiters: HashMap::new(),
-                    path_waiters: HashMap::new(),
-                    destinations_tx,
-                    stats_tx,
-                    request_completions: HashMap::new(),
-                    respond_completions: HashMap::new(),
-                    pending_channel_sends: VecDeque::new(),
-                    pending_buffer_sends: VecDeque::new(),
-                    timers: FuturesUnordered::new(),
-                    timer_abort_handles: HashMap::new(),
-                },
+                protocol,
+                command_rx,
+                link_waiters: HashMap::new(),
+                path_waiters: HashMap::new(),
+                destinations_tx,
+                stats_tx,
+                request_completions: HashMap::new(),
+                respond_completions: HashMap::new(),
+                pending_channel_sends: VecDeque::new(),
+                pending_buffer_sends: VecDeque::new(),
+                timers: FuturesUnordered::new(),
+                timer_abort_handles: HashMap::new(),
                 services: service_senders,
             },
         )
@@ -1207,19 +1196,16 @@ impl<T: Transport> NodeRuntime<T> {
         enum Activity<C> {
             Received(Vec<(Vec<u8>, usize)>),
             Command(Option<C>),
-            Timer(Result<ProtocolTimer, futures_util::future::Aborted>),
+            Timer(Result<ScheduledTimer, futures_util::future::Aborted>),
         }
 
-        let events = self.runtime.protocol.process(Instant::now(), Vec::new());
-        Self::complete_activity(&mut self.runtime, &self.services, events);
-
         loop {
-            let Runtime {
+            let NodeRuntime {
                 protocol,
                 command_rx,
                 timers,
                 ..
-            } = &mut self.runtime;
+            } = &mut self;
             let timer = async {
                 if timers.is_empty() {
                     futures_lite::future::pending().await
@@ -1239,170 +1225,67 @@ impl<T: Transport> NodeRuntime<T> {
             let events = match activity {
                 Activity::Received(received) => {
                     let received = Self::prepare_received(received);
-                    self.runtime.protocol.process(now, received)
+                    self.protocol.process(now, received)
                 }
                 Activity::Command(Some(command)) => {
-                    Self::handle_command(&mut self.runtime, command, now);
-                    self.runtime.protocol.process(now, Vec::new())
+                    self.handle_command(command, now);
+                    self.protocol.process(now, Vec::new())
                 }
                 Activity::Command(None) => break,
                 Activity::Timer(Ok(timer)) => {
-                    let key = timer.key();
-                    if self
-                        .runtime
-                        .timer_abort_handles
-                        .get(&key)
-                        .is_some_and(|(current, _)| *current == timer)
-                    {
-                        self.runtime.timer_abort_handles.remove(&key);
-                        self.runtime.protocol.handle_timer(now, timer)
-                    } else {
-                        Vec::new()
+                    if self.timer_abort_handles.remove(&timer.event).is_none() {
+                        continue;
                     }
+                    self.protocol.handle_timer(now, timer)
                 }
-                Activity::Timer(Err(_)) => Vec::new(),
+                Activity::Timer(Err(_)) => continue,
             };
-            Self::complete_activity(&mut self.runtime, &self.services, events);
+            self.complete_activity(events);
         }
     }
 
-    fn complete_activity(
-        inner: &mut Runtime<T>,
-        services: &HashMap<ServiceId, ServiceSenders>,
-        events: Vec<ServiceEvent>,
-    ) {
-        while let Some((link, message, _)) = inner.pending_channel_sends.front() {
-            match inner
+    fn complete_activity(&mut self, events: Vec<ServiceEvent>) {
+        while let Some((link, message, _)) = self.pending_channel_sends.front() {
+            match self
                 .protocol
                 .try_queue_channel_message(*link, message.clone())
             {
                 Ok(()) => {
-                    let (_, _, reply) = inner.pending_channel_sends.pop_front().unwrap();
+                    let (_, _, reply) = self.pending_channel_sends.pop_front().unwrap();
                     let _ = reply.send(Ok(()));
                 }
                 Err(crate::channel::QueueChannelError::WindowFull) => break,
                 Err(crate::channel::QueueChannelError::LinkNotFound) => {
-                    let (_, _, reply) = inner.pending_channel_sends.pop_front().unwrap();
+                    let (_, _, reply) = self.pending_channel_sends.pop_front().unwrap();
                     let _ = reply.send(Err(crate::ChannelSendError::LinkNotFound));
                 }
                 Err(crate::channel::QueueChannelError::LinkNotActive) => {
-                    let (_, _, reply) = inner.pending_channel_sends.pop_front().unwrap();
+                    let (_, _, reply) = self.pending_channel_sends.pop_front().unwrap();
                     let _ = reply.send(Err(crate::ChannelSendError::LinkNotActive));
                 }
             }
         }
-        while let Some((link, raw, _, _)) = inner.pending_buffer_sends.front() {
-            match inner.protocol.send_buffer_data(*link, raw) {
+        while let Some((link, raw, _, _)) = self.pending_buffer_sends.front() {
+            match self.protocol.send_buffer_data(*link, raw) {
                 Ok(()) => {
-                    let (_, _, processed, reply) = inner.pending_buffer_sends.pop_front().unwrap();
+                    let (_, _, processed, reply) = self.pending_buffer_sends.pop_front().unwrap();
                     let _ = reply.send(Ok(crate::QueuedLinkBufferStreamData {
                         input_prefix_bytes_queued: processed,
                     }));
                 }
                 Err(crate::channel::QueueChannelError::WindowFull) => break,
                 Err(crate::channel::QueueChannelError::LinkNotFound) => {
-                    let (_, _, _, reply) = inner.pending_buffer_sends.pop_front().unwrap();
+                    let (_, _, _, reply) = self.pending_buffer_sends.pop_front().unwrap();
                     let _ = reply.send(Err(crate::ChannelSendError::LinkNotFound));
                 }
                 Err(crate::channel::QueueChannelError::LinkNotActive) => {
-                    let (_, _, _, reply) = inner.pending_buffer_sends.pop_front().unwrap();
+                    let (_, _, _, reply) = self.pending_buffer_sends.pop_front().unwrap();
                     let _ = reply.send(Err(crate::ChannelSendError::LinkNotActive));
                 }
             }
         }
 
-        for event in &events {
-            if let ServiceEvent::PathRequestResult { destination, found } = event
-                && let Some(waiters) = inner.path_waiters.remove(destination)
-            {
-                for tx in waiters {
-                    let _ = tx.send(*found);
-                }
-            }
-        }
-
-        let destinations_changed = events
-            .iter()
-            .any(|event| matches!(event, ServiceEvent::DestinationsChanged));
-        Self::dispatch_events(
-            services,
-            &mut inner.request_completions,
-            &mut inner.respond_completions,
-            events,
-        );
-        if destinations_changed {
-            inner
-                .destinations_tx
-                .send_replace(inner.protocol.known_destinations());
-        }
-        inner.stats_tx.send_replace(inner.protocol.stats());
-
-        inner.link_waiters.retain(|link, waiters| {
-            let status = inner.protocol.lookup_link_status(*link);
-            if status == Some(crate::LinkStatus::Active) {
-                for tx in waiters.drain(..) {
-                    let _ = tx.send(Ok(()));
-                }
-                false
-            } else if status == Some(crate::LinkStatus::Closed) || status.is_none() {
-                for tx in waiters.drain(..) {
-                    let _ = tx.send(Err(EstablishLinkError::Timeout));
-                }
-                false
-            } else {
-                true
-            }
-        });
-        for timer in inner.protocol.take_scheduled_timers() {
-            let key = timer.event.key();
-            let (abort_handle, abort_registration) = AbortHandle::new_pair();
-            if let Some((_, previous)) = inner
-                .timer_abort_handles
-                .insert(key, (timer.event, abort_handle))
-            {
-                previous.abort();
-            }
-            inner.timers.push(Abortable::new(
-                ProtocolTimerFuture::new(timer),
-                abort_registration,
-            ));
-        }
-    }
-
-    fn prepare_received(received: Vec<(Vec<u8>, usize)>) -> Vec<PreparedInbound> {
-        if received.len() < 32
-            || received.iter().map(|(raw, _)| raw.len()).sum::<usize>() / received.len() < 256
-        {
-            return received
-                .into_iter()
-                .filter_map(|(raw, source)| PreparedInbound::parse(raw, source))
-                .collect();
-        }
-
-        #[cfg(feature = "parallel-packet-processing")]
-        {
-            use rayon::prelude::*;
-
-            received
-                .into_par_iter()
-                .filter_map(|(raw, source)| PreparedInbound::parse(raw, source))
-                .collect()
-        }
-        #[cfg(not(feature = "parallel-packet-processing"))]
-        {
-            received
-                .into_iter()
-                .filter_map(|(raw, source)| PreparedInbound::parse(raw, source))
-                .collect()
-        }
-    }
-
-    fn dispatch_events(
-        services: &HashMap<ServiceId, ServiceSenders>,
-        request_completions: &mut HashMap<RequestId, RequestCompletion>,
-        respond_completions: &mut HashMap<RequestId, RespondCompletion>,
-        events: Vec<ServiceEvent>,
-    ) {
+        let mut destinations_changed = false;
         for event in events {
             match event {
                 ServiceEvent::Request {
@@ -1412,7 +1295,7 @@ impl<T: Transport> NodeRuntime<T> {
                     data,
                     remote_identity,
                 } => {
-                    if let Some(channels) = services.get(&service) {
+                    if let Some(channels) = self.services.get(&service) {
                         let _ = channels.request_tx.try_send(IncomingRequest {
                             request_id,
                             path,
@@ -1427,7 +1310,7 @@ impl<T: Transport> NodeRuntime<T> {
                     link,
                     data,
                 } => {
-                    if let Some(channels) = services.get(&service) {
+                    if let Some(channels) = self.services.get(&service) {
                         let datagram = match link {
                             Some(link) => crate::ReceivedDatagram::Link { link, data },
                             None => crate::ReceivedDatagram::Destination { data },
@@ -1440,7 +1323,7 @@ impl<T: Transport> NodeRuntime<T> {
                     link,
                     message,
                 } => {
-                    if let Some(channels) = services.get(&service) {
+                    if let Some(channels) = self.services.get(&service) {
                         let _ = channels.channel_tx.try_send((link, message));
                     }
                 }
@@ -1449,38 +1332,95 @@ impl<T: Transport> NodeRuntime<T> {
                     link,
                     chunk,
                 } => {
-                    if let Some(channels) = services.get(&service) {
+                    if let Some(channels) = self.services.get(&service) {
                         let _ = channels.buffer_tx.try_send((link, chunk));
                     }
                 }
                 #[cfg(test)]
                 ServiceEvent::ResourceProgress { .. } => {}
                 ServiceEvent::RequestResult { request_id, result } => {
-                    if let Some(tx) = request_completions.remove(&request_id) {
+                    if let Some(tx) = self.request_completions.remove(&request_id) {
                         let _ = tx.send(result.map(|(_, data, metadata)| (data, metadata)));
                     }
                 }
                 ServiceEvent::RespondResult { request_id, result } => {
-                    if let Some(tx) = respond_completions.remove(&request_id) {
+                    if let Some(tx) = self.respond_completions.remove(&request_id) {
                         let _ = tx.send(result);
                     }
                 }
-                ServiceEvent::DestinationsChanged => {}
-                ServiceEvent::PathRequestResult { .. } => {}
+                ServiceEvent::DestinationsChanged => destinations_changed = true,
+                ServiceEvent::PathRequestResult { destination, found } => {
+                    if let Some(waiters) = self.path_waiters.remove(&destination) {
+                        for tx in waiters {
+                            let _ = tx.send(found);
+                        }
+                    }
+                }
             }
+        }
+        if destinations_changed {
+            self.destinations_tx
+                .send_replace(self.protocol.known_destinations());
+        }
+        self.stats_tx.send_replace(self.protocol.stats());
+
+        self.link_waiters.retain(
+            |link, waiters| match self.protocol.lookup_link_status(*link) {
+                Some(crate::LinkStatus::Active) => {
+                    for tx in waiters.drain(..) {
+                        let _ = tx.send(Ok(()));
+                    }
+                    false
+                }
+                Some(crate::LinkStatus::Closed) | None => {
+                    for tx in waiters.drain(..) {
+                        let _ = tx.send(Err(EstablishLinkError::Timeout));
+                    }
+                    false
+                }
+                Some(_) => true,
+            },
+        );
+        for timer in self.protocol.take_scheduled_timers() {
+            let (abort_handle, abort_registration) = AbortHandle::new_pair();
+            if let Some(previous) = self.timer_abort_handles.insert(timer.event, abort_handle) {
+                previous.abort();
+            }
+            self.timers.push(Abortable::new(
+                ProtocolTimerFuture::new(timer),
+                abort_registration,
+            ));
         }
     }
 
-    fn handle_command(inner: &mut Runtime<T>, cmd: Command<T>, now: Instant) {
+    fn prepare_received(received: Vec<(Vec<u8>, usize)>) -> Vec<PreparedInbound> {
+        #[cfg(feature = "parallel-packet-processing")]
+        if received.len() >= 32
+            && received.iter().map(|(raw, _)| raw.len()).sum::<usize>() / received.len() >= 256
+        {
+            use rayon::prelude::*;
+
+            return received
+                .into_par_iter()
+                .filter_map(|(raw, source)| PreparedInbound::parse(raw, source))
+                .collect();
+        }
+        received
+            .into_iter()
+            .filter_map(|(raw, source)| PreparedInbound::parse(raw, source))
+            .collect()
+    }
+
+    fn handle_command(&mut self, cmd: Command<T>, now: Instant) {
         match cmd {
             Command::AddInterface { interface } => {
-                inner.protocol.add_interface(*interface);
+                self.protocol.add_interface(*interface);
             }
             Command::Announce { service, app_data } => {
                 if let Some(data) = app_data {
-                    inner.protocol.announce_with_app_data(service, Some(data));
+                    self.protocol.announce_with_app_data(service, Some(data));
                 } else {
-                    inner.protocol.announce(service);
+                    self.protocol.announce(service);
                 }
             }
             Command::ConfigureAnnouncementRatchets {
@@ -1489,7 +1429,7 @@ impl<T: Transport> NodeRuntime<T> {
                 restored_keys,
                 reply,
             } => {
-                let _ = reply.send(inner.protocol.configure_announcement_ratchet_rotation(
+                let _ = reply.send(self.protocol.configure_announcement_ratchet_rotation(
                     service,
                     interval,
                     restored_keys,
@@ -1497,16 +1437,16 @@ impl<T: Transport> NodeRuntime<T> {
                 ));
             }
             Command::ExportRatchetKeysForRestart { service, reply } => {
-                let _ = reply.send(inner.protocol.ratchet_keys_for_restart(service));
+                let _ = reply.send(self.protocol.ratchet_keys_for_restart(service));
             }
             Command::Request {
                 link,
                 path,
                 data,
                 completion,
-            } => match inner.protocol.request_over_link(link, &path, &data) {
+            } => match self.protocol.request_over_link(link, &path, &data) {
                 Ok(request_id) => {
-                    inner.request_completions.insert(request_id, completion);
+                    self.request_completions.insert(request_id, completion);
                 }
                 Err(error) => {
                     let _ = completion.send(Err(error));
@@ -1519,14 +1459,14 @@ impl<T: Transport> NodeRuntime<T> {
                 compress,
                 completion,
             } => {
-                match inner.protocol.respond_checked(
+                match self.protocol.respond_checked(
                     request_id,
                     &data,
                     metadata.as_deref(),
                     compress,
                 ) {
                     Ok(()) => {
-                        inner.respond_completions.insert(request_id, completion);
+                        self.respond_completions.insert(request_id, completion);
                     }
                     Err(error) => {
                         let _ = completion.send(Err(error));
@@ -1538,17 +1478,17 @@ impl<T: Transport> NodeRuntime<T> {
                 data,
                 reply,
             } => {
-                let _ = reply.send(inner.protocol.send_destination_datagram(destination, &data));
+                let _ = reply.send(self.protocol.send_destination_datagram(destination, &data));
             }
             Command::SendLinkDatagram { link, data, reply } => {
-                let _ = reply.send(inner.protocol.send_link_datagram(link, &data));
+                let _ = reply.send(self.protocol.send_link_datagram(link, &data));
             }
             Command::SendChannel {
                 link,
                 message,
                 reply,
             } => {
-                match inner
+                match self
                     .protocol
                     .try_queue_channel_message(link, message.clone())
                 {
@@ -1556,9 +1496,7 @@ impl<T: Transport> NodeRuntime<T> {
                         let _ = reply.send(Ok(()));
                     }
                     Err(crate::channel::QueueChannelError::WindowFull) => {
-                        inner
-                            .pending_channel_sends
-                            .push_back((link, message, reply));
+                        self.pending_channel_sends.push_back((link, message, reply));
                     }
                     Err(crate::channel::QueueChannelError::LinkNotFound) => {
                         let _ = reply.send(Err(crate::ChannelSendError::LinkNotFound));
@@ -1573,15 +1511,14 @@ impl<T: Transport> NodeRuntime<T> {
                 raw,
                 processed,
                 reply,
-            } => match inner.protocol.send_buffer_data(link, &raw) {
+            } => match self.protocol.send_buffer_data(link, &raw) {
                 Ok(()) => {
                     let _ = reply.send(Ok(crate::QueuedLinkBufferStreamData {
                         input_prefix_bytes_queued: processed,
                     }));
                 }
                 Err(crate::channel::QueueChannelError::WindowFull) => {
-                    inner
-                        .pending_buffer_sends
+                    self.pending_buffer_sends
                         .push_back((link, raw, processed, reply));
                 }
                 Err(crate::channel::QueueChannelError::LinkNotFound) => {
@@ -1596,45 +1533,48 @@ impl<T: Transport> NodeRuntime<T> {
                 destination,
                 reply,
             } => {
-                let _ = reply.send(inner.protocol.create_link(service, destination, now));
+                let _ = reply.send(self.protocol.create_link(service, destination, now));
             }
             Command::LinkStatus { link, reply } => {
-                let _ = reply.send(inner.protocol.lookup_link_status(link));
+                let _ = reply.send(self.protocol.lookup_link_status(link));
             }
             Command::LinkRtt { link, reply } => {
-                let _ = reply.send(inner.protocol.link_rtt(link));
+                let _ = reply.send(self.protocol.link_rtt(link));
             }
             Command::CloseLink { link, reply } => {
-                let _ = reply.send(inner.protocol.close_link(link));
+                let _ = reply.send(self.protocol.close_link(link));
             }
             Command::AuthenticateToLinkPeer {
                 link,
                 identity,
                 reply,
             } => {
-                let _ = reply.send(inner.protocol.authenticate_to_link_peer(link, &identity));
+                let _ = reply.send(self.protocol.authenticate_to_link_peer(link, &identity));
             }
             Command::AwaitLinkActive { link, reply } => {
-                if inner.protocol.lookup_link_status(link) == Some(crate::LinkStatus::Active) {
-                    let _ = reply.send(Ok(()));
-                } else if inner.protocol.lookup_link_status(link) == Some(crate::LinkStatus::Closed)
-                    || inner.protocol.lookup_link_status(link).is_none()
-                {
-                    let _ = reply.send(Err(EstablishLinkError::Timeout));
-                } else {
-                    inner.link_waiters.entry(link).or_default().push(reply);
+                match self.protocol.lookup_link_status(link) {
+                    Some(crate::LinkStatus::Active) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    Some(crate::LinkStatus::Closed) | None => {
+                        let _ = reply.send(Err(EstablishLinkError::Timeout));
+                    }
+                    Some(_) => self.link_waiters.entry(link).or_default().push(reply),
                 }
             }
             Command::RequestPath { destination, reply } => {
-                if inner.protocol.has_path(destination) {
+                if self.protocol.has_path(destination) {
                     let _ = reply.send(true);
                 } else {
-                    inner.protocol.request_path(destination, now);
-                    inner
-                        .path_waiters
-                        .entry(destination)
-                        .or_default()
-                        .push(reply);
+                    match self.path_waiters.entry(destination) {
+                        std::collections::hash_map::Entry::Vacant(waiters) => {
+                            self.protocol.request_path(destination, now);
+                            waiters.insert(vec![reply]);
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut waiters) => {
+                            waiters.get_mut().push(reply);
+                        }
+                    }
                 }
             }
             Command::EncryptForLaterDelivery {
@@ -1642,11 +1582,7 @@ impl<T: Transport> NodeRuntime<T> {
                 data,
                 reply,
             } => {
-                let _ = reply.send(
-                    inner
-                        .protocol
-                        .encrypt_for_later_delivery(destination, &data),
-                );
+                let _ = reply.send(self.protocol.encrypt_for_later_delivery(destination, &data));
             }
             Command::DecryptLaterDeliveredPayload {
                 service,
@@ -1654,8 +1590,7 @@ impl<T: Transport> NodeRuntime<T> {
                 reply,
             } => {
                 let _ = reply.send(
-                    inner
-                        .protocol
+                    self.protocol
                         .decrypt_later_delivered_payload(service, &data),
                 );
             }

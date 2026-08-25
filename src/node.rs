@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -113,7 +113,6 @@ pub(crate) struct PathEntry {
     ratchet_key: Option<X25519Public>,
     app_data: Option<Vec<u8>>,
     name_hash: [u8; 10],
-    has_ratchet: bool,
     announce_data: Vec<u8>,
 }
 
@@ -176,67 +175,15 @@ pub(crate) struct ScheduledTimer {
     pub(crate) event: ProtocolTimer,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProtocolTimer {
-    AnnounceRetry {
-        destination: DestinationAddress,
-        retry_at: Instant,
-    },
-    PathExpiry {
-        destination: DestinationAddress,
-        timestamp: Instant,
-    },
-    ReversePathExpiry {
-        destination: DestinationAddress,
-        timestamp: Instant,
-    },
-    ChannelRetry {
-        link: LinkId,
-        retry_at: Instant,
-    },
-    PendingLinkTimeout {
-        link: LinkId,
-        request_time: Instant,
-    },
-    PathRequestTimeout {
-        destination: DestinationAddress,
-        request_time: Instant,
-    },
-    LinkMaintenance {
-        link: LinkId,
-        last_inbound: Instant,
-        last_keepalive_sent: Option<Instant>,
-        rtt_ms: Option<u64>,
-    },
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum ProtocolTimerKey {
+pub(crate) enum ProtocolTimer {
     AnnounceRetry(DestinationAddress),
     PathExpiry(DestinationAddress),
     ReversePathExpiry(DestinationAddress),
     ChannelRetry(LinkId),
-    PendingLinkTimeout(LinkId),
+    PendingLinkTimeout(LinkId, Instant),
     PathRequestTimeout(DestinationAddress),
     LinkMaintenance(LinkId),
-}
-
-impl ProtocolTimer {
-    pub(crate) fn key(self) -> ProtocolTimerKey {
-        match self {
-            Self::AnnounceRetry { destination, .. } => ProtocolTimerKey::AnnounceRetry(destination),
-            Self::PathExpiry { destination, .. } => ProtocolTimerKey::PathExpiry(destination),
-            Self::ReversePathExpiry { destination, .. } => {
-                ProtocolTimerKey::ReversePathExpiry(destination)
-            }
-            Self::ChannelRetry { link, .. } => ProtocolTimerKey::ChannelRetry(link),
-            Self::PendingLinkTimeout { link, .. } => ProtocolTimerKey::PendingLinkTimeout(link),
-            Self::PathRequestTimeout { destination, .. } => {
-                ProtocolTimerKey::PathRequestTimeout(destination)
-            }
-            Self::LinkMaintenance { link, .. } => ProtocolTimerKey::LinkMaintenance(link),
-        }
-    }
 }
 
 impl PreparedInbound {
@@ -300,7 +247,6 @@ pub(crate) struct Protocol<T, R = ThreadRng> {
         ),
     >,
     inbound_resources: HashMap<[u8; 32], (LinkId, crate::resource::InboundResource)>,
-    pending_resource_adverts: HashMap<[u8; 32], (LinkId, crate::resource::ResourceAdvertisement)>,
     multi_segment_transfers: HashMap<[u8; 32], MultiSegmentTransfer>,
     outbound_multi_segments: HashMap<[u8; 32], OutboundMultiSegment>,
     inbound_request_links: HashMap<RequestId, (WireRequestId, LinkId, ServiceId)>,
@@ -311,7 +257,7 @@ pub(crate) struct Protocol<T, R = ThreadRng> {
     discovery_path_requests: HashMap<DestinationAddress, usize>,
     stats: Stats,
     pending_events: Vec<ServiceEvent>,
-    pending_resource_requests: Vec<(LinkId, [u8; 32])>,
+    pending_resource_requests: HashSet<(LinkId, [u8; 32])>,
     channels: HashMap<LinkId, ChannelState>,
     scheduled_timers: Vec<ScheduledTimer>,
     #[cfg(test)]
@@ -345,7 +291,6 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             link_table: HashMap::new(),
             outbound_resources: HashMap::new(),
             inbound_resources: HashMap::new(),
-            pending_resource_adverts: HashMap::new(),
             multi_segment_transfers: HashMap::new(),
             outbound_multi_segments: HashMap::new(),
             inbound_request_links: HashMap::new(),
@@ -355,7 +300,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             discovery_path_requests: HashMap::new(),
             stats: Stats::new(),
             pending_events: Vec::new(),
-            pending_resource_requests: Vec::new(),
+            pending_resource_requests: HashSet::new(),
             channels: HashMap::new(),
             scheduled_timers: Vec::new(),
             #[cfg(test)]
@@ -375,14 +320,26 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         self.scheduled_timers.push(ScheduledTimer { at, event });
     }
 
+    #[cfg(test)]
+    fn install_test_timers(&mut self) {
+        for timer in self.take_scheduled_timers() {
+            if let Some(current) = self
+                .test_timers
+                .iter_mut()
+                .find(|current| current.event == timer.event)
+            {
+                *current = timer;
+            } else {
+                self.test_timers.push(timer);
+            }
+        }
+    }
+
     fn schedule_path_expiry(&mut self, destination: DestinationAddress) {
         if let Some(entry) = self.path_table.get(&destination) {
             self.schedule_timer(
                 entry.timestamp + PATH_TIMEOUT + Duration::from_nanos(1),
-                ProtocolTimer::PathExpiry {
-                    destination,
-                    timestamp: entry.timestamp,
-                },
+                ProtocolTimer::PathExpiry(destination),
             );
         }
     }
@@ -399,38 +356,35 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             .get(&link)
             .and_then(|channel| channel.next_retry(rtt))
         {
-            self.schedule_timer(retry_at, ProtocolTimer::ChannelRetry { link, retry_at });
+            self.schedule_timer(retry_at, ProtocolTimer::ChannelRetry(link));
         }
     }
 
     fn schedule_link_maintenance(&mut self, link_id: LinkId) {
-        if let Some(link) = self.established_links.get(&link_id) {
-            let stale_at = link
-                .pending_requests
-                .is_empty()
-                .then(|| link.last_inbound + Duration::from_secs(link.stale_time_secs()));
-            let keepalive_at = (link.is_initiator && link.state == LinkState::Active).then(|| {
-                let keepalive = Duration::from_secs(link.keepalive_interval_secs());
-                (link.last_inbound + keepalive).max(
-                    link.last_keepalive_sent
-                        .map(|sent| sent + keepalive)
-                        .unwrap_or(link.last_inbound),
-                )
-            });
-            let at = match (stale_at, keepalive_at) {
-                (Some(stale), Some(keepalive)) => stale.min(keepalive),
-                (Some(at), None) | (None, Some(at)) => at,
-                (None, None) => return,
-            };
-            self.schedule_timer(
-                at,
-                ProtocolTimer::LinkMaintenance {
-                    link: link_id,
-                    last_inbound: link.last_inbound,
-                    last_keepalive_sent: link.last_keepalive_sent,
-                    rtt_ms: link.rtt_ms,
-                },
-            );
+        if let Some(link) = self.established_links.get(&link_id)
+            && let Some(at) = Self::link_maintenance_at(link)
+        {
+            self.schedule_timer(at, ProtocolTimer::LinkMaintenance(link_id));
+        }
+    }
+
+    fn link_maintenance_at(link: &EstablishedLink) -> Option<Instant> {
+        let stale_at = link
+            .pending_requests
+            .is_empty()
+            .then(|| link.last_inbound + Duration::from_secs(link.stale_time_secs()));
+        let keepalive_at = (link.is_initiator && link.state == LinkState::Active).then(|| {
+            let keepalive = Duration::from_secs(link.keepalive_interval_secs());
+            (link.last_inbound + keepalive).max(
+                link.last_keepalive_sent
+                    .map(|sent| sent + keepalive)
+                    .unwrap_or(link.last_inbound),
+            )
+        });
+        match (stale_at, keepalive_at) {
+            (Some(stale), Some(keepalive)) => Some(stale.min(keepalive)),
+            (Some(at), None) | (None, Some(at)) => Some(at),
+            (None, None) => None,
         }
     }
 
@@ -880,7 +834,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         let name_hash: [u8; 10] = sha256(name.as_bytes())[..10].try_into().unwrap();
 
         let encryption_secret = StaticSecret::from(*identity.encryption_secret.as_bytes());
-        let encryption_public = identity.encryption_public;
+        let encryption_public = X25519Public::from(&identity.encryption_secret);
         let signing_key = SigningKey::from_bytes(identity.signing_key.as_bytes());
 
         let identity_hash = identity.hash();
@@ -1069,10 +1023,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         self.pending_path_requests.insert(destination, now);
         self.schedule_timer(
             now + Duration::from_secs(PATH_REQUEST_TIMEOUT_SECS),
-            ProtocolTimer::PathRequestTimeout {
-                destination,
-                request_time: now,
-            },
+            ProtocolTimer::PathRequestTimeout(destination),
         );
 
         let mut tag = [0u8; 16];
@@ -1565,10 +1516,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         );
         self.schedule_timer(
             now + timeout,
-            ProtocolTimer::PendingLinkTimeout {
-                link: link_id,
-                request_time: now,
-            },
+            ProtocolTimer::PendingLinkTimeout(link_id, now),
         );
 
         // Send on the interface that received the announce
@@ -1749,7 +1697,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                 let response_packet = self.make_announce_packet(
                     query_dest,
                     path_entry.hops,
-                    path_entry.has_ratchet,
+                    path_entry.ratchet_key.is_some(),
                     true, // is_path_response
                     path_entry.announce_data.clone(),
                     Some(self.transport_id),
@@ -1849,10 +1797,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                         );
                         self.scheduled_timers.push(ScheduledTimer {
                             at: now + REVERSE_TIMEOUT + Duration::from_nanos(1),
-                            event: ProtocolTimer::ReversePathExpiry {
-                                destination: destination_hash,
-                                timestamp: now,
-                            },
+                            event: ProtocolTimer::ReversePathExpiry(destination_hash),
                         });
                     }
 
@@ -1864,10 +1809,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                         path_entry.timestamp = now;
                         self.scheduled_timers.push(ScheduledTimer {
                             at: now + PATH_TIMEOUT + Duration::from_nanos(1),
-                            event: ProtocolTimer::PathExpiry {
-                                destination: dest,
-                                timestamp: now,
-                            },
+                            event: ProtocolTimer::PathExpiry(dest),
                         });
                     }
                 } else {
@@ -2082,7 +2024,6 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                                 ratchet_key: announce.ratchet.map(X25519Public::from),
                                 app_data,
                                 name_hash: announce.name_hash,
-                                has_ratchet,
                                 announce_data: data.clone(),
                             },
                         );
@@ -2094,6 +2035,8 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                         if !is_path_response && self.transport {
                             let delay_ms = self.rng.gen_range(0..=PATHFINDER_RW_MS);
                             let retry_at = now + std::time::Duration::from_millis(delay_ms);
+                            self.pending_announces
+                                .retain(|pending| pending.destination != destination_hash);
                             self.pending_announces.push(PendingAnnounce {
                                 destination: destination_hash,
                                 source_interface: interface_index,
@@ -2106,10 +2049,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                             });
                             self.schedule_timer(
                                 retry_at,
-                                ProtocolTimer::AnnounceRetry {
-                                    destination: destination_hash,
-                                    retry_at,
-                                },
+                                ProtocolTimer::AnnounceRetry(destination_hash),
                             );
                         }
 
@@ -3065,21 +3005,12 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         }
 
         // Process batched resource requests (deduplicated)
-        let pending_reqs: Vec<_> = self.pending_resource_requests.drain(..).collect();
-        let mut seen = std::collections::HashSet::new();
-        for (link_id, hash) in pending_reqs {
-            if seen.insert((link_id, hash)) {
-                self.send_resource_request(link_id, hash, now);
-            }
+        for (link_id, hash) in std::mem::take(&mut self.pending_resource_requests) {
+            self.send_resource_request(link_id, hash, now);
         }
 
         // Remove disconnected interfaces
-        let before_count = self.interfaces.len();
         self.interfaces.retain(|iface| !iface.is_closed());
-        let removed = before_count - self.interfaces.len();
-        if removed > 0 {
-            log::debug!("Removed {} disconnected interface(s)", removed);
-        }
 
         std::mem::take(&mut self.pending_events)
     }
@@ -3095,13 +3026,11 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         .filter_map(|(raw, source)| PreparedInbound::parse(raw, source))
         .collect();
         let mut events = self.process(now, received);
-        let scheduled = self.take_scheduled_timers();
-        self.test_timers.extend(scheduled);
+        self.install_test_timers();
         while let Some(index) = self.test_timers.iter().position(|timer| timer.at <= now) {
             let timer = self.test_timers.swap_remove(index);
-            events.extend(self.handle_timer(now, timer.event));
-            let scheduled = self.take_scheduled_timers();
-            self.test_timers.extend(scheduled);
+            events.extend(self.handle_timer(now, timer));
+            self.install_test_timers();
         }
         for iface in &mut self.interfaces {
             let _ = iface.poll_send(&mut Context::from_waker(std::task::Waker::noop()));
@@ -3109,15 +3038,20 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         events
     }
 
-    pub(crate) fn handle_timer(&mut self, now: Instant, event: ProtocolTimer) -> Vec<ServiceEvent> {
+    pub(crate) fn handle_timer(
+        &mut self,
+        now: Instant,
+        scheduled: ScheduledTimer,
+    ) -> Vec<ServiceEvent> {
+        let ScheduledTimer { at, event } = scheduled;
+        if now < at {
+            return Vec::new();
+        }
         match event {
-            ProtocolTimer::AnnounceRetry {
-                destination,
-                retry_at,
-            } => {
+            ProtocolTimer::AnnounceRetry(destination) => {
                 let Some(index) = self.pending_announces.iter().position(|pending| {
                     pending.destination == destination
-                        && pending.retry_at == retry_at
+                        && pending.retry_at == at
                         && pending.retries_remaining > 0
                 }) else {
                     return Vec::new();
@@ -3148,13 +3082,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                     Some(self.transport_id),
                 );
                 if let Some(retry_at) = next_retry {
-                    self.schedule_timer(
-                        retry_at,
-                        ProtocolTimer::AnnounceRetry {
-                            destination,
-                            retry_at,
-                        },
-                    );
+                    self.schedule_timer(retry_at, ProtocolTimer::AnnounceRetry(destination));
                 } else {
                     self.pending_announces.swap_remove(index);
                 }
@@ -3165,47 +3093,35 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                 self.stats.announces_relayed += interfaces as u64;
                 self.outbound(packet, Some(source), now);
             }
-            ProtocolTimer::PathExpiry {
-                destination,
-                timestamp,
-            } => {
-                if self
-                    .path_table
-                    .get(&destination)
-                    .is_some_and(|entry| entry.timestamp == timestamp)
-                {
+            ProtocolTimer::PathExpiry(destination) => {
+                if self.path_table.get(&destination).is_some_and(|entry| {
+                    entry.timestamp + PATH_TIMEOUT + Duration::from_nanos(1) == at
+                }) {
                     self.path_table.remove(&destination);
                     self.pending_events.push(ServiceEvent::DestinationsChanged);
                 }
             }
-            ProtocolTimer::ReversePathExpiry {
-                destination,
-                timestamp,
-            } => {
-                if self
-                    .reverse_table
-                    .get(&destination)
-                    .is_some_and(|entry| entry.timestamp == timestamp)
-                {
+            ProtocolTimer::ReversePathExpiry(destination) => {
+                if self.reverse_table.get(&destination).is_some_and(|entry| {
+                    entry.timestamp + REVERSE_TIMEOUT + Duration::from_nanos(1) == at
+                }) {
                     self.reverse_table.remove(&destination);
                 }
             }
-            ProtocolTimer::ChannelRetry { link, retry_at } => {
+            ProtocolTimer::ChannelRetry(link) => {
                 let rtt = self
                     .established_links
                     .get(&link)
                     .and_then(|link| link.rtt_ms)
                     .map(Duration::from_millis)
                     .unwrap_or(Duration::from_millis(25));
-                if self
-                    .channels
-                    .get(&link)
-                    .and_then(|channel| channel.next_retry(rtt))
-                    != Some(retry_at)
-                {
+                let Some(channel) = self.channels.get_mut(&link) else {
+                    return Vec::new();
+                };
+                if channel.next_retry(rtt) != Some(at) {
                     return Vec::new();
                 }
-                let (packets, failed) = self.channels.get_mut(&link).unwrap().retries(now, rtt);
+                let (packets, failed) = channel.retries(now, rtt);
                 if failed {
                     self.close_link(crate::LinkHandle(link));
                     self.channels.remove(&link);
@@ -3222,7 +3138,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                     self.schedule_channel_retry(link);
                 }
             }
-            ProtocolTimer::PendingLinkTimeout { link, request_time } => {
+            ProtocolTimer::PendingLinkTimeout(link, request_time) => {
                 let Some(pending) = self.pending_outbound_links.get(&link) else {
                     return Vec::new();
                 };
@@ -3242,11 +3158,14 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                 }
                 self.dispatch_notifications(notifications);
             }
-            ProtocolTimer::PathRequestTimeout {
-                destination,
-                request_time,
-            } => {
-                if self.pending_path_requests.get(&destination) != Some(&request_time) {
+            ProtocolTimer::PathRequestTimeout(destination) => {
+                if self
+                    .pending_path_requests
+                    .get(&destination)
+                    .is_none_or(|requested| {
+                        *requested + Duration::from_secs(PATH_REQUEST_TIMEOUT_SECS) != at
+                    })
+                {
                     return Vec::new();
                 }
                 self.pending_path_requests.remove(&destination);
@@ -3264,19 +3183,11 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                 }
                 self.dispatch_notifications(notifications);
             }
-            ProtocolTimer::LinkMaintenance {
-                link: link_id,
-                last_inbound,
-                last_keepalive_sent,
-                rtt_ms,
-            } => {
+            ProtocolTimer::LinkMaintenance(link_id) => {
                 let Some(link) = self.established_links.get(&link_id) else {
                     return Vec::new();
                 };
-                if link.last_inbound != last_inbound
-                    || link.last_keepalive_sent != last_keepalive_sent
-                    || link.rtt_ms != rtt_ms
-                {
+                if Self::link_maintenance_at(link) != Some(at) {
                     return Vec::new();
                 }
                 let stale = now.saturating_duration_since(link.last_inbound)
@@ -3308,7 +3219,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                     self.channels.remove(&link_id);
                 } else {
                     if keepalive {
-                        let interface = self.established_links[&link_id].receiving_interface;
+                        let interface = link.receiving_interface;
                         let packet = Packet::LinkData {
                             hops: 0,
                             destination: crate::packet::LinkDataDestination::Direct(link_id),
@@ -3469,9 +3380,8 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                             );
 
                             let hash = adv.hash;
-                            let mut resource =
+                            let resource =
                                 crate::resource::InboundResource::from_advertisement(&adv);
-                            resource.mark_transferring();
                             self.inbound_resources.insert(hash, (link_id, resource));
                             self.send_resource_request(link_id, hash, now);
                         } else if let Some(ref req_id_bytes) = adv.request_id
@@ -3493,9 +3403,8 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                                     );
 
                                     let hash = adv.hash;
-                                    let mut resource =
+                                    let resource =
                                         crate::resource::InboundResource::from_advertisement(&adv);
-                                    resource.mark_transferring();
                                     self.inbound_resources.insert(hash, (link_id, resource));
                                     self.send_resource_request(link_id, hash, now);
                                 } else {
@@ -3542,8 +3451,6 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                     .get(&link_id)
                     .map(|l| l.receiving_interface);
                 if let Some((_, _, _, _, resource)) = self.outbound_resources.get_mut(&hash) {
-                    resource.mark_transferring();
-
                     for part_hash in requested_hashes {
                         if let Some(part_data) = resource.get_part(&part_hash) {
                             // Resource parts are already encrypted at the stream level,
@@ -3694,7 +3601,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                 if let Some(hash) = completed {
                     self.complete_resource(link_id, hash, now);
                 } else if let Some(hash) = need_more {
-                    self.pending_resource_requests.push((link_id, hash));
+                    self.pending_resource_requests.insert((link_id, hash));
                 }
             }
             LinkContext::ResourceHmu => {
@@ -3730,7 +3637,6 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                 let hash: [u8; 32] = plaintext[..32].try_into().unwrap();
                 self.inbound_resources.remove(&hash);
                 self.outbound_resources.remove(&hash);
-                self.pending_resource_adverts.remove(&hash);
             }
             _ => {}
         }
@@ -7326,7 +7232,6 @@ mod tests {
         // Verify B has the ratchet key
         let path_entry = b.path_table.get(&addr_a).unwrap();
         assert!(path_entry.ratchet_key.is_some());
-        assert!(path_entry.has_ratchet);
 
         // B sends raw data (will be encrypted with ratchet)
         b.send_raw(addr_a, b"ratchet encrypted").unwrap();
@@ -8102,10 +8007,7 @@ mod tests {
         );
         node.schedule_timer(
             created_at + REVERSE_TIMEOUT + Duration::from_nanos(1),
-            ProtocolTimer::ReversePathExpiry {
-                destination: packet_hash,
-                timestamp: created_at,
-            },
+            ProtocolTimer::ReversePathExpiry(packet_hash),
         );
 
         node.poll(created_at + REVERSE_TIMEOUT);

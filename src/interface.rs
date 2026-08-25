@@ -57,7 +57,6 @@ impl Transport for Box<dyn Transport> {
     }
 }
 
-#[derive(Clone)]
 struct QueuedPacket {
     packet: Packet,
     priority: u8,
@@ -87,9 +86,7 @@ pub struct Interface<T> {
     pub(crate) transport: T,
     queue: BinaryHeap<QueuedPacket>,
     closed: bool,
-    pub(crate) ifac_size: usize,
-    pub(crate) ifac_identity: Option<SigningKey>,
-    pub(crate) ifac_key: Option<Vec<u8>>,
+    access_code: Option<InterfaceAccessCode>,
 }
 
 impl<T: Transport> Interface<T> {
@@ -98,16 +95,12 @@ impl<T: Transport> Interface<T> {
             transport,
             queue: BinaryHeap::new(),
             closed: false,
-            ifac_size: 0,
-            ifac_identity: None,
-            ifac_key: None,
+            access_code: None,
         }
     }
 
     pub fn with_interface_access_code(mut self, access_code: InterfaceAccessCode) -> Self {
-        self.ifac_identity = Some(access_code.signing_key);
-        self.ifac_key = Some(access_code.shared_key);
-        self.ifac_size = access_code.transmitted_bytes;
+        self.access_code = Some(access_code);
         self
     }
 
@@ -124,47 +117,40 @@ impl<T: Transport> Interface<T> {
             return None;
         }
 
-        if let (Some(ifac_identity), Some(ifac_key)) = (&self.ifac_identity, &self.ifac_key) {
-            if self.ifac_size == 0 {
-                return Some(raw.to_vec());
-            }
+        if let Some(access_code) = &self.access_code {
+            let ifac_size = access_code.transmitted_bytes;
 
             // Interface has IFAC enabled - packet MUST have valid IFAC
             if raw[0] & 0x80 != 0x80 {
                 return None; // IFAC flag not set
             }
-            if raw.len() <= 2 + self.ifac_size {
+            if raw.len() <= 2 + ifac_size {
                 return None; // Too short
             }
 
             // Extract IFAC
-            let ifac = &raw[2..2 + self.ifac_size];
+            let ifac = &raw[2..2 + ifac_size];
 
             // Generate mask
-            let mask = crate::crypto::hkdf_expand(ifac, ifac_key, raw.len());
+            let mask = crate::crypto::hkdf_expand(ifac, &access_code.shared_key, raw.len());
 
             // Unmask header and payload (but not IFAC itself)
-            let mut unmasked_raw = Vec::with_capacity(raw.len());
-            for (i, &byte) in raw.iter().enumerate() {
-                if i <= 1 || i > self.ifac_size + 1 {
-                    unmasked_raw.push(byte ^ mask[i]);
-                } else {
-                    unmasked_raw.push(byte);
+            let mut unmasked_raw = raw.to_vec();
+            for (i, byte) in unmasked_raw.iter_mut().enumerate() {
+                if i <= 1 || i > ifac_size + 1 {
+                    *byte ^= mask[i];
                 }
             }
 
-            // Unset IFAC flag and re-assemble packet without IFAC
-            let new_header = [unmasked_raw[0] & 0x7f, unmasked_raw[1]];
-            let mut new_raw = Vec::with_capacity(raw.len() - self.ifac_size);
-            new_raw.extend_from_slice(&new_header);
-            new_raw.extend_from_slice(&unmasked_raw[2 + self.ifac_size..]);
+            unmasked_raw[0] &= 0x7f;
+            unmasked_raw.drain(2..2 + ifac_size);
 
             // Validate: re-compute IFAC and compare
-            let signature = crate::crypto::sign(ifac_identity, &new_raw);
-            let expected_ifac = &signature.to_bytes()[64 - self.ifac_size..];
+            let signature = crate::crypto::sign(&access_code.signing_key, &unmasked_raw);
+            let expected_ifac = &signature.to_bytes()[64 - ifac_size..];
 
             if ifac == expected_ifac {
-                Some(new_raw)
+                Some(unmasked_raw)
             } else {
                 None
             }
@@ -212,43 +198,38 @@ impl<T: Transport> Interface<T> {
     }
 
     fn apply_ifac(&self, raw: &[u8]) -> Vec<u8> {
-        if let (Some(ifac_identity), Some(ifac_key)) = (&self.ifac_identity, &self.ifac_key) {
-            if self.ifac_size == 0 {
-                return raw.to_vec();
-            }
+        if let Some(access_code) = &self.access_code {
+            let ifac_size = access_code.transmitted_bytes;
 
             // Calculate packet access code (sign raw, take last ifac_size bytes)
-            let signature = crate::crypto::sign(ifac_identity, raw);
-            let ifac = &signature.to_bytes()[64 - self.ifac_size..];
+            let signature = crate::crypto::sign(&access_code.signing_key, raw);
+            let ifac = &signature.to_bytes()[64 - ifac_size..];
 
             // Generate mask
-            let mask = crate::crypto::hkdf_expand(ifac, ifac_key, raw.len() + self.ifac_size);
+            let mask =
+                crate::crypto::hkdf_expand(ifac, &access_code.shared_key, raw.len() + ifac_size);
 
             // Set IFAC flag (bit 7 of header byte 0)
             let new_header = [raw[0] | 0x80, raw[1]];
 
             // Assemble new payload: header + ifac + payload
-            let mut new_raw = Vec::with_capacity(raw.len() + self.ifac_size);
+            let mut new_raw = Vec::with_capacity(raw.len() + ifac_size);
             new_raw.extend_from_slice(&new_header);
             new_raw.extend_from_slice(ifac);
             new_raw.extend_from_slice(&raw[2..]);
 
             // Mask payload
-            let mut masked_raw = Vec::with_capacity(new_raw.len());
-            for (i, &byte) in new_raw.iter().enumerate() {
+            for (i, byte) in new_raw.iter_mut().enumerate() {
                 if i == 0 {
                     // Mask first header byte, but keep IFAC flag set
-                    masked_raw.push((byte ^ mask[i]) | 0x80);
-                } else if i == 1 || i > self.ifac_size + 1 {
+                    *byte = (*byte ^ mask[i]) | 0x80;
+                } else if i == 1 || i > ifac_size + 1 {
                     // Mask second header byte and payload
-                    masked_raw.push(byte ^ mask[i]);
-                } else {
-                    // Don't mask the IFAC itself
-                    masked_raw.push(byte);
+                    *byte ^= mask[i];
                 }
             }
 
-            masked_raw
+            new_raw
         } else {
             raw.to_vec()
         }

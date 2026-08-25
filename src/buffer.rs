@@ -7,7 +7,6 @@ use bzip2::write::BzEncoder;
 use crate::channel::CHANNEL_MDU;
 
 pub(crate) const STREAM_MESSAGE_TYPE: u16 = 0xff00;
-const STREAM_ID_MAX: u16 = 0x3fff;
 const STREAM_MDU: usize = CHANNEL_MDU - 2;
 const MAX_CHUNK_LEN: usize = 16 * 1024;
 
@@ -36,10 +35,10 @@ impl LinkBufferStreamChunk {
 pub struct LinkBufferStreamId(u16);
 
 impl LinkBufferStreamId {
-    pub const MAX_VALUE: u16 = STREAM_ID_MAX;
+    pub const MAX_VALUE: u16 = 0x3fff;
 
     pub fn new(value: u16) -> Result<Self, InvalidLinkBufferStreamId> {
-        if value > STREAM_ID_MAX {
+        if value > Self::MAX_VALUE {
             return Err(InvalidLinkBufferStreamId);
         }
         Ok(Self(value))
@@ -86,7 +85,7 @@ pub(crate) fn encode(
         (source[..length].to_vec(), length, false)
     };
     let mut header = stream_id.as_u16();
-    if end_of_stream {
+    if end_of_stream && processed == data.len() {
         header |= 0x8000;
     }
     if compressed {
@@ -120,7 +119,7 @@ pub(crate) fn decode(raw: &[u8]) -> Option<LinkBufferStreamChunk> {
         raw[2..].to_vec()
     };
     Some(LinkBufferStreamChunk {
-        stream_id: LinkBufferStreamId(header & STREAM_ID_MAX),
+        stream_id: LinkBufferStreamId(header & LinkBufferStreamId::MAX_VALUE),
         data,
         end_of_stream: header & 0x8000 != 0,
     })
@@ -155,13 +154,23 @@ mod tests {
     }
 
     #[test]
+    fn partial_chunk_does_not_end_stream() {
+        let data = vec![b'x'; MAX_CHUNK_LEN + 1];
+        let (raw, processed) = encode(LinkBufferStreamId::new(1).unwrap(), &data, true);
+        assert!(processed < data.len());
+        assert!(!decode(&raw).unwrap().end_of_stream);
+    }
+
+    #[test]
     fn rejects_invalid_streams_and_messages() {
         assert_eq!(
-            LinkBufferStreamId::new(STREAM_ID_MAX).unwrap().as_u16(),
-            STREAM_ID_MAX
+            LinkBufferStreamId::new(LinkBufferStreamId::MAX_VALUE)
+                .unwrap()
+                .as_u16(),
+            LinkBufferStreamId::MAX_VALUE
         );
         assert_eq!(
-            LinkBufferStreamId::new(STREAM_ID_MAX + 1),
+            LinkBufferStreamId::new(LinkBufferStreamId::MAX_VALUE + 1),
             Err(InvalidLinkBufferStreamId)
         );
         assert_eq!(decode(&[0]), None);

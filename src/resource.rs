@@ -25,20 +25,12 @@ const SDU: usize = 470;
 
 pub(crate) const MAX_EFFICIENT_SIZE: usize = 1024 * 1024 - 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ResourceStatus {
-    Queued,
-    Advertised,
-    Transferring,
-}
-
 pub(crate) struct OutboundResource {
     pub hash: [u8; 32],
     pub random_hash: [u8; 4],
     pub original_hash: [u8; 32],
     expected_proof: [u8; 32],
-    pub status: ResourceStatus,
-    pub metadata: Option<Vec<u8>>,
+    has_metadata: bool,
     pub compressed: bool,
     pub is_response: bool,
     pub segment_index: usize,
@@ -63,6 +55,7 @@ impl OutboundResource {
         total_data_size: Option<usize>,
     ) -> Self {
         let metadata_size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+        let has_metadata = metadata.is_some();
         let total_size = total_data_size.unwrap_or(data.len()) + metadata_size;
         let total_segments = if total_size <= MAX_EFFICIENT_SIZE {
             1
@@ -130,8 +123,7 @@ impl OutboundResource {
             random_hash,
             original_hash,
             expected_proof,
-            status: ResourceStatus::Queued,
-            metadata,
+            has_metadata,
             compressed,
             is_response,
             segment_index,
@@ -164,8 +156,6 @@ impl OutboundResource {
             .flat_map(|h| h.iter().copied())
             .collect();
         self.hashmap_sent = hashmap_chunk.len() / MAPHASH_LEN;
-        self.status = ResourceStatus::Advertised;
-
         ResourceAdvertisement {
             transfer_size: self.transfer_size(),
             data_size: self.parts.iter().map(|p| p.len()).sum(),
@@ -180,7 +170,7 @@ impl OutboundResource {
             split: self.total_segments > 1,
             is_request: false,
             is_response: self.is_response,
-            has_metadata: self.metadata.is_some(),
+            has_metadata: self.has_metadata,
             request_id: self.request_id.clone(),
         }
     }
@@ -200,10 +190,6 @@ impl OutboundResource {
         Some((segment, chunk))
     }
 
-    pub fn mark_transferring(&mut self) {
-        self.status = ResourceStatus::Transferring;
-    }
-
     pub fn verify_proof(&self, proof: &[u8]) -> bool {
         proof == self.expected_proof
     }
@@ -213,7 +199,6 @@ pub(crate) struct InboundResource {
     pub hash: [u8; 32],
     pub random_hash: [u8; 4],
     pub original_hash: [u8; 32],
-    pub status: ResourceStatus,
     pub compressed: bool,
     pub is_response: bool,
     pub has_metadata: bool,
@@ -264,7 +249,6 @@ impl InboundResource {
             hash: adv.hash,
             random_hash: adv.random_hash,
             original_hash: adv.original_hash,
-            status: ResourceStatus::Queued,
             compressed: adv.compressed,
             is_response: adv.is_response,
             has_metadata: adv.has_metadata,
@@ -524,10 +508,6 @@ impl InboundResource {
         );
 
         Some((result, proof))
-    }
-
-    pub fn mark_transferring(&mut self) {
-        self.status = ResourceStatus::Transferring;
     }
 
     pub fn mark_req_sent(&mut self, now: Instant) {

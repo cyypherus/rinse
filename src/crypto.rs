@@ -33,13 +33,6 @@ fn derive_key(shared_secret: &[u8], salt: &[u8]) -> [u8; AES_KEY_LEN] {
     key
 }
 
-fn derive_link_key(shared_secret: &[u8], link_id: &[u8; 16]) -> [u8; 64] {
-    let hk = Hkdf::<Sha256>::new(Some(link_id), shared_secret);
-    let mut key = [0u8; 64];
-    hk.expand(b"", &mut key).expect("valid length");
-    key
-}
-
 pub fn hkdf_expand(ikm: &[u8], salt: &[u8], length: usize) -> Vec<u8> {
     let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
     let mut output = vec![0u8; length];
@@ -180,14 +173,9 @@ pub(crate) struct LinkEncryption;
 
 impl LinkEncryption {
     pub fn derive_keys(shared_secret: &[u8; 32], link_id: &[u8; 16]) -> LinkKeys {
-        let derived = derive_link_key(shared_secret, link_id);
-        log::debug!(
-            "derive_keys: shared={} link_id={} -> signing={} encryption={}",
-            hex::encode(shared_secret),
-            hex::encode(link_id),
-            hex::encode(&derived[..32]),
-            hex::encode(&derived[32..])
-        );
+        let hk = Hkdf::<Sha256>::new(Some(link_id), shared_secret);
+        let mut derived = [0u8; 64];
+        hk.expand(b"", &mut derived).expect("valid length");
         let mut signing_key = [0u8; 32];
         let mut encryption_key = [0u8; 32];
         signing_key.copy_from_slice(&derived[..32]);
@@ -230,13 +218,7 @@ impl LinkEncryption {
 
         let expected_hmac = hmac_sha256(&keys.signing_key, signed_parts);
         if received_hmac != expected_hmac {
-            log::warn!(
-                "link decrypt: HMAC verification failed\n  signing_key={}\n  signed_parts[..32]={}\n  received_hmac={}\n  expected_hmac={}",
-                hex::encode(keys.signing_key),
-                hex::encode(&signed_parts[..signed_parts.len().min(32)]),
-                hex::encode(received_hmac),
-                hex::encode(expected_hmac)
-            );
+            log::warn!("link decrypt: HMAC verification failed");
             return None;
         }
 

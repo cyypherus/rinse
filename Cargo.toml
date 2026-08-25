@@ -68,5 +68,4 @@ name = "throughput"
 harness = false
 
 [dev-dependencies]
-env_logger = "0.11"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
