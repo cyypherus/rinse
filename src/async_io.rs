@@ -1,14 +1,13 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex as StdMutex};
 #[cfg(feature = "tcp")]
-use std::task::Waker;
+use std::pin::Pin;
 #[cfg(any(test, feature = "tcp"))]
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::handle::{
     DecryptLaterDeliveredPayloadError, EncryptForLaterDeliveryError, EstablishLinkError,
@@ -23,22 +22,12 @@ use crate::stats::LifetimeStats;
 use crate::{Interface, PrivateIdentity, Transport};
 
 #[cfg(feature = "tcp")]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(feature = "tcp")]
 use tokio::net::TcpStream;
 
 #[cfg(feature = "tcp")]
 use crate::transports::hdlc::{HDLC_FLAG, hdlc_escape, hdlc_unescape};
-
-#[cfg(feature = "tcp")]
-fn hdlc_frame(data: &[u8]) -> Vec<u8> {
-    let escaped = hdlc_escape(data);
-    let mut result = Vec::with_capacity(escaped.len() + 2);
-    result.push(HDLC_FLAG);
-    result.extend(escaped);
-    result.push(HDLC_FLAG);
-    result
-}
 
 #[cfg(test)]
 mod tests {
@@ -49,6 +38,11 @@ mod tests {
         inbound: mpsc::UnboundedReceiver<Vec<u8>>,
     }
 
+    struct ConnectedTransport {
+        inbound: mpsc::UnboundedReceiver<Vec<u8>>,
+        outbound: mpsc::UnboundedSender<Vec<u8>>,
+    }
+
     impl Transport for TestTransport {
         fn poll_send(&mut self, _: &mut Context<'_>, _: &[u8]) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
@@ -57,6 +51,33 @@ mod tests {
         fn poll_receive(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<Option<Vec<u8>>>> {
             self.inbound.poll_recv(cx).map(Ok)
         }
+    }
+
+    impl Transport for ConnectedTransport {
+        fn poll_send(&mut self, _: &mut Context<'_>, frame: &[u8]) -> Poll<std::io::Result<()>> {
+            Poll::Ready(self.outbound.send(frame.to_vec()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "transport closed")
+            }))
+        }
+
+        fn poll_receive(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<Option<Vec<u8>>>> {
+            self.inbound.poll_recv(cx).map(Ok)
+        }
+    }
+
+    fn connected_transports() -> (ConnectedTransport, ConnectedTransport) {
+        let (left_tx, left_rx) = mpsc::unbounded_channel();
+        let (right_tx, right_rx) = mpsc::unbounded_channel();
+        (
+            ConnectedTransport {
+                inbound: left_rx,
+                outbound: right_tx,
+            },
+            ConnectedTransport {
+                inbound: right_rx,
+                outbound: left_tx,
+            },
+        )
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -150,6 +171,74 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn service_receivers_close_with_runtime() {
+        let mut builder: NodeBuilder<TestTransport> = NodeBuilder::non_forwarding_endpoint();
+        let mut rng = StdRng::seed_from_u64(1);
+        let service = builder
+            .register_local_service("service", &[], &PrivateIdentity::generate(&mut rng))
+            .id;
+        let (node, runtime) = builder.build();
+        let runtime = tokio::spawn(runtime.run());
+        runtime.abort();
+        assert!(runtime.await.unwrap_err().is_cancelled());
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), node.recv_request(service)).await,
+            Ok(Err(ReceiveError::RuntimeStopped))
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_completion_stays_owned_by_runtime() {
+        let (client_transport, server_transport) = connected_transports();
+        let mut rng = StdRng::seed_from_u64(1);
+
+        let mut server_builder = NodeBuilder::non_forwarding_endpoint();
+        let server_service = server_builder.register_local_service(
+            "server",
+            &["/echo"],
+            &PrivateIdentity::generate(&mut rng),
+        );
+        server_builder.add_initial_interface(Interface::new(server_transport));
+        let (server, server_runtime) = server_builder.build();
+
+        let mut client_builder = NodeBuilder::non_forwarding_endpoint();
+        let client_service = client_builder.register_local_service(
+            "client",
+            &[],
+            &PrivateIdentity::generate(&mut rng),
+        );
+        client_builder.add_initial_interface(Interface::new(client_transport));
+        let (client, client_runtime) = client_builder.build();
+
+        let server_run = tokio::spawn(server_runtime.run());
+        let client_run = tokio::spawn(client_runtime.run());
+        server
+            .queue_service_announcement(server_service.id)
+            .unwrap();
+        client
+            .ensure_route_to(server_service.destination_address)
+            .await
+            .unwrap();
+        let link = client
+            .establish_link_from(client_service.id, server_service.destination_address)
+            .await
+            .unwrap();
+
+        let responder = tokio::spawn(async move {
+            let request = server.recv_request(server_service.id).await.unwrap();
+            server
+                .respond(request.request_id, &request.data, None, false)
+                .await
+                .unwrap();
+        });
+        let response = client.request(link, "/echo", b"payload").await.unwrap();
+        assert_eq!(response.data, b"payload");
+        responder.await.unwrap();
+        server_run.abort();
+        client_run.abort();
+    }
+
     #[test]
     fn runtime_runs_without_tokio() {
         futures_lite::future::block_on(async {
@@ -224,20 +313,11 @@ fn hdlc_extract_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
 }
 
 #[cfg(feature = "tcp")]
-struct Inbound {
-    packets: VecDeque<Vec<u8>>,
-    waker: Option<Waker>,
-    closed: bool,
-}
-
-#[cfg(feature = "tcp")]
-type InboundQueue = Arc<StdMutex<Inbound>>;
-
-#[cfg(feature = "tcp")]
 pub struct AsyncTcpTransport {
-    inbox: InboundQueue,
-    outbox: mpsc::UnboundedSender<Vec<u8>>,
-    io_task: Option<tokio::task::JoinHandle<()>>,
+    stream: TcpStream,
+    inbound: Vec<u8>,
+    outbound: Vec<u8>,
+    written: usize,
 }
 
 #[cfg(feature = "tcp")]
@@ -254,119 +334,86 @@ impl AsyncTcpTransport {
     }
 
     fn start(stream: TcpStream) -> Self {
-        let inbox = Arc::new(StdMutex::new(Inbound {
-            packets: VecDeque::new(),
-            waker: None,
-            closed: false,
-        }));
-        let (outbox, outbound) = mpsc::unbounded_channel();
-        let io_task = tokio::spawn(tcp_io_task(stream, inbox.clone(), outbound));
-
         Self {
-            inbox,
-            outbox,
-            io_task: Some(io_task),
-        }
-    }
-}
-
-#[cfg(feature = "tcp")]
-impl Drop for AsyncTcpTransport {
-    fn drop(&mut self) {
-        if let Some(io_task) = self.io_task.take() {
-            io_task.abort();
+            stream,
+            inbound: Vec::new(),
+            outbound: Vec::new(),
+            written: 0,
         }
     }
 }
 
 #[cfg(feature = "tcp")]
 impl Transport for AsyncTcpTransport {
-    fn poll_send(&mut self, _: &mut Context<'_>, frame: &[u8]) -> Poll<std::io::Result<()>> {
-        Poll::Ready(self.outbox.send(frame.to_vec()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "TCP connection closed")
-        }))
+    fn poll_send(&mut self, cx: &mut Context<'_>, frame: &[u8]) -> Poll<std::io::Result<()>> {
+        if self.outbound.is_empty() {
+            let escaped = hdlc_escape(frame);
+            self.outbound.reserve(escaped.len() + 2);
+            self.outbound.push(HDLC_FLAG);
+            self.outbound.extend(escaped);
+            self.outbound.push(HDLC_FLAG);
+            self.written = 0;
+        }
+        while self.written < self.outbound.len() {
+            let this = &mut *self;
+            match Pin::new(&mut this.stream).poll_write(cx, &this.outbound[this.written..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "TCP connection closed",
+                    )));
+                }
+                Poll::Ready(Ok(written)) => this.written += written,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        match Pin::new(&mut self.stream).poll_flush(cx) {
+            Poll::Ready(Ok(())) => {
+                self.outbound.clear();
+                self.written = 0;
+                Poll::Ready(Ok(()))
+            }
+            result => result,
+        }
     }
 
     fn poll_receive(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<Option<Vec<u8>>>> {
-        let mut inbox = self.inbox.lock().unwrap();
-        if let Some(packet) = inbox.packets.pop_front() {
-            Poll::Ready(Ok(Some(packet)))
-        } else if inbox.closed {
-            Poll::Ready(Ok(None))
-        } else {
-            inbox.waker = Some(cx.waker().clone());
-            Poll::Pending
-        }
-    }
-}
-
-#[cfg(feature = "tcp")]
-async fn tcp_io_task(
-    stream: TcpStream,
-    inbox: InboundQueue,
-    mut outbound: mpsc::UnboundedReceiver<Vec<u8>>,
-) {
-    let (mut reader, mut writer) = stream.into_split();
-
-    let inbox_clone = inbox.clone();
-    let read_task = async move {
-        let mut buf = [0u8; 65536];
-        let mut hdlc_buf = Vec::new();
-
         loop {
-            match reader.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    hdlc_buf.extend_from_slice(&buf[..n]);
-                    while let Some(frame) = hdlc_extract_frame(&mut hdlc_buf) {
-                        let mut inbox = inbox_clone.lock().unwrap();
-                        inbox.packets.push_back(frame);
-                        if let Some(waker) = inbox.waker.take() {
-                            waker.wake();
-                        }
-                    }
+            if let Some(frame) = hdlc_extract_frame(&mut self.inbound) {
+                return Poll::Ready(Ok(Some(frame)));
+            }
+            let mut bytes = [0; 65536];
+            let mut read = ReadBuf::new(&mut bytes);
+            match Pin::new(&mut self.stream).poll_read(cx, &mut read) {
+                Poll::Ready(Ok(())) if read.filled().is_empty() => {
+                    return Poll::Ready(Ok(None));
                 }
-                Err(_) => break,
+                Poll::Ready(Ok(())) => self.inbound.extend_from_slice(read.filled()),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
             }
         }
-    };
-
-    let write_task = async move {
-        while let Some(data) = outbound.recv().await {
-            let frame = hdlc_frame(&data);
-            if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
-                return;
-            }
-        }
-    };
-
-    tokio::select! {
-        _ = read_task => {}
-        _ = write_task => {}
-    }
-
-    let mut inbox = inbox.lock().unwrap();
-    inbox.closed = true;
-    if let Some(waker) = inbox.waker.take() {
-        waker.wake();
     }
 }
 
-type RequestWaiters = Arc<
-    StdMutex<HashMap<RequestId, oneshot::Sender<Result<(Vec<u8>, Option<Vec<u8>>), RequestError>>>>,
->;
-type RespondWaiters = Arc<StdMutex<HashMap<RequestId, oneshot::Sender<Result<(), RespondError>>>>>;
-type Receiver<T> = Arc<TokioMutex<mpsc::UnboundedReceiver<T>>>;
+type RequestCompletion = oneshot::Sender<Result<(Vec<u8>, Option<Vec<u8>>), RequestError>>;
+type RespondCompletion = oneshot::Sender<Result<(), RespondError>>;
+
 #[derive(Clone)]
-struct ServiceChannels {
-    request_tx: mpsc::UnboundedSender<IncomingRequest>,
-    request_rx: Receiver<IncomingRequest>,
-    datagram_tx: mpsc::UnboundedSender<crate::ReceivedDatagram>,
-    datagram_rx: Receiver<crate::ReceivedDatagram>,
-    channel_tx: mpsc::UnboundedSender<(crate::LinkHandle, crate::ChannelMessage)>,
-    channel_rx: Receiver<(crate::LinkHandle, crate::ChannelMessage)>,
-    buffer_tx: mpsc::UnboundedSender<(crate::LinkHandle, crate::LinkBufferStreamChunk)>,
-    buffer_rx: Receiver<(crate::LinkHandle, crate::LinkBufferStreamChunk)>,
+struct ServiceSenders {
+    request_tx: async_channel::Sender<IncomingRequest>,
+    datagram_tx: async_channel::Sender<crate::ReceivedDatagram>,
+    channel_tx: async_channel::Sender<(crate::LinkHandle, crate::ChannelMessage)>,
+    buffer_tx: async_channel::Sender<(crate::LinkHandle, crate::LinkBufferStreamChunk)>,
+}
+
+#[derive(Clone)]
+struct ServiceReceivers {
+    request_rx: async_channel::Receiver<IncomingRequest>,
+    datagram_rx: async_channel::Receiver<crate::ReceivedDatagram>,
+    channel_rx: async_channel::Receiver<(crate::LinkHandle, crate::ChannelMessage)>,
+    buffer_rx: async_channel::Receiver<(crate::LinkHandle, crate::LinkBufferStreamChunk)>,
 }
 
 enum Command<T: Transport> {
@@ -391,14 +438,14 @@ enum Command<T: Transport> {
         link: crate::LinkHandle,
         path: String,
         data: Vec<u8>,
-        reply: oneshot::Sender<Result<RequestId, RequestError>>,
+        completion: RequestCompletion,
     },
     Respond {
         request_id: RequestId,
         data: Vec<u8>,
         metadata: Option<Vec<u8>>,
         compress: bool,
-        accepted: oneshot::Sender<Result<(), RespondError>>,
+        completion: RespondCompletion,
     },
     SendDestinationDatagram {
         destination: DestinationAddress,
@@ -470,8 +517,8 @@ struct Runtime<T: Transport> {
     path_waiters: HashMap<DestinationAddress, Vec<oneshot::Sender<bool>>>,
     destinations_tx: watch::Sender<Vec<KnownDestination>>,
     stats_tx: watch::Sender<LifetimeStats>,
-    request_waiters: RequestWaiters,
-    respond_waiters: RespondWaiters,
+    request_completions: HashMap<RequestId, RequestCompletion>,
+    respond_completions: HashMap<RequestId, RespondCompletion>,
     pending_channel_sends: VecDeque<(
         crate::LinkHandle,
         crate::ChannelMessage,
@@ -487,21 +534,19 @@ struct Runtime<T: Transport> {
 
 pub struct NodeBuilder<T: Transport> {
     protocol: crate::node::Protocol<T, StdRng>,
-    services: HashMap<ServiceId, ServiceChannels>,
+    services: HashMap<ServiceId, (ServiceSenders, ServiceReceivers)>,
 }
 
 pub struct Node<T: Transport> {
-    services: Arc<StdMutex<HashMap<ServiceId, ServiceChannels>>>,
+    services: HashMap<ServiceId, ServiceReceivers>,
     command_tx: mpsc::UnboundedSender<Command<T>>,
     destinations_rx: watch::Receiver<Vec<KnownDestination>>,
     stats_rx: watch::Receiver<LifetimeStats>,
-    request_waiters: RequestWaiters,
-    respond_waiters: RespondWaiters,
 }
 
 pub struct NodeRuntime<T: Transport> {
     runtime: Runtime<T>,
-    services: Arc<StdMutex<HashMap<ServiceId, ServiceChannels>>>,
+    services: HashMap<ServiceId, ServiceSenders>,
 }
 
 pub struct OutboundLinkBufferStream<'a, T: Transport> {
@@ -517,8 +562,6 @@ impl<T: Transport> Clone for Node<T> {
             command_tx: self.command_tx.clone(),
             destinations_rx: self.destinations_rx.clone(),
             stats_rx: self.stats_rx.clone(),
-            request_waiters: self.request_waiters.clone(),
-            respond_waiters: self.respond_waiters.clone(),
         }
     }
 }
@@ -549,10 +592,10 @@ impl<T: Transport> NodeBuilder<T> {
         accepted_request_paths: &[&str],
         private_identity: &PrivateIdentity,
     ) -> crate::RegisteredLocalService {
-        let (request_tx, request_rx) = mpsc::unbounded_channel();
-        let (datagram_tx, datagram_rx) = mpsc::unbounded_channel();
-        let (channel_tx, channel_rx) = mpsc::unbounded_channel();
-        let (buffer_tx, buffer_rx) = mpsc::unbounded_channel();
+        let (request_tx, request_rx) = async_channel::unbounded();
+        let (datagram_tx, datagram_rx) = async_channel::unbounded();
+        let (channel_tx, channel_rx) = async_channel::unbounded();
+        let (buffer_tx, buffer_rx) = async_channel::unbounded();
 
         let service_id =
             self.protocol
@@ -561,16 +604,20 @@ impl<T: Transport> NodeBuilder<T> {
 
         self.services.insert(
             service_id,
-            ServiceChannels {
-                request_tx,
-                request_rx: Arc::new(TokioMutex::new(request_rx)),
-                datagram_tx,
-                datagram_rx: Arc::new(TokioMutex::new(datagram_rx)),
-                channel_tx,
-                channel_rx: Arc::new(TokioMutex::new(channel_rx)),
-                buffer_tx,
-                buffer_rx: Arc::new(TokioMutex::new(buffer_rx)),
-            },
+            (
+                ServiceSenders {
+                    request_tx,
+                    datagram_tx,
+                    channel_tx,
+                    buffer_tx,
+                },
+                ServiceReceivers {
+                    request_rx,
+                    datagram_rx,
+                    channel_rx,
+                    buffer_rx,
+                },
+            ),
         );
         crate::RegisteredLocalService {
             id: service_id,
@@ -579,36 +626,38 @@ impl<T: Transport> NodeBuilder<T> {
     }
 
     pub fn build(self) -> (Node<T>, NodeRuntime<T>) {
+        let Self { protocol, services } = self;
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (destinations_tx, destinations_rx) = watch::channel(Vec::new());
         let (stats_tx, stats_rx) = watch::channel(LifetimeStats::default());
-        let services = Arc::new(StdMutex::new(self.services));
-        let request_waiters = Arc::new(StdMutex::new(HashMap::new()));
-        let respond_waiters = Arc::new(StdMutex::new(HashMap::new()));
+        let mut service_senders = HashMap::with_capacity(services.len());
+        let mut service_receivers = HashMap::with_capacity(services.len());
+        for (service, (senders, receivers)) in services {
+            service_senders.insert(service, senders);
+            service_receivers.insert(service, receivers);
+        }
 
         (
             Node {
-                services: services.clone(),
+                services: service_receivers,
                 command_tx,
                 destinations_rx,
                 stats_rx,
-                request_waiters: request_waiters.clone(),
-                respond_waiters: respond_waiters.clone(),
             },
             NodeRuntime {
                 runtime: Runtime {
-                    protocol: self.protocol,
+                    protocol,
                     command_rx,
                     link_waiters: HashMap::new(),
                     path_waiters: HashMap::new(),
                     destinations_tx,
                     stats_tx,
-                    request_waiters,
-                    respond_waiters,
+                    request_completions: HashMap::new(),
+                    respond_completions: HashMap::new(),
                     pending_channel_sends: VecDeque::new(),
                     pending_buffer_sends: VecDeque::new(),
                 },
-                services,
+                services: service_senders,
             },
         )
     }
@@ -639,7 +688,7 @@ impl<T: Transport> Node<T> {
         &self,
         service: ServiceId,
     ) -> Result<(), crate::AnnounceError> {
-        if !self.services.lock().unwrap().contains_key(&service) {
+        if !self.services.contains_key(&service) {
             return Err(crate::AnnounceError::ServiceNotFound);
         }
         self.command_tx
@@ -655,7 +704,7 @@ impl<T: Transport> Node<T> {
         service: ServiceId,
         announcement_data: Vec<u8>,
     ) -> Result<(), crate::AnnounceError> {
-        if !self.services.lock().unwrap().contains_key(&service) {
+        if !self.services.contains_key(&service) {
             return Err(crate::AnnounceError::ServiceNotFound);
         }
         self.command_tx
@@ -762,17 +811,13 @@ impl<T: Transport> Node<T> {
     ) -> Result<(crate::LinkHandle, crate::ChannelMessage), ReceiveError> {
         let receiver = self
             .services
-            .lock()
-            .unwrap()
             .get(&service)
             .map(|channels| channels.channel_rx.clone())
             .ok_or(ReceiveError::ServiceNotFound)?;
         receiver
-            .lock()
-            .await
             .recv()
             .await
-            .ok_or(ReceiveError::RuntimeStopped)
+            .map_err(|_| ReceiveError::RuntimeStopped)
     }
 
     async fn queue_link_buffer_stream_data(
@@ -823,17 +868,13 @@ impl<T: Transport> Node<T> {
     ) -> Result<(crate::LinkHandle, crate::LinkBufferStreamChunk), ReceiveError> {
         let receiver = self
             .services
-            .lock()
-            .unwrap()
             .get(&service)
             .map(|channels| channels.buffer_rx.clone())
             .ok_or(ReceiveError::ServiceNotFound)?;
         receiver
-            .lock()
-            .await
             .recv()
             .await
-            .ok_or(ReceiveError::RuntimeStopped)
+            .map_err(|_| ReceiveError::RuntimeStopped)
     }
 
     pub fn known_destinations(&self) -> Vec<KnownDestination> {
@@ -850,25 +891,16 @@ impl<T: Transport> Node<T> {
         path: &str,
         data: &[u8],
     ) -> Result<Response, RequestError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let (completion, result) = oneshot::channel();
         self.command_tx
             .send(Command::Request {
                 link,
                 path: path.to_string(),
                 data: data.to_vec(),
-                reply: reply_tx,
+                completion,
             })
             .map_err(|_| RequestError::RuntimeStopped)?;
-
-        let request_id = reply_rx.await.map_err(|_| RequestError::RuntimeStopped)??;
-
-        let (waiter_tx, waiter_rx) = oneshot::channel();
-        self.request_waiters
-            .lock()
-            .unwrap()
-            .insert(request_id, waiter_tx);
-
-        waiter_rx
+        result
             .await
             .unwrap_or(Err(RequestError::RuntimeStopped))
             .map(|(data, metadata)| Response { data, metadata })
@@ -881,71 +913,44 @@ impl<T: Transport> Node<T> {
         metadata: Option<&[u8]>,
         compress: bool,
     ) -> Result<(), RespondError> {
-        let (waiter_tx, waiter_rx) = oneshot::channel();
-        self.respond_waiters
-            .lock()
-            .unwrap()
-            .insert(request_id, waiter_tx);
-
-        let (accepted, acceptance) = oneshot::channel();
-        if self
-            .command_tx
+        let (completion, result) = oneshot::channel();
+        self.command_tx
             .send(Command::Respond {
                 request_id,
                 data: data.to_vec(),
                 metadata: metadata.map(|m| m.to_vec()),
                 compress,
-                accepted,
+                completion,
             })
-            .is_err()
-        {
-            self.respond_waiters.lock().unwrap().remove(&request_id);
-            return Err(RespondError::RuntimeStopped);
-        }
-        if let Err(error) = acceptance
-            .await
-            .unwrap_or(Err(RespondError::RuntimeStopped))
-        {
-            self.respond_waiters.lock().unwrap().remove(&request_id);
-            return Err(error);
-        }
-
-        waiter_rx.await.unwrap_or(Err(RespondError::RuntimeStopped))
+            .map_err(|_| RespondError::RuntimeStopped)?;
+        result.await.unwrap_or(Err(RespondError::RuntimeStopped))
     }
 
     pub async fn recv_request(&self, service: ServiceId) -> Result<IncomingRequest, ReceiveError> {
-        let request_rx = {
-            let services = self.services.lock().unwrap();
-            let channels = services
-                .get(&service)
-                .ok_or(ReceiveError::ServiceNotFound)?;
-            channels.request_rx.clone()
-        };
+        let request_rx = self
+            .services
+            .get(&service)
+            .map(|channels| channels.request_rx.clone())
+            .ok_or(ReceiveError::ServiceNotFound)?;
         request_rx
-            .lock()
-            .await
             .recv()
             .await
-            .ok_or(ReceiveError::RuntimeStopped)
+            .map_err(|_| ReceiveError::RuntimeStopped)
     }
 
     pub async fn recv_datagram(
         &self,
         service: ServiceId,
     ) -> Result<crate::ReceivedDatagram, ReceiveError> {
-        let datagram_rx = {
-            let services = self.services.lock().unwrap();
-            let channels = services
-                .get(&service)
-                .ok_or(ReceiveError::ServiceNotFound)?;
-            channels.datagram_rx.clone()
-        };
+        let datagram_rx = self
+            .services
+            .get(&service)
+            .map(|channels| channels.datagram_rx.clone())
+            .ok_or(ReceiveError::ServiceNotFound)?;
         datagram_rx
-            .lock()
-            .await
             .recv()
             .await
-            .ok_or(ReceiveError::RuntimeStopped)
+            .map_err(|_| ReceiveError::RuntimeStopped)
     }
 
     pub async fn wait_for_known_destinations_to_differ_from(
@@ -1192,7 +1197,7 @@ impl<T: Transport> NodeRuntime<T> {
 
     fn advance_protocol(
         inner: &mut Runtime<T>,
-        services: &Arc<StdMutex<HashMap<ServiceId, ServiceChannels>>>,
+        services: &HashMap<ServiceId, ServiceSenders>,
         received: Vec<(Vec<u8>, usize)>,
     ) -> Option<Instant> {
         let now = Instant::now();
@@ -1254,8 +1259,8 @@ impl<T: Transport> NodeRuntime<T> {
             .any(|event| matches!(event, ServiceEvent::DestinationsChanged));
         Self::dispatch_events(
             services,
-            &inner.request_waiters,
-            &inner.respond_waiters,
+            &mut inner.request_completions,
+            &mut inner.respond_completions,
             events,
         );
         if destinations_changed {
@@ -1314,12 +1319,11 @@ impl<T: Transport> NodeRuntime<T> {
     }
 
     fn dispatch_events(
-        services: &Arc<StdMutex<HashMap<ServiceId, ServiceChannels>>>,
-        request_waiters: &RequestWaiters,
-        respond_waiters: &RespondWaiters,
+        services: &HashMap<ServiceId, ServiceSenders>,
+        request_completions: &mut HashMap<RequestId, RequestCompletion>,
+        respond_completions: &mut HashMap<RequestId, RespondCompletion>,
         events: Vec<ServiceEvent>,
     ) {
-        let services = services.lock().unwrap();
         for event in events {
             match event {
                 ServiceEvent::Request {
@@ -1330,7 +1334,7 @@ impl<T: Transport> NodeRuntime<T> {
                     remote_identity,
                 } => {
                     if let Some(channels) = services.get(&service) {
-                        let _ = channels.request_tx.send(IncomingRequest {
+                        let _ = channels.request_tx.try_send(IncomingRequest {
                             request_id,
                             path,
                             data,
@@ -1349,7 +1353,7 @@ impl<T: Transport> NodeRuntime<T> {
                             Some(link) => crate::ReceivedDatagram::Link { link, data },
                             None => crate::ReceivedDatagram::Destination { data },
                         };
-                        let _ = channels.datagram_tx.send(datagram);
+                        let _ = channels.datagram_tx.try_send(datagram);
                     }
                 }
                 ServiceEvent::Channel {
@@ -1358,7 +1362,7 @@ impl<T: Transport> NodeRuntime<T> {
                     message,
                 } => {
                     if let Some(channels) = services.get(&service) {
-                        let _ = channels.channel_tx.send((link, message));
+                        let _ = channels.channel_tx.try_send((link, message));
                     }
                 }
                 ServiceEvent::Buffer {
@@ -1367,18 +1371,18 @@ impl<T: Transport> NodeRuntime<T> {
                     chunk,
                 } => {
                     if let Some(channels) = services.get(&service) {
-                        let _ = channels.buffer_tx.send((link, chunk));
+                        let _ = channels.buffer_tx.try_send((link, chunk));
                     }
                 }
                 #[cfg(test)]
                 ServiceEvent::ResourceProgress { .. } => {}
                 ServiceEvent::RequestResult { request_id, result } => {
-                    if let Some(tx) = request_waiters.lock().unwrap().remove(&request_id) {
+                    if let Some(tx) = request_completions.remove(&request_id) {
                         let _ = tx.send(result.map(|(_, data, metadata)| (data, metadata)));
                     }
                 }
                 ServiceEvent::RespondResult { request_id, result } => {
-                    if let Some(tx) = respond_waiters.lock().unwrap().remove(&request_id) {
+                    if let Some(tx) = respond_completions.remove(&request_id) {
                         let _ = tx.send(result);
                     }
                 }
@@ -1420,23 +1424,35 @@ impl<T: Transport> NodeRuntime<T> {
                 link,
                 path,
                 data,
-                reply,
-            } => {
-                let _ = reply.send(inner.protocol.request_over_link(link, &path, &data));
-            }
+                completion,
+            } => match inner.protocol.request_over_link(link, &path, &data) {
+                Ok(request_id) => {
+                    inner.request_completions.insert(request_id, completion);
+                }
+                Err(error) => {
+                    let _ = completion.send(Err(error));
+                }
+            },
             Command::Respond {
                 request_id,
                 data,
                 metadata,
                 compress,
-                accepted,
+                completion,
             } => {
-                let _ = accepted.send(inner.protocol.respond_checked(
+                match inner.protocol.respond_checked(
                     request_id,
                     &data,
                     metadata.as_deref(),
                     compress,
-                ));
+                ) {
+                    Ok(()) => {
+                        inner.respond_completions.insert(request_id, completion);
+                    }
+                    Err(error) => {
+                        let _ = completion.send(Err(error));
+                    }
+                }
             }
             Command::SendDestinationDatagram {
                 destination,

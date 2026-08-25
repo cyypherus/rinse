@@ -6,12 +6,13 @@ edition = "2024"
 [features]
 default = ["parallel-packet-processing"]
 parallel-packet-processing = ["dep:rayon"]
-tcp = ["tokio/fs", "tokio/io-util", "tokio/macros", "tokio/net", "tokio/rt-multi-thread", "tokio/time"]
+tcp = ["tokio/io-util", "tokio/net"]
 config = ["dep:toml"]
-relay = ["config", "dep:serde_json", "dep:simplelog", "dep:ratatui", "dep:crossterm", "tokio/signal", "tokio/time"]
+relay = ["config", "dep:serde_json", "dep:simplelog", "dep:ratatui", "dep:crossterm", "tokio/fs", "tokio/macros", "tokio/rt-multi-thread", "tokio/signal", "tokio/time"]
 
 [dependencies]
 aes = "0.8.4"
+async-channel = "2"
 cbc = { version = "0.1.2", features = ["alloc"] }
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 hex = "0.4"
