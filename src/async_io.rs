@@ -2,6 +2,10 @@ use std::collections::HashMap;
 #[cfg(feature = "tcp")]
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex as StdMutex};
+#[cfg(any(test, feature = "tcp"))]
+use std::task::{Context, Poll};
+#[cfg(feature = "tcp")]
+use std::task::Waker;
 use std::time::{Duration, Instant};
 
 use rand::SeedableRng;
@@ -41,13 +45,15 @@ mod tests {
     use super::*;
     use crate::packet::{LinkContext, LinkDataDestination, Packet};
 
-    struct TestTransport;
+    struct TestTransport {
+        inbound: mpsc::UnboundedReceiver<Vec<u8>>,
+    }
 
     impl Transport for TestTransport {
         fn send(&mut self, _: &[u8]) {}
 
-        fn recv(&mut self) -> Option<Vec<u8>> {
-            None
+        fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
+            self.inbound.poll_recv(cx)
         }
 
         fn bandwidth_available(&self) -> bool {
@@ -125,6 +131,38 @@ mod tests {
             Err(AppDecryptError::RuntimeStopped)
         );
     }
+
+    #[tokio::test]
+    async fn input_wakes_idle_runtime() {
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let node = Node::new(false);
+        node.add_interface(Interface::new(TestTransport {
+            inbound: inbound_rx,
+        }));
+        let observer = node.clone();
+        let runtime = tokio::spawn(node.run());
+        tokio::task::yield_now().await;
+
+        let packet = Packet::LinkData {
+            hops: 0,
+            destination: LinkDataDestination::Direct([1; 16]),
+            context: LinkContext::Resource,
+            data: vec![1],
+        };
+        inbound_tx.send(packet.to_bytes()).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if observer.stats().await.packets_received == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        runtime.abort();
+    }
 }
 
 #[cfg(feature = "tcp")]
@@ -154,13 +192,20 @@ fn hdlc_extract_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
 }
 
 #[cfg(feature = "tcp")]
-type PacketQueue = Arc<StdMutex<VecDeque<Vec<u8>>>>;
+struct Inbound {
+    packets: VecDeque<Vec<u8>>,
+    waker: Option<Waker>,
+    closed: bool,
+}
+
+#[cfg(feature = "tcp")]
+type InboundQueue = Arc<StdMutex<Inbound>>;
 
 #[cfg(feature = "tcp")]
 pub struct AsyncTcpTransport {
     addr: String,
-    inbox: PacketQueue,
-    outbox: PacketQueue,
+    inbox: InboundQueue,
+    outbox: mpsc::UnboundedSender<Vec<u8>>,
     connected: Arc<StdMutex<bool>>,
     shutdown_tx: Option<mpsc::Sender<()>>,
     io_task: Option<tokio::task::JoinHandle<()>>,
@@ -175,14 +220,18 @@ impl AsyncTcpTransport {
     }
 
     pub fn from_stream(addr: String, stream: TcpStream) -> std::io::Result<Self> {
-        let inbox: PacketQueue = Arc::new(StdMutex::new(VecDeque::new()));
-        let outbox: PacketQueue = Arc::new(StdMutex::new(VecDeque::new()));
+        let inbox = Arc::new(StdMutex::new(Inbound {
+            packets: VecDeque::new(),
+            waker: None,
+            closed: false,
+        }));
+        let (outbox, outbound) = mpsc::unbounded_channel();
         let connected = Arc::new(StdMutex::new(true));
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let io_task = tokio::spawn(tcp_io_task(
             stream,
             inbox.clone(),
-            outbox.clone(),
+            outbound,
             connected.clone(),
             shutdown_rx,
         ));
@@ -211,16 +260,19 @@ impl AsyncTcpTransport {
         stream.set_nodelay(true)?;
 
         *self.connected.lock().unwrap() = true;
-        self.inbox.lock().unwrap().clear();
-        self.outbox.lock().unwrap().clear();
-
+        let mut inbox = self.inbox.lock().unwrap();
+        inbox.packets.clear();
+        inbox.closed = false;
+        drop(inbox);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let (outbox, outbound) = mpsc::unbounded_channel();
         self.shutdown_tx = Some(shutdown_tx);
+        self.outbox = outbox;
 
         self.io_task = Some(tokio::spawn(tcp_io_task(
             stream,
             self.inbox.clone(),
-            self.outbox.clone(),
+            outbound,
             self.connected.clone(),
             shutdown_rx,
         )));
@@ -241,11 +293,19 @@ impl Drop for AsyncTcpTransport {
 #[cfg(feature = "tcp")]
 impl Transport for AsyncTcpTransport {
     fn send(&mut self, data: &[u8]) {
-        self.outbox.lock().unwrap().push_back(data.to_vec());
+        let _ = self.outbox.send(data.to_vec());
     }
 
-    fn recv(&mut self) -> Option<Vec<u8>> {
-        self.inbox.lock().unwrap().pop_front()
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
+        let mut inbox = self.inbox.lock().unwrap();
+        if let Some(packet) = inbox.packets.pop_front() {
+            Poll::Ready(Some(packet))
+        } else if inbox.closed {
+            Poll::Ready(None)
+        } else {
+            inbox.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
     }
 
     fn bandwidth_available(&self) -> bool {
@@ -260,8 +320,8 @@ impl Transport for AsyncTcpTransport {
 #[cfg(feature = "tcp")]
 async fn tcp_io_task(
     stream: TcpStream,
-    inbox: PacketQueue,
-    outbox: PacketQueue,
+    inbox: InboundQueue,
+    mut outbound: mpsc::UnboundedReceiver<Vec<u8>>,
     connected: Arc<StdMutex<bool>>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
@@ -278,7 +338,11 @@ async fn tcp_io_task(
                 Ok(n) => {
                     hdlc_buf.extend_from_slice(&buf[..n]);
                     while let Some(frame) = hdlc_extract_frame(&mut hdlc_buf) {
-                        inbox_clone.lock().unwrap().push_back(frame);
+                        let mut inbox = inbox_clone.lock().unwrap();
+                        inbox.packets.push_back(frame);
+                        if let Some(waker) = inbox.waker.take() {
+                            waker.wake();
+                        }
                     }
                 }
                 Err(_) => break,
@@ -287,21 +351,9 @@ async fn tcp_io_task(
     };
 
     let write_task = async move {
-        let mut interval = tokio::time::interval(Duration::from_micros(100));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            interval.tick().await;
-
-            let packets: Vec<Vec<u8>> = outbox.lock().unwrap().drain(..).collect();
-            for data in packets {
-                let frame = hdlc_frame(&data);
-                if writer.write_all(&frame).await.is_err() {
-                    return;
-                }
-            }
-
-            if writer.flush().await.is_err() {
+        while let Some(data) = outbound.recv().await {
+            let frame = hdlc_frame(&data);
+            if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
                 return;
             }
         }
@@ -314,6 +366,11 @@ async fn tcp_io_task(
     }
 
     *connected.lock().unwrap() = false;
+    let mut inbox = inbox.lock().unwrap();
+    inbox.closed = true;
+    if let Some(waker) = inbox.waker.take() {
+        waker.wake();
+    }
 }
 
 #[cfg(feature = "tcp")]
@@ -1016,32 +1073,41 @@ impl<T: Transport> Node<T> {
             panic!("node runtime already started");
         };
 
-        let mut next_wake: Option<Instant> = None;
+        let mut next_wake = Self::poll(&mut inner, &self.services, Vec::new()).await;
 
         loop {
-            let sleep_duration = next_wake
-                .map(|t| t.saturating_duration_since(Instant::now()))
-                .unwrap_or(Duration::from_millis(10))
-                .min(Duration::from_millis(10))
-                .max(Duration::from_millis(1));
+            let deadline = async {
+                match next_wake {
+                    Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                    None => std::future::pending().await,
+                }
+            };
+            let mut command = None;
+            let mut received = Vec::new();
+            let protocol = &mut inner.protocol;
+            let command_rx = &mut inner.command_rx;
 
             tokio::select! {
                 biased;
-                Some(cmd) = inner.command_rx.recv() => {
-                    Self::handle_command(&mut inner, cmd, Instant::now());
+                raw = std::future::poll_fn(|cx| protocol.poll_received(cx)) => {
+                    received = raw;
                 }
-                _ = tokio::time::sleep(sleep_duration) => {}
+                cmd = command_rx.recv() => command = cmd,
+                _ = deadline => {}
             }
-            next_wake = Self::poll(&mut inner, &self.services).await;
+            if let Some(command) = command {
+                Self::handle_command(&mut inner, command, Instant::now());
+            }
+            next_wake = Self::poll(&mut inner, &self.services, received).await;
         }
     }
 
     async fn poll(
         inner: &mut Runtime<T>,
         services: &Arc<StdMutex<HashMap<ServiceId, ServiceChannels>>>,
+        received: Vec<(Vec<u8>, usize)>,
     ) -> Option<Instant> {
         let now = Instant::now();
-        let received = inner.protocol.drain_received();
         let received = Self::prepare_received(received).await;
         let (events, next_wake) = inner.protocol.poll_prepared(now, received);
 

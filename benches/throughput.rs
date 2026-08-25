@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::hint::black_box;
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 use rinse::{Interface, Node, Transport};
@@ -10,8 +11,8 @@ struct IdleTransport;
 impl Transport for IdleTransport {
     fn send(&mut self, _: &[u8]) {}
 
-    fn recv(&mut self) -> Option<Vec<u8>> {
-        None
+    fn poll_recv(&mut self, _: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
+        Poll::Pending
     }
 
     fn bandwidth_available(&self) -> bool {
@@ -26,8 +27,10 @@ struct BurstTransport {
 impl Transport for BurstTransport {
     fn send(&mut self, _: &[u8]) {}
 
-    fn recv(&mut self) -> Option<Vec<u8>> {
-        self.packets.pop_front()
+    fn poll_recv(&mut self, _: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
+        self.packets
+            .pop_front()
+            .map_or(Poll::Pending, |packet| Poll::Ready(Some(packet)))
     }
 
     fn bandwidth_available(&self) -> bool {

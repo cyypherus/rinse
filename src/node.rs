@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -2750,16 +2751,25 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         sent
     }
 
-    pub(crate) fn drain_received(&mut self) -> Vec<(Vec<u8>, usize)> {
+    pub(crate) fn poll_received(&mut self, cx: &mut Context<'_>) -> Poll<Vec<(Vec<u8>, usize)>> {
         let mut received = Vec::new();
+        let mut ready = false;
         for (i, iface) in self.interfaces.iter_mut().enumerate() {
-            while let Some(raw) = iface.recv() {
+            while let Poll::Ready(packet) = iface.poll_recv(cx) {
+                ready = true;
+                let Some(raw) = packet else {
+                    break;
+                };
                 self.stats.packets_received += 1;
                 self.stats.bytes_received += raw.len() as u64;
                 received.push((raw, i));
             }
         }
-        received
+        if ready {
+            Poll::Ready(received)
+        } else {
+            Poll::Pending
+        }
     }
 
     pub(crate) fn poll_prepared(
@@ -2903,11 +2913,14 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
 
     #[cfg(test)]
     pub fn poll(&mut self, now: Instant) -> (Vec<ServiceEvent>, Option<Instant>) {
-        let received = self
-            .drain_received()
-            .into_iter()
-            .filter_map(|(raw, source)| PreparedInbound::parse(raw, source))
-            .collect();
+        let received = match self.poll_received(&mut Context::from_waker(std::task::Waker::noop()))
+        {
+            Poll::Ready(received) => received,
+            Poll::Pending => Vec::new(),
+        }
+        .into_iter()
+        .filter_map(|(raw, source)| PreparedInbound::parse(raw, source))
+        .collect();
         self.poll_prepared(now, received)
     }
 
@@ -3944,8 +3957,10 @@ mod tests {
         fn send(&mut self, data: &[u8]) {
             self.outbox.push_back(data.to_vec());
         }
-        fn recv(&mut self) -> Option<Vec<u8>> {
-            self.inbox.pop_front()
+        fn poll_recv(&mut self, _: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
+            self.inbox
+                .pop_front()
+                .map_or(Poll::Pending, |packet| Poll::Ready(Some(packet)))
         }
         fn bandwidth_available(&self) -> bool {
             true

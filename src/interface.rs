@@ -1,4 +1,5 @@
 use std::collections::BinaryHeap;
+use std::task::{Context, Poll};
 
 use ed25519_dalek::SigningKey;
 
@@ -6,7 +7,7 @@ use crate::packet::Packet;
 
 pub trait Transport: Send {
     fn send(&mut self, data: &[u8]);
-    fn recv(&mut self) -> Option<Vec<u8>>;
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>>;
     fn bandwidth_available(&self) -> bool;
     fn is_connected(&self) -> bool {
         true
@@ -17,8 +18,8 @@ impl Transport for Box<dyn Transport> {
     fn send(&mut self, data: &[u8]) {
         (**self).send(data)
     }
-    fn recv(&mut self) -> Option<Vec<u8>> {
-        (**self).recv()
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
+        (**self).poll_recv(cx)
     }
     fn bandwidth_available(&self) -> bool {
         (**self).bandwidth_available()
@@ -156,19 +157,26 @@ impl<T: Transport> Interface<T> {
         }
     }
 
-    pub(crate) fn recv(&mut self) -> Option<Vec<u8>> {
-        let raw = self.transport.recv()?;
-        let data = self.validate_and_strip_ifac(&raw)?;
-        if let Ok(pkt) = Packet::from_bytes(&data) {
-            log::trace!("[RECV] {}", pkt.log_format());
-        } else {
-            log::trace!(
-                "[RECV] raw {} bytes: {}",
-                data.len(),
-                hex::encode(&data[..data.len().min(32)])
-            );
+    pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
+        loop {
+            let raw = match self.transport.poll_recv(cx) {
+                Poll::Ready(Some(raw)) => raw,
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            };
+            if let Some(data) = self.validate_and_strip_ifac(&raw) {
+                if let Ok(pkt) = Packet::from_bytes(&data) {
+                    log::trace!("[RECV] {}", pkt.log_format());
+                } else {
+                    log::trace!(
+                        "[RECV] raw {} bytes: {}",
+                        data.len(),
+                        hex::encode(&data[..data.len().min(32)])
+                    );
+                }
+                return Poll::Ready(Some(data));
+            }
         }
-        Some(data)
     }
 
     fn apply_ifac(&self, raw: &[u8]) -> Vec<u8> {
@@ -257,8 +265,8 @@ mod tests {
             self.sent.lock().unwrap().push(data.to_vec());
         }
 
-        fn recv(&mut self) -> Option<Vec<u8>> {
-            None
+        fn poll_recv(&mut self, _: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
+            Poll::Pending
         }
 
         fn bandwidth_available(&self) -> bool {
