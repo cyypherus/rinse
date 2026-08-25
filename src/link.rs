@@ -218,7 +218,6 @@ pub(crate) enum LinkState {
     Handshake,
     Active,
     Stale,
-    Closed,
 }
 
 pub(crate) struct EstablishedLink {

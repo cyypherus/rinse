@@ -28,6 +28,7 @@ x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 bzip2 = "0.5"
 embassy-time = { version = "0.5", features = ["generic-queue-64", "std"] }
 futures-lite = "2"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 rayon = { version = "1", optional = true }
 tokio = { version = "1", default-features = false, features = ["sync"] }
 env_logger = "0.11"

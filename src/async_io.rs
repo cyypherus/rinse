@@ -1,10 +1,11 @@
 use std::collections::{HashMap, VecDeque};
-#[cfg(feature = "tcp")]
+use std::future::Future;
 use std::pin::Pin;
-#[cfg(any(test, feature = "tcp"))]
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use futures_util::future::{AbortHandle, Abortable};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -15,7 +16,7 @@ use crate::handle::{
     RatchetKeysForRestart, RatchetKeysForRestartError, ReceiveError, RequestError, RespondError,
     Response, RuntimeStopped, ServiceEvent, ServiceId,
 };
-use crate::node::PreparedInbound;
+use crate::node::{PreparedInbound, ProtocolTimer, ProtocolTimerKey, ScheduledTimer};
 use crate::packet::DestinationAddress;
 use crate::request::RequestId;
 use crate::stats::LifetimeStats;
@@ -249,6 +250,29 @@ mod tests {
                 drop(node);
             })
             .await;
+        });
+    }
+
+    #[test]
+    fn protocol_timer_wakes_without_runtime_activity() {
+        futures_lite::future::block_on(async {
+            let destination = [7; 16];
+            let timestamp = Instant::now();
+            let event = ProtocolTimerFuture::new(ScheduledTimer {
+                at: timestamp + Duration::from_millis(1),
+                event: ProtocolTimer::ReversePathExpiry {
+                    destination,
+                    timestamp,
+                },
+            })
+            .await;
+            assert!(matches!(
+                event,
+                ProtocolTimer::ReversePathExpiry {
+                    destination: expired,
+                    timestamp: created,
+                } if expired == destination && created == timestamp
+            ));
         });
     }
 
@@ -510,6 +534,34 @@ enum Command<T: Transport> {
     },
 }
 
+struct ProtocolTimerFuture {
+    timer: embassy_time::Timer,
+    event: Option<ProtocolTimer>,
+}
+
+impl ProtocolTimerFuture {
+    fn new(scheduled: ScheduledTimer) -> Self {
+        let remaining = scheduled.at.saturating_duration_since(Instant::now());
+        Self {
+            timer: embassy_time::Timer::after(embassy_time::Duration::from_micros(
+                remaining.as_micros().min(u64::MAX as u128) as u64,
+            )),
+            event: Some(scheduled.event),
+        }
+    }
+}
+
+impl Future for ProtocolTimerFuture {
+    type Output = ProtocolTimer;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.timer).poll(cx) {
+            Poll::Ready(()) => Poll::Ready(self.event.take().unwrap()),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 struct Runtime<T: Transport> {
     protocol: crate::node::Protocol<T, StdRng>,
     command_rx: mpsc::UnboundedReceiver<Command<T>>,
@@ -530,6 +582,8 @@ struct Runtime<T: Transport> {
         usize,
         oneshot::Sender<Result<crate::QueuedLinkBufferStreamData, crate::ChannelSendError>>,
     )>,
+    timers: FuturesUnordered<Abortable<ProtocolTimerFuture>>,
+    timer_abort_handles: HashMap<ProtocolTimerKey, (ProtocolTimer, AbortHandle)>,
 }
 
 pub struct NodeBuilder<T: Transport> {
@@ -656,6 +710,8 @@ impl<T: Transport> NodeBuilder<T> {
                     respond_completions: HashMap::new(),
                     pending_channel_sends: VecDeque::new(),
                     pending_buffer_sends: VecDeque::new(),
+                    timers: FuturesUnordered::new(),
+                    timer_abort_handles: HashMap::new(),
                 },
                 services: service_senders,
             },
@@ -1151,28 +1207,26 @@ impl<T: Transport> NodeRuntime<T> {
         enum Activity<C> {
             Received(Vec<(Vec<u8>, usize)>),
             Command(Option<C>),
-            Deadline,
+            Timer(Result<ProtocolTimer, futures_util::future::Aborted>),
         }
 
-        let mut protocol_deadline =
-            Self::advance_protocol(&mut self.runtime, &self.services, Vec::new());
+        let events = self.runtime.protocol.process(Instant::now(), Vec::new());
+        Self::complete_activity(&mut self.runtime, &self.services, events);
 
         loop {
-            let deadline = async {
-                match protocol_deadline {
-                    Some(deadline) => {
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        embassy_time::Timer::after(embassy_time::Duration::from_micros(
-                            remaining.as_micros().min(u64::MAX as u128) as u64,
-                        ))
-                        .await;
-                    }
-                    None => futures_lite::future::pending().await,
+            let Runtime {
+                protocol,
+                command_rx,
+                timers,
+                ..
+            } = &mut self.runtime;
+            let timer = async {
+                if timers.is_empty() {
+                    futures_lite::future::pending().await
+                } else {
+                    Activity::Timer(timers.next().await.unwrap())
                 }
-                Activity::Deadline
             };
-            let protocol = &mut self.runtime.protocol;
-            let command_rx = &mut self.runtime.command_rx;
             let received = async {
                 Activity::Received(
                     futures_lite::future::poll_fn(|cx| protocol.poll_received(cx)).await,
@@ -1180,30 +1234,43 @@ impl<T: Transport> NodeRuntime<T> {
             };
             let command = async { Activity::Command(command_rx.recv().await) };
             let activity =
-                futures_lite::future::or(received, futures_lite::future::or(command, deadline))
-                    .await;
-            let received = match activity {
-                Activity::Received(received) => received,
+                futures_lite::future::or(received, futures_lite::future::or(command, timer)).await;
+            let now = Instant::now();
+            let events = match activity {
+                Activity::Received(received) => {
+                    let received = Self::prepare_received(received);
+                    self.runtime.protocol.process(now, received)
+                }
                 Activity::Command(Some(command)) => {
-                    Self::handle_command(&mut self.runtime, command, Instant::now());
-                    Vec::new()
+                    Self::handle_command(&mut self.runtime, command, now);
+                    self.runtime.protocol.process(now, Vec::new())
                 }
                 Activity::Command(None) => break,
-                Activity::Deadline => Vec::new(),
+                Activity::Timer(Ok(timer)) => {
+                    let key = timer.key();
+                    if self
+                        .runtime
+                        .timer_abort_handles
+                        .get(&key)
+                        .is_some_and(|(current, _)| *current == timer)
+                    {
+                        self.runtime.timer_abort_handles.remove(&key);
+                        self.runtime.protocol.handle_timer(now, timer)
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Activity::Timer(Err(_)) => Vec::new(),
             };
-            protocol_deadline = Self::advance_protocol(&mut self.runtime, &self.services, received);
+            Self::complete_activity(&mut self.runtime, &self.services, events);
         }
     }
 
-    fn advance_protocol(
+    fn complete_activity(
         inner: &mut Runtime<T>,
         services: &HashMap<ServiceId, ServiceSenders>,
-        received: Vec<(Vec<u8>, usize)>,
-    ) -> Option<Instant> {
-        let now = Instant::now();
-        let received = Self::prepare_received(received);
-        let (events, protocol_deadline) = inner.protocol.advance(now, received);
-
+        events: Vec<ServiceEvent>,
+    ) {
         while let Some((link, message, _)) = inner.pending_channel_sends.front() {
             match inner
                 .protocol
@@ -1286,8 +1353,20 @@ impl<T: Transport> NodeRuntime<T> {
                 true
             }
         });
-
-        protocol_deadline
+        for timer in inner.protocol.take_scheduled_timers() {
+            let key = timer.event.key();
+            let (abort_handle, abort_registration) = AbortHandle::new_pair();
+            if let Some((_, previous)) = inner
+                .timer_abort_handles
+                .insert(key, (timer.event, abort_handle))
+            {
+                previous.abort();
+            }
+            inner.timers.push(Abortable::new(
+                ProtocolTimerFuture::new(timer),
+                abort_registration,
+            ));
+        }
     }
 
     fn prepare_received(received: Vec<(Vec<u8>, usize)>) -> Vec<PreparedInbound> {

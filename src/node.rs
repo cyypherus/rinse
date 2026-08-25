@@ -170,6 +170,75 @@ pub(crate) struct PreparedInbound {
     source: usize,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ScheduledTimer {
+    pub(crate) at: Instant,
+    pub(crate) event: ProtocolTimer,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProtocolTimer {
+    AnnounceRetry {
+        destination: DestinationAddress,
+        retry_at: Instant,
+    },
+    PathExpiry {
+        destination: DestinationAddress,
+        timestamp: Instant,
+    },
+    ReversePathExpiry {
+        destination: DestinationAddress,
+        timestamp: Instant,
+    },
+    ChannelRetry {
+        link: LinkId,
+        retry_at: Instant,
+    },
+    PendingLinkTimeout {
+        link: LinkId,
+        request_time: Instant,
+    },
+    PathRequestTimeout {
+        destination: DestinationAddress,
+        request_time: Instant,
+    },
+    LinkMaintenance {
+        link: LinkId,
+        last_inbound: Instant,
+        last_keepalive_sent: Option<Instant>,
+        rtt_ms: Option<u64>,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ProtocolTimerKey {
+    AnnounceRetry(DestinationAddress),
+    PathExpiry(DestinationAddress),
+    ReversePathExpiry(DestinationAddress),
+    ChannelRetry(LinkId),
+    PendingLinkTimeout(LinkId),
+    PathRequestTimeout(DestinationAddress),
+    LinkMaintenance(LinkId),
+}
+
+impl ProtocolTimer {
+    pub(crate) fn key(self) -> ProtocolTimerKey {
+        match self {
+            Self::AnnounceRetry { destination, .. } => ProtocolTimerKey::AnnounceRetry(destination),
+            Self::PathExpiry { destination, .. } => ProtocolTimerKey::PathExpiry(destination),
+            Self::ReversePathExpiry { destination, .. } => {
+                ProtocolTimerKey::ReversePathExpiry(destination)
+            }
+            Self::ChannelRetry { link, .. } => ProtocolTimerKey::ChannelRetry(link),
+            Self::PendingLinkTimeout { link, .. } => ProtocolTimerKey::PendingLinkTimeout(link),
+            Self::PathRequestTimeout { destination, .. } => {
+                ProtocolTimerKey::PathRequestTimeout(destination)
+            }
+            Self::LinkMaintenance { link, .. } => ProtocolTimerKey::LinkMaintenance(link),
+        }
+    }
+}
+
 impl PreparedInbound {
     pub(crate) fn parse(raw: Vec<u8>, source: usize) -> Option<Self> {
         let wire_len = raw.len();
@@ -244,6 +313,9 @@ pub(crate) struct Protocol<T, R = ThreadRng> {
     pending_events: Vec<ServiceEvent>,
     pending_resource_requests: Vec<(LinkId, [u8; 32])>,
     channels: HashMap<LinkId, ChannelState>,
+    scheduled_timers: Vec<ScheduledTimer>,
+    #[cfg(test)]
+    test_timers: Vec<ScheduledTimer>,
 }
 
 impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
@@ -285,11 +357,81 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             pending_events: Vec::new(),
             pending_resource_requests: Vec::new(),
             channels: HashMap::new(),
+            scheduled_timers: Vec::new(),
+            #[cfg(test)]
+            test_timers: Vec::new(),
         }
     }
 
     pub fn stats(&self) -> LifetimeStats {
         self.stats.snapshot()
+    }
+
+    pub(crate) fn take_scheduled_timers(&mut self) -> Vec<ScheduledTimer> {
+        std::mem::take(&mut self.scheduled_timers)
+    }
+
+    fn schedule_timer(&mut self, at: Instant, event: ProtocolTimer) {
+        self.scheduled_timers.push(ScheduledTimer { at, event });
+    }
+
+    fn schedule_path_expiry(&mut self, destination: DestinationAddress) {
+        if let Some(entry) = self.path_table.get(&destination) {
+            self.schedule_timer(
+                entry.timestamp + PATH_TIMEOUT + Duration::from_nanos(1),
+                ProtocolTimer::PathExpiry {
+                    destination,
+                    timestamp: entry.timestamp,
+                },
+            );
+        }
+    }
+
+    fn schedule_channel_retry(&mut self, link: LinkId) {
+        let rtt = self
+            .established_links
+            .get(&link)
+            .and_then(|link| link.rtt_ms)
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_millis(25));
+        if let Some(retry_at) = self
+            .channels
+            .get(&link)
+            .and_then(|channel| channel.next_retry(rtt))
+        {
+            self.schedule_timer(retry_at, ProtocolTimer::ChannelRetry { link, retry_at });
+        }
+    }
+
+    fn schedule_link_maintenance(&mut self, link_id: LinkId) {
+        if let Some(link) = self.established_links.get(&link_id) {
+            let stale_at = link
+                .pending_requests
+                .is_empty()
+                .then(|| link.last_inbound + Duration::from_secs(link.stale_time_secs()));
+            let keepalive_at = (link.is_initiator && link.state == LinkState::Active).then(|| {
+                let keepalive = Duration::from_secs(link.keepalive_interval_secs());
+                (link.last_inbound + keepalive).max(
+                    link.last_keepalive_sent
+                        .map(|sent| sent + keepalive)
+                        .unwrap_or(link.last_inbound),
+                )
+            });
+            let at = match (stale_at, keepalive_at) {
+                (Some(stale), Some(keepalive)) => stale.min(keepalive),
+                (Some(at), None) | (None, Some(at)) => at,
+                (None, None) => return,
+            };
+            self.schedule_timer(
+                at,
+                ProtocolTimer::LinkMaintenance {
+                    link: link_id,
+                    last_inbound: link.last_inbound,
+                    last_keepalive_sent: link.last_keepalive_sent,
+                    rtt_ms: link.rtt_ms,
+                },
+            );
+        }
     }
 
     pub fn add_interface(&mut self, interface: Interface<T>) -> usize {
@@ -925,6 +1067,13 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             self.interfaces.len()
         );
         self.pending_path_requests.insert(destination, now);
+        self.schedule_timer(
+            now + Duration::from_secs(PATH_REQUEST_TIMEOUT_SECS),
+            ProtocolTimer::PathRequestTimeout {
+                destination,
+                request_time: now,
+            },
+        );
 
         let mut tag = [0u8; 16];
         self.rng.fill_bytes(&mut tag);
@@ -1048,6 +1197,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             .get_mut(&link_id)
             .unwrap()
             .track(packet, packet_hash, now);
+        self.schedule_channel_retry(link_id);
         Ok(())
     }
 
@@ -1089,7 +1239,6 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             LinkState::Handshake => crate::LinkStatus::Pending,
             LinkState::Active => crate::LinkStatus::Active,
             LinkState::Stale => crate::LinkStatus::Stale,
-            LinkState::Closed => crate::LinkStatus::Closed,
         })
     }
 
@@ -1410,6 +1559,17 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                 request_time: now,
             },
         );
+        let timeout = Duration::from_secs(
+            ESTABLISHMENT_TIMEOUT_BASE_SECS
+                + ESTABLISHMENT_TIMEOUT_PER_HOP_SECS * hops.max(1) as u64,
+        );
+        self.schedule_timer(
+            now + timeout,
+            ProtocolTimer::PendingLinkTimeout {
+                link: link_id,
+                request_time: now,
+            },
+        );
 
         // Send on the interface that received the announce
         log::debug!(
@@ -1687,6 +1847,13 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                                 receiving_interface: interface_index,
                             },
                         );
+                        self.scheduled_timers.push(ScheduledTimer {
+                            at: now + REVERSE_TIMEOUT + Duration::from_nanos(1),
+                            event: ProtocolTimer::ReversePathExpiry {
+                                destination: destination_hash,
+                                timestamp: now,
+                            },
+                        });
                     }
 
                     // Transmit on outbound interface
@@ -1695,6 +1862,13 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                         self.stats.bytes_relayed += wire_len as u64;
                         iface.send(new_packet, 0);
                         path_entry.timestamp = now;
+                        self.scheduled_timers.push(ScheduledTimer {
+                            at: now + PATH_TIMEOUT + Duration::from_nanos(1),
+                            event: ProtocolTimer::PathExpiry {
+                                destination: dest,
+                                timestamp: now,
+                            },
+                        });
                     }
                 } else {
                     log::debug!(
@@ -1912,6 +2086,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                                 announce_data: data.clone(),
                             },
                         );
+                        self.schedule_path_expiry(destination_hash);
 
                         // Schedule for rebroadcast with random delay
                         // PATH_RESPONSE announces are not rebroadcast (they're one-shot responses)
@@ -1929,6 +2104,13 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                                 retry_at,
                                 local_rebroadcasts: 0,
                             });
+                            self.schedule_timer(
+                                retry_at,
+                                ProtocolTimer::AnnounceRetry {
+                                    destination: destination_hash,
+                                    retry_at,
+                                },
+                            );
                         }
 
                         log::debug!(
@@ -2042,6 +2224,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
 
                     self.established_links.insert(new_link_id, link);
                     self.destination_links.insert(destination_hash, new_link_id);
+                    self.schedule_link_maintenance(new_link_id);
 
                     log::info!(
                         "Sending LinkProof for link <{}> on interface {}",
@@ -2441,6 +2624,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
 
                     self.established_links.insert(destination_hash, link);
                     self.destination_links.insert(dest, destination_hash);
+                    self.schedule_link_maintenance(destination_hash);
 
                     // Send LRRTT packet to inform responder of the measured RTT
                     if let Some(rtt) = rtt_secs {
@@ -2601,6 +2785,9 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         }
 
         self.dispatch_notifications(notifications);
+
+        self.schedule_channel_retry(destination_hash);
+        self.schedule_link_maintenance(link_id);
 
         for (link_id, original_hash) in pending_next_segments {
             self.send_next_segment(link_id, original_hash);
@@ -2792,6 +2979,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             if let Some(entry) = self.path_table.get_mut(&destination_hash) {
                 entry.timestamp = now;
             }
+            self.schedule_path_expiry(destination_hash);
 
             return true;
         }
@@ -2866,16 +3054,11 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         }
     }
 
-    pub(crate) fn advance(
+    pub(crate) fn process(
         &mut self,
         now: Instant,
         received: Vec<PreparedInbound>,
-    ) -> (Vec<ServiceEvent>, Option<Instant>) {
-        let mut deadline: Option<Instant> = None;
-        let mut include_deadline = |t: Instant| {
-            deadline = Some(deadline.map_or(t, |current| current.min(t)));
-        };
-
+    ) -> Vec<ServiceEvent> {
         for received in received {
             let (packet, packet_hash, wire_len, source) = received.into_parts();
             self.inbound(packet, packet_hash, wire_len, source, now);
@@ -2890,101 +3073,6 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             }
         }
 
-        // Handle pending announce rebroadcasts
-        let mut to_send = Vec::new();
-        for pending in &mut self.pending_announces {
-            if pending.retry_at <= now && pending.retries_remaining > 0 {
-                pending.retries_remaining -= 1;
-                pending.retry_at = now + std::time::Duration::from_millis(self.retry_delay_ms);
-                to_send.push((
-                    pending.destination,
-                    pending.hops,
-                    pending.has_ratchet,
-                    pending.data.clone(),
-                    pending.source_interface,
-                ));
-                if pending.retries_remaining > 0 {
-                    include_deadline(pending.retry_at);
-                }
-            } else if pending.retries_remaining > 0 {
-                include_deadline(pending.retry_at);
-            }
-        }
-        // Remove announces with no retries left
-        self.pending_announces.retain(|a| a.retries_remaining > 0);
-
-        for (dest, hops, has_ratchet, data, source) in to_send {
-            log::debug!(
-                "Rebroadcasting announce for <{}> at hops={}",
-                hex::encode(dest),
-                hops + 1
-            );
-            let packet = self.make_announce_packet(
-                dest,
-                hops,
-                has_ratchet,
-                false,
-                data,
-                Some(self.transport_id),
-            );
-            let packet_len = packet.to_bytes().len();
-            let num_interfaces = self.interfaces.len().saturating_sub(1); // minus source
-            self.stats.packets_relayed += num_interfaces as u64;
-            self.stats.bytes_relayed += (packet_len * num_interfaces) as u64;
-            self.stats.announces_relayed += num_interfaces as u64;
-            self.outbound(packet, Some(source), now);
-        }
-
-        let path_count = self.path_table.len();
-        self.path_table
-            .retain(|_, entry| now.saturating_duration_since(entry.timestamp) <= PATH_TIMEOUT);
-        if self.path_table.len() != path_count {
-            self.pending_events.push(ServiceEvent::DestinationsChanged);
-        }
-        for entry in self.path_table.values() {
-            include_deadline(entry.timestamp + PATH_TIMEOUT);
-        }
-
-        self.reverse_table
-            .retain(|_, entry| now.saturating_duration_since(entry.timestamp) <= REVERSE_TIMEOUT);
-        for entry in self.reverse_table.values() {
-            include_deadline(entry.timestamp + REVERSE_TIMEOUT);
-        }
-
-        let mut channel_retries = Vec::new();
-        let mut failed_channels = Vec::new();
-        for (link_id, channel) in &mut self.channels {
-            let rtt = self
-                .established_links
-                .get(link_id)
-                .and_then(|link| link.rtt_ms)
-                .map(Duration::from_millis)
-                .unwrap_or(Duration::from_millis(25));
-            let (packets, failed) = channel.retries(now, rtt);
-            for packet in packets {
-                channel_retries.push((*link_id, packet));
-            }
-            if failed {
-                failed_channels.push(*link_id);
-            } else if let Some(next) = channel.next_retry(rtt) {
-                include_deadline(next);
-            }
-        }
-        for (link_id, packet) in channel_retries {
-            let target_interface = self.established_links[&link_id].receiving_interface;
-            if let Some(interface) = self.interfaces.get_mut(target_interface) {
-                interface.send(packet, 0);
-            }
-        }
-        for link_id in failed_channels {
-            self.close_link(crate::LinkHandle(link_id));
-            self.channels.remove(&link_id);
-        }
-
-        if let Some(t) = self.maintain_links(now) {
-            include_deadline(t);
-        }
-
         // Remove disconnected interfaces
         let before_count = self.interfaces.len();
         self.interfaces.retain(|iface| !iface.is_closed());
@@ -2993,11 +3081,11 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             log::debug!("Removed {} disconnected interface(s)", removed);
         }
 
-        (std::mem::take(&mut self.pending_events), deadline)
+        std::mem::take(&mut self.pending_events)
     }
 
     #[cfg(test)]
-    pub fn poll(&mut self, now: Instant) -> (Vec<ServiceEvent>, Option<Instant>) {
+    fn poll(&mut self, now: Instant) -> Vec<ServiceEvent> {
         let received = match self.poll_received(&mut Context::from_waker(std::task::Waker::noop()))
         {
             Poll::Ready(received) => received,
@@ -3006,212 +3094,240 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         .into_iter()
         .filter_map(|(raw, source)| PreparedInbound::parse(raw, source))
         .collect();
-        let result = self.advance(now, received);
+        let mut events = self.process(now, received);
+        let scheduled = self.take_scheduled_timers();
+        self.test_timers.extend(scheduled);
+        while let Some(index) = self.test_timers.iter().position(|timer| timer.at <= now) {
+            let timer = self.test_timers.swap_remove(index);
+            events.extend(self.handle_timer(now, timer.event));
+            let scheduled = self.take_scheduled_timers();
+            self.test_timers.extend(scheduled);
+        }
         for iface in &mut self.interfaces {
             let _ = iface.poll_send(&mut Context::from_waker(std::task::Waker::noop()));
         }
-        result
+        events
     }
 
-    fn maintain_links(&mut self, now: Instant) -> Option<Instant> {
-        let mut deadline: Option<Instant> = None;
-        let mut include_deadline = |t: Instant| {
-            deadline = Some(deadline.map_or(t, |current| current.min(t)));
-        };
-
-        // Check for timed out pending links
-        let mut timed_out_pending: Vec<(LinkId, DestinationAddress)> = Vec::new();
-        for (link_id, pending) in &self.pending_outbound_links {
-            let hops = self
-                .path_table
-                .get(&pending.destination)
-                .map(|e| e.hops)
-                .unwrap_or(1);
-            let timeout_secs = ESTABLISHMENT_TIMEOUT_BASE_SECS
-                + ESTABLISHMENT_TIMEOUT_PER_HOP_SECS * hops.max(1) as u64;
-            let elapsed = now.duration_since(pending.request_time).as_secs();
-            if elapsed >= timeout_secs {
-                timed_out_pending.push((*link_id, pending.destination));
-            } else {
-                let timeout_at =
-                    pending.request_time + std::time::Duration::from_secs(timeout_secs);
-                include_deadline(timeout_at);
-            }
-        }
-
-        // Handle timed out pending links
-        let mut notifications = Vec::new();
-        for (link_id, destination) in timed_out_pending {
-            self.pending_outbound_links.remove(&link_id);
-
-            // Fail any queued requests for this destination
-            if let Some(queued) = self.pending_outbound_requests.remove(&destination) {
-                for (_service, local_request_id, _path, _data) in queued {
-                    notifications.push(Notification::RequestResult {
-                        request_id: local_request_id,
-                        result: Err(crate::handle::RequestError::LinkClosed),
-                    });
-                }
-            }
-        }
-
-        // Check for timed out path requests
-        let mut timed_out_paths: Vec<DestinationAddress> = Vec::new();
-        for (destination, request_time) in &self.pending_path_requests {
-            let elapsed = now.duration_since(*request_time).as_secs();
-            if elapsed >= PATH_REQUEST_TIMEOUT_SECS {
-                timed_out_paths.push(*destination);
-            } else {
-                let timeout_at =
-                    *request_time + std::time::Duration::from_secs(PATH_REQUEST_TIMEOUT_SECS);
-                include_deadline(timeout_at);
-            }
-        }
-
-        for destination in timed_out_paths {
-            self.pending_path_requests.remove(&destination);
-
-            notifications.push(Notification::PathRequestResult {
+    pub(crate) fn handle_timer(&mut self, now: Instant, event: ProtocolTimer) -> Vec<ServiceEvent> {
+        match event {
+            ProtocolTimer::AnnounceRetry {
                 destination,
-                found: false,
-            });
-
-            if let Some(queued) = self.pending_outbound_requests.remove(&destination) {
-                for (_service, local_request_id, _path, _data) in queued {
-                    notifications.push(Notification::RequestResult {
-                        request_id: local_request_id,
-                        result: Err(crate::handle::RequestError::Timeout),
-                    });
-                }
-            }
-
-            log::warn!(
-                "Path request for <{}> timed out after {} seconds",
-                hex::encode(destination),
-                PATH_REQUEST_TIMEOUT_SECS
-            );
-        }
-
-        if !notifications.is_empty() {
-            self.dispatch_notifications(notifications);
-        }
-
-        let mut to_close = Vec::new();
-        let mut to_keepalive = Vec::new();
-
-        for (link_id, link) in &mut self.established_links {
-            if link.state == LinkState::Closed {
-                to_close.push(*link_id);
-                continue;
-            }
-
-            let keepalive_secs = link.keepalive_interval_secs();
-            let stale_secs = link.stale_time_secs();
-            let since_inbound = now.duration_since(link.last_inbound).as_secs();
-
-            if link.state == LinkState::Active
-                && since_inbound >= stale_secs
-                && link.pending_requests.is_empty()
-            {
-                log::info!(
-                    "Link {} to <{}> became stale (no inbound for {}s, stale_time={}s)",
-                    hex::encode(link_id),
-                    hex::encode(link.destination),
-                    since_inbound,
-                    stale_secs
-                );
-                link.state = LinkState::Stale;
-            }
-
-            if link.state == LinkState::Stale {
-                to_close.push(*link_id);
-                continue;
-            }
-
-            if link.is_initiator && link.state == LinkState::Active {
-                // Python: send keepalive if now >= last_inbound + keepalive AND now >= last_keepalive + keepalive
-                let since_last_keepalive = link
-                    .last_keepalive_sent
-                    .map(|t| now.duration_since(t).as_secs())
-                    .unwrap_or(u64::MAX);
-
-                if since_inbound >= keepalive_secs && since_last_keepalive >= keepalive_secs {
-                    to_keepalive.push(*link_id);
-                } else {
-                    // Schedule wake for next keepalive check
-                    let next_inbound_check =
-                        link.last_inbound + std::time::Duration::from_secs(keepalive_secs);
-                    let next_keepalive_check = link
-                        .last_keepalive_sent
-                        .map(|t| t + std::time::Duration::from_secs(keepalive_secs))
-                        .unwrap_or(now);
-                    include_deadline(next_inbound_check.max(next_keepalive_check));
-                }
-            }
-
-            // Schedule wake for stale check
-            let stale_at = link.last_inbound + std::time::Duration::from_secs(stale_secs);
-            if stale_at > now {
-                include_deadline(stale_at);
-            }
-        }
-
-        for link_id in to_keepalive {
-            use crate::packet::LinkDataDestination;
-            let target_interface = if let Some(link) = self.established_links.get_mut(&link_id) {
-                log::debug!(
-                    "Sending keepalive request on link {} (no inbound for {}s, rtt={:?}ms, interval={}s)",
-                    hex::encode(link_id),
-                    now.duration_since(link.last_inbound).as_secs(),
-                    link.rtt_ms,
-                    link.keepalive_interval_secs()
-                );
-                link.last_keepalive_sent = Some(now);
-                link.touch_outbound(now);
-                link.receiving_interface
-            } else {
-                continue;
-            };
-            let packet = Packet::LinkData {
-                hops: 0,
-                destination: LinkDataDestination::Direct(link_id),
-                context: LinkContext::Keepalive,
-                data: vec![crate::link::KEEPALIVE_REQUEST],
-            };
-            if let Some(iface) = self.interfaces.get_mut(target_interface) {
-                iface.send(packet, 0);
-            }
-        }
-
-        for link_id in to_close {
-            if let Some(link) = self.established_links.get(&link_id)
-                && link.state != LinkState::Closed
-            {
-                use crate::packet::LinkDataDestination;
-                log::info!(
-                    "Closing stale link <{}> to <{}> (state={:?})",
-                    hex::encode(link_id),
-                    hex::encode(link.destination),
-                    link.state
-                );
-                let dest = link.destination;
-                let target_interface = link.receiving_interface;
-                let close_data = link.encrypt(&mut self.rng, &link_id);
-                let packet = Packet::LinkData {
-                    hops: 0,
-                    destination: LinkDataDestination::Direct(link_id),
-                    context: LinkContext::LinkClose,
-                    data: close_data,
+                retry_at,
+            } => {
+                let Some(index) = self.pending_announces.iter().position(|pending| {
+                    pending.destination == destination
+                        && pending.retry_at == retry_at
+                        && pending.retries_remaining > 0
+                }) else {
+                    return Vec::new();
                 };
-                if let Some(iface) = self.interfaces.get_mut(target_interface) {
-                    iface.send(packet, 0);
+                let (hops, has_ratchet, data, source, next_retry) = {
+                    let pending = &mut self.pending_announces[index];
+                    pending.retries_remaining -= 1;
+                    let next_retry = if pending.retries_remaining > 0 {
+                        pending.retry_at = now + Duration::from_millis(self.retry_delay_ms);
+                        Some(pending.retry_at)
+                    } else {
+                        None
+                    };
+                    (
+                        pending.hops,
+                        pending.has_ratchet,
+                        pending.data.clone(),
+                        pending.source_interface,
+                        next_retry,
+                    )
+                };
+                let packet = self.make_announce_packet(
+                    destination,
+                    hops,
+                    has_ratchet,
+                    false,
+                    data,
+                    Some(self.transport_id),
+                );
+                if let Some(retry_at) = next_retry {
+                    self.schedule_timer(
+                        retry_at,
+                        ProtocolTimer::AnnounceRetry {
+                            destination,
+                            retry_at,
+                        },
+                    );
+                } else {
+                    self.pending_announces.swap_remove(index);
                 }
-                self.destination_links.remove(&dest);
+                let packet_len = packet.to_bytes().len();
+                let interfaces = self.interfaces.len().saturating_sub(1);
+                self.stats.packets_relayed += interfaces as u64;
+                self.stats.bytes_relayed += (packet_len * interfaces) as u64;
+                self.stats.announces_relayed += interfaces as u64;
+                self.outbound(packet, Some(source), now);
             }
-            self.established_links.remove(&link_id);
+            ProtocolTimer::PathExpiry {
+                destination,
+                timestamp,
+            } => {
+                if self
+                    .path_table
+                    .get(&destination)
+                    .is_some_and(|entry| entry.timestamp == timestamp)
+                {
+                    self.path_table.remove(&destination);
+                    self.pending_events.push(ServiceEvent::DestinationsChanged);
+                }
+            }
+            ProtocolTimer::ReversePathExpiry {
+                destination,
+                timestamp,
+            } => {
+                if self
+                    .reverse_table
+                    .get(&destination)
+                    .is_some_and(|entry| entry.timestamp == timestamp)
+                {
+                    self.reverse_table.remove(&destination);
+                }
+            }
+            ProtocolTimer::ChannelRetry { link, retry_at } => {
+                let rtt = self
+                    .established_links
+                    .get(&link)
+                    .and_then(|link| link.rtt_ms)
+                    .map(Duration::from_millis)
+                    .unwrap_or(Duration::from_millis(25));
+                if self
+                    .channels
+                    .get(&link)
+                    .and_then(|channel| channel.next_retry(rtt))
+                    != Some(retry_at)
+                {
+                    return Vec::new();
+                }
+                let (packets, failed) = self.channels.get_mut(&link).unwrap().retries(now, rtt);
+                if failed {
+                    self.close_link(crate::LinkHandle(link));
+                    self.channels.remove(&link);
+                } else {
+                    if let Some(interface) = self
+                        .established_links
+                        .get(&link)
+                        .and_then(|link| self.interfaces.get_mut(link.receiving_interface))
+                    {
+                        for packet in packets {
+                            interface.send(packet, 0);
+                        }
+                    }
+                    self.schedule_channel_retry(link);
+                }
+            }
+            ProtocolTimer::PendingLinkTimeout { link, request_time } => {
+                let Some(pending) = self.pending_outbound_links.get(&link) else {
+                    return Vec::new();
+                };
+                if pending.request_time != request_time {
+                    return Vec::new();
+                }
+                let destination = pending.destination;
+                self.pending_outbound_links.remove(&link);
+                let mut notifications = Vec::new();
+                if let Some(queued) = self.pending_outbound_requests.remove(&destination) {
+                    for (_, request_id, _, _) in queued {
+                        notifications.push(Notification::RequestResult {
+                            request_id,
+                            result: Err(crate::handle::RequestError::LinkClosed),
+                        });
+                    }
+                }
+                self.dispatch_notifications(notifications);
+            }
+            ProtocolTimer::PathRequestTimeout {
+                destination,
+                request_time,
+            } => {
+                if self.pending_path_requests.get(&destination) != Some(&request_time) {
+                    return Vec::new();
+                }
+                self.pending_path_requests.remove(&destination);
+                let mut notifications = vec![Notification::PathRequestResult {
+                    destination,
+                    found: false,
+                }];
+                if let Some(queued) = self.pending_outbound_requests.remove(&destination) {
+                    for (_, request_id, _, _) in queued {
+                        notifications.push(Notification::RequestResult {
+                            request_id,
+                            result: Err(crate::handle::RequestError::Timeout),
+                        });
+                    }
+                }
+                self.dispatch_notifications(notifications);
+            }
+            ProtocolTimer::LinkMaintenance {
+                link: link_id,
+                last_inbound,
+                last_keepalive_sent,
+                rtt_ms,
+            } => {
+                let Some(link) = self.established_links.get(&link_id) else {
+                    return Vec::new();
+                };
+                if link.last_inbound != last_inbound
+                    || link.last_keepalive_sent != last_keepalive_sent
+                    || link.rtt_ms != rtt_ms
+                {
+                    return Vec::new();
+                }
+                let stale = now.saturating_duration_since(link.last_inbound)
+                    >= Duration::from_secs(link.stale_time_secs())
+                    && link.pending_requests.is_empty();
+                let keepalive = link.is_initiator
+                    && link.state == LinkState::Active
+                    && now.saturating_duration_since(link.last_inbound)
+                        >= Duration::from_secs(link.keepalive_interval_secs())
+                    && link.last_keepalive_sent.is_none_or(|sent| {
+                        now.saturating_duration_since(sent)
+                            >= Duration::from_secs(link.keepalive_interval_secs())
+                    });
+                if stale || link.state == LinkState::Stale {
+                    let destination = link.destination;
+                    let interface = link.receiving_interface;
+                    let data = link.encrypt(&mut self.rng, &link_id);
+                    let packet = Packet::LinkData {
+                        hops: 0,
+                        destination: crate::packet::LinkDataDestination::Direct(link_id),
+                        context: LinkContext::LinkClose,
+                        data,
+                    };
+                    if let Some(interface) = self.interfaces.get_mut(interface) {
+                        interface.send(packet, 0);
+                    }
+                    self.destination_links.remove(&destination);
+                    self.established_links.remove(&link_id);
+                    self.channels.remove(&link_id);
+                } else {
+                    if keepalive {
+                        let interface = self.established_links[&link_id].receiving_interface;
+                        let packet = Packet::LinkData {
+                            hops: 0,
+                            destination: crate::packet::LinkDataDestination::Direct(link_id),
+                            context: LinkContext::Keepalive,
+                            data: vec![crate::link::KEEPALIVE_REQUEST],
+                        };
+                        if let Some(link) = self.established_links.get_mut(&link_id) {
+                            link.last_keepalive_sent = Some(now);
+                            link.touch_outbound(now);
+                        }
+                        if let Some(interface) = self.interfaces.get_mut(interface) {
+                            interface.send(packet, 0);
+                        }
+                    }
+                    self.schedule_link_maintenance(link_id);
+                }
+            }
         }
-
-        deadline
+        std::mem::take(&mut self.pending_events)
     }
 
     fn handle_keepalive(&mut self, link_id: LinkId, data: &[u8]) {
@@ -4187,7 +4303,7 @@ mod tests {
         .unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events, _) = b.poll(now);
+        let events = b.poll(now);
 
         assert!(events.iter().any(|event| matches!(
             event,
@@ -4234,7 +4350,7 @@ mod tests {
         assert_eq!(processed, data.len());
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events, _) = b.poll(now);
+        let events = b.poll(now);
 
         assert!(events.iter().any(|event| matches!(
             event,
@@ -4311,7 +4427,7 @@ mod tests {
         a.send_link_packet(link_id, LinkContext::None, b"payload");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events, _) = b.poll(now);
+        let events = b.poll(now);
 
         // B receives raw data via ServiceEvent::Raw
         let raw_events: Vec<_> = events
@@ -4364,7 +4480,7 @@ mod tests {
         transfer(&mut a, 0, &mut b, 0);
         b.poll(later);
         transfer(&mut b, 1, &mut c, 0);
-        let (events, _) = c.poll(later);
+        let events = c.poll(later);
 
         // C receives raw data via ServiceEvent::Raw
         let raw_events: Vec<_> = events
@@ -4418,7 +4534,7 @@ mod tests {
         );
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events_b, _) = b.poll(now);
+        let events_b = b.poll(now);
 
         // B should have received the request via ServiceEvent::Request
         let request = events_b.iter().find_map(|e| match e {
@@ -4438,7 +4554,7 @@ mod tests {
         b.respond(*request_id, b"response data", None, true);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
-        let (events_a, _) = a.poll(now);
+        let events_a = a.poll(now);
 
         // A should have received the response via ServiceEvent::RequestResult
         let response = events_a.iter().find_map(|e| match e {
@@ -4504,7 +4620,7 @@ mod tests {
         transfer(&mut a, 0, &mut b, 0);
         b.poll(later);
         transfer(&mut b, 1, &mut c, 0);
-        let (events_c, _) = c.poll(later);
+        let events_c = c.poll(later);
 
         // C should have received the request via ServiceEvent::Request
         let request = events_c.iter().find_map(|e| match e {
@@ -4526,7 +4642,7 @@ mod tests {
         transfer(&mut c, 0, &mut b, 1);
         b.poll(later);
         transfer(&mut b, 0, &mut a, 0);
-        let (events_a, _) = a.poll(later);
+        let events_a = a.poll(later);
 
         // A should have received the response via ServiceEvent::RequestResult
         let response = events_a.iter().find_map(|e| match e {
@@ -4574,7 +4690,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"request");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events_b, _) = b.poll(now);
+        let events_b = b.poll(now);
 
         // B should have received the request
         let request = events_b.iter().find_map(|e| match e {
@@ -4611,7 +4727,7 @@ mod tests {
 
         // Transfer resource parts
         transfer(&mut b, 0, &mut a, 0);
-        let (events_a, _) = a.poll(now);
+        let events_a = a.poll(now);
 
         // Transfer proof
         transfer(&mut a, 0, &mut b, 0);
@@ -4663,7 +4779,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"req");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events_b, _) = b.poll(now);
+        let events_b = b.poll(now);
 
         // B responds with large response
         let request_id = events_b
@@ -4680,7 +4796,7 @@ mod tests {
         let mut response_received = None;
         for _ in 0..50 {
             transfer(&mut b, 0, &mut a, 0);
-            let (events_a, _) = a.poll(now);
+            let events_a = a.poll(now);
             transfer(&mut a, 0, &mut b, 0);
             b.poll(now);
             if let Some(data) = events_a.iter().find_map(|e| match e {
@@ -4763,7 +4879,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events_b, _) = b.poll(now);
+        let events_b = b.poll(now);
 
         let request_id = events_b
             .iter()
@@ -4781,7 +4897,7 @@ mod tests {
         for _ in 0..500 {
             t += std::time::Duration::from_millis(1);
             transfer(&mut b, 0, &mut a, 0);
-            let (events_a, _) = a.poll(t);
+            let events_a = a.poll(t);
             transfer(&mut a, 0, &mut b, 0);
             b.poll(t);
 
@@ -4845,7 +4961,7 @@ mod tests {
         transfer(&mut a, 0, &mut b, 0);
         b.poll(later);
         transfer(&mut b, 1, &mut c, 0);
-        let (events_c, _) = c.poll(later);
+        let events_c = c.poll(later);
 
         // C responds with large response
         let request_id = events_c
@@ -4864,7 +4980,7 @@ mod tests {
             transfer(&mut c, 0, &mut b, 1);
             b.poll(later);
             transfer(&mut b, 0, &mut a, 0);
-            let (events_a, _) = a.poll(later);
+            let events_a = a.poll(later);
             transfer(&mut a, 0, &mut b, 0);
             b.poll(later);
             transfer(&mut b, 1, &mut c, 0);
@@ -4981,6 +5097,7 @@ mod tests {
                         l.last_keepalive_sent = None;
                         l.last_inbound = t; // Response received
                     }
+                    node.schedule_link_maintenance(link);
                 }
                 t += Duration::from_secs(step_secs);
             }
@@ -4996,6 +5113,7 @@ mod tests {
             link.last_inbound = now; // 6s ago at test_start
             link.last_keepalive_sent = None;
         }
+        a.schedule_link_maintenance(link_id);
         let low_rtt_count = count_keepalives(&mut a, link_id, test_start, 60, 1);
         assert!(
             (10..=14).contains(&low_rtt_count),
@@ -5012,6 +5130,7 @@ mod tests {
             link.last_inbound = now2;
             link.last_keepalive_sent = None;
         }
+        a.schedule_link_maintenance(link_id);
         let high_rtt_count = count_keepalives(&mut a, link_id, now2, 60, 1);
         assert_eq!(
             high_rtt_count, 0,
@@ -5125,7 +5244,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"request");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events_b, _) = b.poll(now);
+        let events_b = b.poll(now);
 
         // Verify request was received
         let request_id = events_b
@@ -5151,7 +5270,7 @@ mod tests {
         b.respond(request_id, b"late response", None, true);
         b.poll(after_stale);
         transfer(&mut b, 0, &mut a, 0);
-        let (events_a, _) = a.poll(after_stale);
+        let events_a = a.poll(after_stale);
 
         // Response should be received
         let response = events_a.iter().find_map(|e| match e {
@@ -5211,6 +5330,7 @@ mod tests {
             link.last_outbound = future;
             link.last_inbound = now; // 400s ago, triggers keepalive (> 360s)
         }
+        a.schedule_link_maintenance(link_id);
 
         a.poll(future);
 
@@ -5312,7 +5432,7 @@ mod tests {
         a.send_link_packet(link_id, LinkContext::None, b"hello over ifac");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events_b, _) = b.poll(now);
+        let events_b = b.poll(now);
 
         // B should receive data via ServiceEvent::Raw
         let raw_data = events_b.iter().find_map(|e| match e {
@@ -5385,7 +5505,7 @@ mod tests {
         b.announce(svc_b);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
-        let (events_a, _) = a.poll(now);
+        let events_a = a.poll(now);
 
         // Check that DestinationsChanged event was emitted
         let destinations_changed = events_a
@@ -5403,7 +5523,7 @@ mod tests {
         b.announce(svc_b);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
-        let (events_a2, _) = a.poll(now);
+        let events_a2 = a.poll(now);
 
         let destinations_changed2 = events_a2
             .iter()
@@ -5443,7 +5563,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"hello");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events_b, _) = b.poll(now);
+        let events_b = b.poll(now);
 
         let request = events_b.iter().find_map(|e| match e {
             ServiceEvent::Request { path, data, .. } => Some((path.clone(), data.clone())),
@@ -5485,7 +5605,7 @@ mod tests {
             .unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events_b, _) = b.poll(now);
+        let events_b = b.poll(now);
 
         // B responds
         let request_id = events_b
@@ -5498,7 +5618,7 @@ mod tests {
         b.respond(request_id, b"response", None, true);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
-        let (events_a, _) = a.poll(now);
+        let events_a = a.poll(now);
 
         let result = events_a.iter().find_map(|e| match e {
             ServiceEvent::RequestResult {
@@ -5580,7 +5700,7 @@ mod tests {
             .unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events_b1, _) = b.poll(now);
+        let events_b1 = b.poll(now);
 
         // B responds to first request
         let req_id_1 = events_b1
@@ -5593,7 +5713,7 @@ mod tests {
         b.respond(req_id_1, b"response1", None, true);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
-        let (events_a1, _) = a.poll(now);
+        let events_a1 = a.poll(now);
 
         let resp1 = events_a1.iter().find_map(|e| match e {
             ServiceEvent::RequestResult {
@@ -5612,7 +5732,7 @@ mod tests {
             .unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events_b2, _) = b.poll(now);
+        let events_b2 = b.poll(now);
 
         // B responds to second request
         let req_id_2 = events_b2
@@ -5625,7 +5745,7 @@ mod tests {
         b.respond(req_id_2, b"response2", None, true);
         b.poll(now);
         transfer(&mut b, 0, &mut a, 0);
-        let (events_a2, _) = a.poll(now);
+        let events_a2 = a.poll(now);
 
         let resp2 = events_a2.iter().find_map(|e| match e {
             ServiceEvent::RequestResult {
@@ -5683,7 +5803,7 @@ mod tests {
             );
             a.poll(now);
             transfer(&mut a, 0, &mut b, 0);
-            let (events_b, _) = b.poll(now);
+            let events_b = b.poll(now);
 
             let req_id = events_b
                 .iter()
@@ -5695,7 +5815,7 @@ mod tests {
             b.respond(req_id, resp_data.as_bytes(), None, true);
             b.poll(now);
             transfer(&mut b, 0, &mut a, 0);
-            let (events_a, _) = a.poll(now);
+            let events_a = a.poll(now);
 
             let response = events_a.iter().find_map(|e| match e {
                 ServiceEvent::RequestResult {
@@ -5759,7 +5879,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events_b, _) = b.poll(now);
+        let events_b = b.poll(now);
 
         // B responds with large response
         let request_id = events_b
@@ -5779,7 +5899,7 @@ mod tests {
         for _ in 0..500 {
             t += std::time::Duration::from_millis(1); // Fast: ~470KB/s per part
             transfer(&mut b, 0, &mut a, 0);
-            let (events_a, _) = a.poll(t);
+            let events_a = a.poll(t);
             transfer(&mut a, 0, &mut b, 0);
             b.poll(t);
 
@@ -5841,7 +5961,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events_b, _) = b.poll(now);
+        let events_b = b.poll(now);
 
         // B responds with large response
         let request_id = events_b
@@ -5861,7 +5981,7 @@ mod tests {
         for _ in 0..500 {
             t += std::time::Duration::from_secs(10); // Very slow: ~47 bytes/s per part
             transfer(&mut b, 0, &mut a, 0);
-            let (events_a, _) = a.poll(t);
+            let events_a = a.poll(t);
             transfer(&mut a, 0, &mut b, 0);
             b.poll(t);
 
@@ -5921,7 +6041,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events_b, _) = b.poll(now);
+        let events_b = b.poll(now);
 
         // B responds with large response
         let request_id = events_b
@@ -5949,7 +6069,7 @@ mod tests {
             }
 
             transfer(&mut b, 0, &mut a, 0);
-            let (events_a, _) = a.poll(t);
+            let events_a = a.poll(t);
             transfer(&mut a, 0, &mut b, 0);
             b.poll(t);
 
@@ -6014,7 +6134,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events_b, _) = b.poll(now);
+        let events_b = b.poll(now);
 
         // B responds with large response
         let request_id = events_b
@@ -6035,7 +6155,7 @@ mod tests {
         for _ in 0..1000 {
             t += std::time::Duration::from_millis(1);
             transfer(&mut b, 0, &mut a, 0);
-            let (events_a, _) = a.poll(t);
+            let events_a = a.poll(t);
             transfer(&mut a, 0, &mut b, 0);
             b.poll(t);
 
@@ -6135,7 +6255,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"req");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events_b, _) = b.poll(now);
+        let events_b = b.poll(now);
 
         // B responds with large response
         let request_id = events_b
@@ -6215,7 +6335,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"req");
         a.poll(later);
         transfer(&mut a, 0, &mut b, 0);
-        let (events_b, _) = b.poll(later);
+        let events_b = b.poll(later);
 
         // B responds
         let request_id = events_b
@@ -6274,7 +6394,7 @@ mod tests {
             a.request(svc_a, crate::LinkHandle(link_id), "test.path", b"ping");
             a.poll(t);
             transfer(&mut a, 0, &mut b, 0);
-            let (events_b, _) = b.poll(t);
+            let events_b = b.poll(t);
 
             // B responds
             let request_id = events_b
@@ -6338,7 +6458,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events, _) = b.poll(now);
+        let events = b.poll(now);
         let req_id = events
             .iter()
             .find_map(|e| match e {
@@ -6425,7 +6545,7 @@ mod tests {
             .unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events, _) = b.poll(now);
+        let events = b.poll(now);
         let server_req_id = events
             .iter()
             .find_map(|e| match e {
@@ -6442,7 +6562,7 @@ mod tests {
 
         for _ in 0..100 {
             transfer(&mut b, 0, &mut a, 0);
-            let (events, _) = a.poll(now);
+            let events = a.poll(now);
 
             for event in &events {
                 match event {
@@ -6700,7 +6820,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"");
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events, _) = b.poll(now);
+        let events = b.poll(now);
         let server_req_id = events
             .iter()
             .find_map(|e| match e {
@@ -6717,7 +6837,7 @@ mod tests {
         let mut received_data = None;
         for _ in 0..50 {
             transfer(&mut b, 0, &mut a, 0);
-            let (events, _) = a.poll(now);
+            let events = a.poll(now);
 
             for event in &events {
                 if let ServiceEvent::RequestResult {
@@ -7033,7 +7153,7 @@ mod tests {
             .unwrap();
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
-        let (events, _) = b.poll(now);
+        let events = b.poll(now);
         let server_req_id = events
             .iter()
             .find_map(|e| match e {
@@ -7056,7 +7176,7 @@ mod tests {
         for _ in 0..500 {
             t += std::time::Duration::from_millis(1);
             transfer(&mut b, 0, &mut a, 0);
-            let (events, _) = a.poll(t);
+            let events = a.poll(t);
 
             for event in &events {
                 match event {
@@ -7177,7 +7297,7 @@ mod tests {
         b.poll(t);
 
         transfer(&mut b, 0, &mut a, 0);
-        let (events, _) = a.poll(t);
+        let events = a.poll(t);
 
         let raw_received = events.iter().any(|e| matches!(e, ServiceEvent::Raw { .. }));
         assert!(raw_received);
@@ -7214,7 +7334,7 @@ mod tests {
 
         // A receives and decrypts using ratchet
         transfer(&mut b, 0, &mut a, 0);
-        let (events, _) = a.poll(t);
+        let events = a.poll(t);
 
         let data_received = events.iter().find_map(|e| match e {
             ServiceEvent::Raw { data, .. } => Some(data.clone()),
@@ -7397,7 +7517,7 @@ mod tests {
         b.link_request(handle, "/test", b"hello", t);
         b.poll(t);
         transfer(&mut b, 0, &mut a, 0);
-        let (events_a, _) = a.poll(t);
+        let events_a = a.poll(t);
 
         let request_event = events_a
             .iter()
@@ -7470,7 +7590,7 @@ mod tests {
         transfer(&mut b, 1, &mut c, 0);
         c.poll(t2);
         transfer(&mut c, 1, &mut d, 0);
-        let (events, _) = d.poll(t2);
+        let events = d.poll(t2);
 
         let raw_events: Vec<_> = events
             .iter()
@@ -7526,7 +7646,7 @@ mod tests {
         transfer(&mut a, 0, &mut b, 0);
         b.poll(t1);
         transfer(&mut b, 1, &mut c, 0);
-        let (events_c, _) = c.poll(t1);
+        let events_c = c.poll(t1);
 
         let data_c: Vec<_> = events_c
             .iter()
@@ -7546,7 +7666,7 @@ mod tests {
         b.poll(t1);
         transfer(&mut b, 0, &mut a, 0);
 
-        let (events_a, _) = a.poll(t1);
+        let events_a = a.poll(t1);
 
         let data_a: Vec<_> = events_a
             .iter()
@@ -7692,7 +7812,7 @@ mod tests {
         let request_id = a.link_request(handle, "/test", b"request", t).unwrap();
         a.poll(t);
         transfer(&mut a, 0, &mut b, 0);
-        let (events_b, _) = b.poll(t);
+        let events_b = b.poll(t);
 
         let req_event = events_b
             .iter()
@@ -7711,7 +7831,7 @@ mod tests {
 
         b.poll(t);
         transfer(&mut b, 0, &mut a, 0);
-        let (events_a, _) = a.poll(t);
+        let events_a = a.poll(t);
 
         let result_event = events_a.iter().find(|e| {
             matches!(
@@ -7958,7 +8078,7 @@ mod tests {
         assert!(b.path_table.contains_key(&address));
 
         let expired_at = learned_at + std::time::Duration::from_secs(7 * 24 * 60 * 60 + 1);
-        let (events, _) = b.poll(expired_at);
+        let events = b.poll(expired_at);
 
         assert!(!b.path_table.contains_key(&address));
         assert!(
@@ -7978,6 +8098,13 @@ mod tests {
             ReverseTableEntry {
                 timestamp: created_at,
                 receiving_interface: 0,
+            },
+        );
+        node.schedule_timer(
+            created_at + REVERSE_TIMEOUT + Duration::from_nanos(1),
+            ProtocolTimer::ReversePathExpiry {
+                destination: packet_hash,
+                timestamp: created_at,
             },
         );
 
@@ -8269,7 +8396,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"req");
         a.poll(t);
         transfer(&mut a, 0, &mut b, 0);
-        let (events_b, _) = b.poll(t);
+        let events_b = b.poll(t);
 
         let request_id = events_b
             .iter()
@@ -8421,7 +8548,7 @@ mod tests {
         assert!(stats_after.packets_relayed > stats_before.packets_relayed);
 
         transfer(&mut b, 1, &mut c, 0);
-        let (events, _) = c.poll(t1);
+        let events = c.poll(t1);
 
         let has_raw = events.iter().any(|e| matches!(e, ServiceEvent::Raw { .. }));
         assert!(has_raw);
@@ -8444,7 +8571,7 @@ mod tests {
         assert!(a.pending_path_requests.contains_key(&unknown_dest));
 
         let timeout = t + std::time::Duration::from_secs(61);
-        let (events, _) = a.poll(timeout);
+        let events = a.poll(timeout);
 
         assert!(!a.pending_path_requests.contains_key(&unknown_dest));
 
@@ -8565,7 +8692,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"req");
         a.poll(t);
         transfer(&mut a, 0, &mut b, 0);
-        let (events_b, _) = b.poll(t);
+        let events_b = b.poll(t);
 
         let request_id = events_b
             .iter()
@@ -8582,7 +8709,7 @@ mod tests {
         let mut received_data = None;
         for _ in 0..500 {
             transfer(&mut b, 0, &mut a, 0);
-            let (events_a, _) = a.poll(t);
+            let events_a = a.poll(t);
             transfer(&mut a, 0, &mut b, 0);
             b.poll(t);
 
@@ -8634,7 +8761,7 @@ mod tests {
         a.request(svc_a, crate::LinkHandle(link_id), "test", b"req");
         a.poll(t);
         transfer(&mut a, 0, &mut b, 0);
-        let (events_b, _) = b.poll(t);
+        let events_b = b.poll(t);
 
         let request_id = events_b
             .iter()
@@ -8786,7 +8913,7 @@ mod tests {
         client.request(svc_client, crate::LinkHandle(link_id), "test", b"req");
         client.poll(now);
         transfer(&mut client, 0, &mut server, 0);
-        let (events, _) = server.poll(now);
+        let events = server.poll(now);
         let req_id = events
             .iter()
             .find_map(|e| match e {
@@ -8803,7 +8930,7 @@ mod tests {
         client.request(svc_client, crate::LinkHandle(link_id), "test", b"req2");
         client.poll(now);
         transfer(&mut client, 0, &mut server, 0);
-        let (events, _) = server.poll(now);
+        let events = server.poll(now);
         let req_id = events
             .iter()
             .find_map(|e| match e {
