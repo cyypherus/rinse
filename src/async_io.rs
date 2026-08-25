@@ -92,6 +92,23 @@ mod tests {
             assert_eq!(packet, expected);
         }
     }
+
+    #[tokio::test]
+    async fn clones_share_runtime_setup() {
+        let node: Node<TestTransport> = Node::new(false);
+        let mut setup = node.clone();
+        let mut rng = StdRng::seed_from_u64(1);
+        let service = setup.add_service("service", &[], &Identity::generate(&mut rng));
+        assert_eq!(
+            setup.service_address(service),
+            node.service_address(service)
+        );
+
+        let runtime = tokio::spawn(setup.run());
+        tokio::task::yield_now().await;
+        runtime.abort();
+        assert!(runtime.await.unwrap_err().is_cancelled());
+    }
 }
 
 #[cfg(feature = "tcp")]
@@ -121,15 +138,13 @@ fn hdlc_extract_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
 }
 
 #[cfg(feature = "tcp")]
-type Inbox = Arc<StdMutex<VecDeque<Vec<u8>>>>;
-#[cfg(feature = "tcp")]
-type Outbox = Arc<StdMutex<VecDeque<Vec<u8>>>>;
+type PacketQueue = Arc<StdMutex<VecDeque<Vec<u8>>>>;
 
 #[cfg(feature = "tcp")]
 pub struct AsyncTcpTransport {
     addr: String,
-    inbox: Inbox,
-    outbox: Outbox,
+    inbox: PacketQueue,
+    outbox: PacketQueue,
     connected: Arc<StdMutex<bool>>,
     shutdown_tx: Option<mpsc::Sender<()>>,
     io_task: Option<tokio::task::JoinHandle<()>>,
@@ -145,8 +160,8 @@ impl AsyncTcpTransport {
     }
 
     pub fn from_stream(addr: String, stream: TcpStream) -> std::io::Result<Self> {
-        let inbox: Inbox = Arc::new(StdMutex::new(VecDeque::new()));
-        let outbox: Outbox = Arc::new(StdMutex::new(VecDeque::new()));
+        let inbox: PacketQueue = Arc::new(StdMutex::new(VecDeque::new()));
+        let outbox: PacketQueue = Arc::new(StdMutex::new(VecDeque::new()));
         let connected = Arc::new(StdMutex::new(true));
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let inbound_notifier = Arc::new(StdMutex::new(None));
@@ -239,8 +254,8 @@ impl Transport for AsyncTcpTransport {
 #[cfg(feature = "tcp")]
 async fn tcp_io_task(
     stream: TcpStream,
-    inbox: Inbox,
-    outbox: Outbox,
+    inbox: PacketQueue,
+    outbox: PacketQueue,
     connected: Arc<StdMutex<bool>>,
     inbound_notifier: Arc<StdMutex<Option<Arc<Notify>>>>,
     mut shutdown_rx: mpsc::Receiver<()>,
@@ -310,31 +325,21 @@ type RequestWaiters = Arc<
     StdMutex<HashMap<RequestId, oneshot::Sender<Result<(Vec<u8>, Option<Vec<u8>>), RequestError>>>>,
 >;
 type RespondWaiters = Arc<StdMutex<HashMap<RequestId, oneshot::Sender<Result<(), RespondError>>>>>;
-type LinkWaiters = HashMap<crate::LinkHandle, Vec<oneshot::Sender<Result<(), LinkError>>>>;
-type PathWaiters = HashMap<Address, Vec<oneshot::Sender<bool>>>;
-type IncomingRequestReceiver = Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingRequest>>>;
-type RawReceiver = Arc<TokioMutex<mpsc::UnboundedReceiver<Vec<u8>>>>;
-type ResourceReceiver = Arc<TokioMutex<mpsc::UnboundedReceiver<(crate::LinkHandle, Vec<u8>)>>>;
-type ProgressReceiver = Arc<TokioMutex<mpsc::UnboundedReceiver<crate::handle::Progress>>>;
-type ChannelReceiver =
-    Arc<TokioMutex<mpsc::UnboundedReceiver<(crate::LinkHandle, crate::ChannelMessage)>>>;
-type BufferReceiver =
-    Arc<TokioMutex<mpsc::UnboundedReceiver<(crate::LinkHandle, crate::BufferChunk)>>>;
-
+type Receiver<T> = Arc<TokioMutex<mpsc::UnboundedReceiver<T>>>;
 #[derive(Clone)]
 struct ServiceChannels {
     request_tx: mpsc::UnboundedSender<IncomingRequest>,
-    request_rx: IncomingRequestReceiver,
+    request_rx: Receiver<IncomingRequest>,
     raw_tx: mpsc::UnboundedSender<Vec<u8>>,
-    raw_rx: RawReceiver,
+    raw_rx: Receiver<Vec<u8>>,
     resource_tx: mpsc::UnboundedSender<(crate::LinkHandle, Vec<u8>)>,
-    resource_rx: ResourceReceiver,
+    resource_rx: Receiver<(crate::LinkHandle, Vec<u8>)>,
     progress_tx: mpsc::UnboundedSender<crate::handle::Progress>,
-    progress_rx: ProgressReceiver,
+    progress_rx: Receiver<crate::handle::Progress>,
     channel_tx: mpsc::UnboundedSender<(crate::LinkHandle, crate::ChannelMessage)>,
-    channel_rx: ChannelReceiver,
+    channel_rx: Receiver<(crate::LinkHandle, crate::ChannelMessage)>,
     buffer_tx: mpsc::UnboundedSender<(crate::LinkHandle, crate::BufferChunk)>,
-    buffer_rx: BufferReceiver,
+    buffer_rx: Receiver<(crate::LinkHandle, crate::BufferChunk)>,
     request_waiters: RequestWaiters,
     respond_waiters: RespondWaiters,
 }
@@ -449,8 +454,8 @@ enum Command<T: Transport> {
 struct Runtime<T: Transport> {
     protocol: crate::node::Protocol<T, StdRng>,
     command_rx: mpsc::UnboundedReceiver<Command<T>>,
-    link_waiters: LinkWaiters,
-    path_waiters: PathWaiters,
+    link_waiters: HashMap<crate::LinkHandle, Vec<oneshot::Sender<Result<(), LinkError>>>>,
+    path_waiters: HashMap<Address, Vec<oneshot::Sender<bool>>>,
     destinations_changed_tx: watch::Sender<()>,
     destinations_tx: watch::Sender<Vec<Destination>>,
     stats_tx: watch::Sender<StatsSnapshot>,
@@ -464,7 +469,7 @@ pub struct Node<T: Transport> {
     destinations_changed_rx: watch::Receiver<()>,
     destinations_rx: watch::Receiver<Vec<Destination>>,
     stats_rx: watch::Receiver<StatsSnapshot>,
-    inner: Option<Runtime<T>>,
+    inner: Arc<StdMutex<Option<Runtime<T>>>>,
 }
 
 impl<T: Transport> Clone for Node<T> {
@@ -476,7 +481,7 @@ impl<T: Transport> Clone for Node<T> {
             destinations_changed_rx: self.destinations_changed_rx.clone(),
             destinations_rx: self.destinations_rx.clone(),
             stats_rx: self.stats_rx.clone(),
-            inner: None,
+            inner: self.inner.clone(),
         }
     }
 }
@@ -497,7 +502,7 @@ impl<T: Transport> Node<T> {
             destinations_changed_rx,
             destinations_rx,
             stats_rx,
-            inner: Some(Runtime {
+            inner: Arc::new(StdMutex::new(Some(Runtime {
                 protocol: crate::node::Protocol::with_rng(rng, transport),
                 command_rx,
                 link_waiters: HashMap::new(),
@@ -506,7 +511,7 @@ impl<T: Transport> Node<T> {
                 destinations_tx,
                 stats_tx,
                 inbound_ready,
-            }),
+            }))),
         }
     }
 
@@ -517,8 +522,8 @@ impl<T: Transport> Node<T> {
     }
 
     pub fn add_service(&mut self, name: &str, paths: &[&str], identity: &Identity) -> ServiceId {
-        let inner = self
-            .inner
+        let mut runtime = self.inner.lock().unwrap();
+        let inner = runtime
             .as_mut()
             .expect("add_service requires the original Node");
 
@@ -982,9 +987,9 @@ impl<T: Transport> Node<T> {
         reply_rx.await.ok().flatten()
     }
 
-    pub async fn run(mut self) {
-        let Some(mut inner) = self.inner.take() else {
-            panic!("run() can only be called on the original Node, not a clone");
+    pub async fn run(self) {
+        let Some(mut inner) = self.inner.lock().unwrap().take() else {
+            panic!("node runtime already started");
         };
 
         let mut next_wake: Option<Instant> = None;
@@ -1209,7 +1214,9 @@ impl<T: Transport> Node<T> {
     fn handle_command(inner: &mut Runtime<T>, cmd: Command<T>, now: Instant) {
         match cmd {
             Command::AddInterface { mut interface } => {
-                interface.set_inbound_notifier(inner.inbound_ready.clone());
+                interface
+                    .transport
+                    .set_inbound_notifier(inner.inbound_ready.clone());
                 inner.protocol.add_interface(*interface);
             }
             Command::Announce { service, app_data } => {

@@ -71,7 +71,7 @@ pub struct Destination {
     pub last_seen: Instant,
 }
 
-pub enum ServiceEvent {
+pub(crate) enum ServiceEvent {
     Request {
         service: ServiceId,
         request_id: RequestId,

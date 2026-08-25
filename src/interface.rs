@@ -97,10 +97,6 @@ impl<T: Transport> Interface<T> {
         self.transport.is_connected()
     }
 
-    pub(crate) fn set_inbound_notifier(&mut self, notifier: std::sync::Arc<tokio::sync::Notify>) {
-        self.transport.set_inbound_notifier(notifier);
-    }
-
     pub(crate) fn send(&mut self, packet: Packet, priority: u8) {
         self.queue.push(QueuedPacket { packet, priority });
     }

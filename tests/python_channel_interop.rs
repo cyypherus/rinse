@@ -157,7 +157,10 @@ async fn python_and_rust_exchange_channels_and_buffers() {
     client
         .send_channel(
             link,
-            ChannelMessage::new(0x0101, b"rust-channel".to_vec()).unwrap(),
+            ChannelMessage {
+                message_type: 0x0101,
+                data: b"rust-channel".to_vec(),
+            },
         )
         .await
         .unwrap();

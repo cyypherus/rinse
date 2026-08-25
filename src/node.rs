@@ -899,19 +899,6 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         )
     }
 
-    #[cfg(test)]
-    pub fn send_buffer(
-        &mut self,
-        link: crate::LinkHandle,
-        stream_id: u16,
-        data: &[u8],
-        eof: bool,
-    ) -> Result<usize, crate::BufferError> {
-        let (raw, processed) = crate::buffer::encode(stream_id, data, eof)?;
-        self.send_buffer_data(link, &raw)?;
-        Ok(processed)
-    }
-
     pub(crate) fn send_buffer_data(
         &mut self,
         link: crate::LinkHandle,
@@ -2164,7 +2151,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                             if let Some(service) = service {
                                 for message in messages {
                                     if message.message_type == crate::buffer::STREAM_MESSAGE_TYPE {
-                                        if let Ok(chunk) = crate::buffer::decode(&message.data) {
+                                        if let Some(chunk) = crate::buffer::decode(&message.data) {
                                             notifications.push(Notification::Buffer {
                                                 service,
                                                 link: crate::LinkHandle(link_id),
@@ -4076,7 +4063,10 @@ mod tests {
 
         a.send_channel(
             crate::LinkHandle(link_id),
-            ChannelMessage::new(0x0101, b"hello".to_vec()).unwrap(),
+            ChannelMessage {
+                message_type: 0x0101,
+                data: b"hello".to_vec(),
+            },
         )
         .unwrap();
         a.poll(now);
@@ -4121,11 +4111,10 @@ mod tests {
         a.poll(now);
 
         let data = vec![b'x'; 4096];
-        assert_eq!(
-            a.send_buffer(crate::LinkHandle(link_id), 3, &data, true)
-                .unwrap(),
-            data.len()
-        );
+        let (raw, processed) = crate::buffer::encode(3, &data, true).unwrap();
+        a.send_buffer_data(crate::LinkHandle(link_id), &raw)
+            .unwrap();
+        assert_eq!(processed, data.len());
         a.poll(now);
         transfer(&mut a, 0, &mut b, 0);
         let (events, _) = b.poll(now);

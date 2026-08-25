@@ -21,7 +21,6 @@ pub struct BufferChunk {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BufferError {
     InvalidStreamId,
-    InvalidMessage,
     DecompressionFailed,
     Channel(crate::ChannelError),
 }
@@ -77,9 +76,9 @@ pub(crate) fn encode(
     Ok((raw, processed))
 }
 
-pub(crate) fn decode(raw: &[u8]) -> Result<BufferChunk, BufferError> {
+pub(crate) fn decode(raw: &[u8]) -> Option<BufferChunk> {
     if raw.len() < 2 {
-        return Err(BufferError::InvalidMessage);
+        return None;
     }
     let header = u16::from_be_bytes([raw[0], raw[1]]);
     let compressed = header & 0x4000 != 0;
@@ -90,15 +89,15 @@ pub(crate) fn decode(raw: &[u8]) -> Result<BufferChunk, BufferError> {
             .by_ref()
             .take(MAX_CHUNK_LEN as u64 + 1)
             .read_to_end(&mut decoded)
-            .map_err(|_| BufferError::DecompressionFailed)?;
+            .ok()?;
         if decoded.len() > MAX_CHUNK_LEN {
-            return Err(BufferError::DecompressionFailed);
+            return None;
         }
         decoded
     } else {
         raw[2..].to_vec()
     };
-    Ok(BufferChunk {
+    Some(BufferChunk {
         stream_id: header & STREAM_ID_MAX,
         data,
         eof: header & 0x8000 != 0,
@@ -139,10 +138,7 @@ mod tests {
             encode(STREAM_ID_MAX + 1, b"", false),
             Err(BufferError::InvalidStreamId)
         );
-        assert_eq!(decode(&[0]), Err(BufferError::InvalidMessage));
-        assert_eq!(
-            decode(&[0x40, 0, 1, 2, 3]),
-            Err(BufferError::DecompressionFailed)
-        );
+        assert_eq!(decode(&[0]), None);
+        assert_eq!(decode(&[0x40, 0, 1, 2, 3]), None);
     }
 }

@@ -11,21 +11,6 @@ pub struct ChannelMessage {
     pub data: Vec<u8>,
 }
 
-impl ChannelMessage {
-    pub fn new(message_type: u16, data: Vec<u8>) -> Result<Self, ChannelError> {
-        if message_type >= 0xf000 {
-            return Err(ChannelError::ReservedMessageType);
-        }
-        if data.len() > CHANNEL_MDU {
-            return Err(ChannelError::MessageTooLarge {
-                size: data.len(),
-                max: CHANNEL_MDU,
-            });
-        }
-        Ok(Self { message_type, data })
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelError {
     InvalidLink,
@@ -218,12 +203,13 @@ mod tests {
 
     #[test]
     fn rejects_reserved_and_oversized_user_messages() {
+        let mut channel = ChannelState::new();
         assert_eq!(
-            ChannelMessage::new(0xf000, Vec::new()),
+            channel.prepare(0xf000, &[], false),
             Err(ChannelError::ReservedMessageType)
         );
         assert_eq!(
-            ChannelMessage::new(1, vec![0; CHANNEL_MDU + 1]),
+            channel.prepare(1, &vec![0; CHANNEL_MDU + 1], false),
             Err(ChannelError::MessageTooLarge {
                 size: CHANNEL_MDU + 1,
                 max: CHANNEL_MDU,
