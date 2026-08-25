@@ -309,6 +309,10 @@ impl Packet {
     }
 
     pub fn from_bytes(raw: &[u8]) -> Result<Self, ParseError> {
+        Self::from_vec(raw.to_vec())
+    }
+
+    pub(crate) fn from_vec(mut raw: Vec<u8>) -> Result<Self, ParseError> {
         if raw.len() < 4 {
             return Err(ParseError::TooShort);
         }
@@ -325,7 +329,7 @@ impl Packet {
         let is_type2 = header_type == 1;
         let is_transport = propagation_type == 1;
 
-        let (transport_id, destination_hash, context_byte, data) = if is_type2 {
+        let (transport_id, destination_hash, context_byte, data_offset) = if is_type2 {
             if raw.len() < 2 + ADDR_LEN + ADDR_LEN + 1 {
                 return Err(ParseError::TooShort);
             }
@@ -334,8 +338,7 @@ impl Packet {
             tid.copy_from_slice(&raw[2..2 + ADDR_LEN]);
             dest.copy_from_slice(&raw[2 + ADDR_LEN..2 + 2 * ADDR_LEN]);
             let ctx = raw[2 + 2 * ADDR_LEN];
-            let data = raw[2 + 2 * ADDR_LEN + 1..].to_vec();
-            (Some(tid), dest, ctx, data)
+            (Some(tid), dest, ctx, 2 + 2 * ADDR_LEN + 1)
         } else {
             if raw.len() < 2 + ADDR_LEN + 1 {
                 return Err(ParseError::TooShort);
@@ -343,9 +346,10 @@ impl Packet {
             let mut dest = [0u8; ADDR_LEN];
             dest.copy_from_slice(&raw[2..2 + ADDR_LEN]);
             let ctx = raw[2 + ADDR_LEN];
-            let data = raw[2 + ADDR_LEN + 1..].to_vec();
-            (None, dest, ctx, data)
+            (None, dest, ctx, 2 + ADDR_LEN + 1)
         };
+        raw.drain(..data_offset);
+        let data = raw;
 
         match packet_type {
             PKT_DATA => {
@@ -815,6 +819,23 @@ impl Packet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_vec_reuses_input_allocation() {
+        let packet = Packet::LinkData {
+            hops: 0,
+            destination: LinkDataDestination::Direct([1; 16]),
+            context: LinkContext::Resource,
+            data: vec![2; 1024],
+        };
+        let raw = packet.to_bytes();
+        let allocation = raw.as_ptr();
+        let parsed = Packet::from_vec(raw).unwrap();
+        let Packet::LinkData { data, .. } = parsed else {
+            panic!("expected link data");
+        };
+        assert_eq!(data.as_ptr(), allocation);
+    }
 
     #[test]
     fn spec_example1_type2_transport_single_data_hops4() {

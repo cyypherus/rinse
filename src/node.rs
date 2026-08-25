@@ -156,44 +156,40 @@ struct OutboundMultiSegment {
 pub(crate) struct PreparedInbound {
     packet: Packet,
     packet_hash: [u8; 32],
-    raw: Vec<u8>,
+    wire_len: usize,
     source: usize,
 }
 
 impl PreparedInbound {
     pub(crate) fn parse(raw: Vec<u8>, source: usize) -> Option<Self> {
-        match Packet::from_bytes(&raw) {
-            Ok(packet) => {
-                let mut hasher = Sha256::new();
-                hasher.update([raw[0] & 0b0000_1111]);
-                let skip = if raw[0] & 0b0100_0000 != 0 {
-                    2 + std::mem::size_of::<Address>()
-                } else {
-                    2
-                };
-                hasher.update(&raw[skip..]);
-                let packet_hash = hasher.finalize().into();
-                Some(Self {
-                    packet,
-                    packet_hash,
-                    raw,
-                    source,
-                })
-            }
+        let wire_len = raw.len();
+        let mut hasher = Sha256::new();
+        hasher.update([raw.first().copied().unwrap_or(0) & 0b0000_1111]);
+        let skip = if raw.first().copied().unwrap_or(0) & 0b0100_0000 != 0 {
+            2 + std::mem::size_of::<Address>()
+        } else {
+            2
+        };
+        if raw.len() >= skip {
+            hasher.update(&raw[skip..]);
+        }
+        let packet_hash = hasher.finalize().into();
+        match Packet::from_vec(raw) {
+            Ok(packet) => Some(Self {
+                packet,
+                packet_hash,
+                wire_len,
+                source,
+            }),
             Err(error) => {
-                log::debug!(
-                    "Failed to parse packet: {:?} raw={} (len={})",
-                    error,
-                    hex::encode(&raw[..raw.len().min(64)]),
-                    raw.len()
-                );
+                log::debug!("Failed to parse packet: {:?} (len={})", error, wire_len);
                 None
             }
         }
     }
 
-    pub(crate) fn into_parts(self) -> (Packet, [u8; 32], Vec<u8>, usize) {
-        (self.packet, self.packet_hash, self.raw, self.source)
+    pub(crate) fn into_parts(self) -> (Packet, [u8; 32], usize, usize) {
+        (self.packet, self.packet_hash, self.wire_len, self.source)
     }
 }
 
@@ -1383,7 +1379,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         &mut self,
         mut packet: Packet,
         packet_hash: [u8; 32],
-        raw: &[u8],
+        wire_len: usize,
         interface_index: usize,
         now: Instant,
     ) -> Option<(Packet, bool, bool)> {
@@ -1589,7 +1585,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                     // Transmit on outbound interface
                     if let Some(iface) = self.interfaces.get_mut(outbound_interface) {
                         self.stats.packets_relayed += 1;
-                        self.stats.bytes_relayed += raw.len() as u64;
+                        self.stats.bytes_relayed += wire_len as u64;
                         iface.send(new_packet, 0);
                         path_entry.timestamp = now;
                     }
@@ -1643,7 +1639,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
 
                     if let Some(iface) = self.interfaces.get_mut(out_iface) {
                         self.stats.packets_relayed += 1;
-                        self.stats.bytes_relayed += raw.len() as u64;
+                        self.stats.bytes_relayed += wire_len as u64;
                         self.stats.link_packets_relayed += 1;
                         iface.send(packet.clone(), 0);
                         link_entry.timestamp = now;
@@ -2256,9 +2252,8 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             }
             Packet::LinkProof { data, .. } => {
                 log::info!(
-                    "Received LinkProof: dest_from_packet=<{}> raw_bytes={} pending_links={:?}",
+                    "Received LinkProof: dest_from_packet=<{}> pending_links={:?}",
                     hex::encode(destination_hash),
-                    hex::encode(&raw[..raw.len().min(40)]),
                     self.pending_outbound_links
                         .keys()
                         .map(hex::encode)
@@ -2271,7 +2266,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                         if let Some(iface) = self.interfaces.get_mut(link_entry.receiving_interface)
                         {
                             self.stats.packets_relayed += 1;
-                            self.stats.bytes_relayed += raw.len() as u64;
+                            self.stats.bytes_relayed += wire_len as u64;
                             self.stats.proofs_relayed += 1;
                             iface.send(packet.clone(), 0);
                         }
@@ -2436,7 +2431,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                             self.interfaces.get_mut(reverse_entry.receiving_interface)
                     {
                         self.stats.packets_relayed += 1;
-                        self.stats.bytes_relayed += raw.len() as u64;
+                        self.stats.bytes_relayed += wire_len as u64;
                         self.stats.proofs_relayed += 1;
                         iface.send(packet.clone(), 0);
                     }
@@ -2762,8 +2757,8 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         };
 
         for received in received {
-            let (packet, packet_hash, raw, source) = received.into_parts();
-            self.inbound(packet, packet_hash, &raw, source, now);
+            let (packet, packet_hash, wire_len, source) = received.into_parts();
+            self.inbound(packet, packet_hash, wire_len, source, now);
         }
 
         // Process batched resource requests (deduplicated)
