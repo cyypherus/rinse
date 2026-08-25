@@ -19,8 +19,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Gauge, Paragraph},
 };
-use rinse::config::{Config, InterfaceConfig, data_dir, load_or_generate_identity};
-use rinse::{Interface, Node, StatsSnapshot, TcpTransport};
+use rinse::config::{Config, InterfaceConfig, data_dir, load_or_create_persistent_identity};
+use rinse::{Interface, LifetimeStats, Node, TcpTransport};
 use serde::{Deserialize, Serialize};
 use simplelog::{
     ColorChoice, Config as LogConfig, SharedLogger, TermLogger, TerminalMode, WriteLogger,
@@ -71,7 +71,7 @@ impl PersistedStats {
         }
     }
 
-    fn merge(&mut self, session: &StatsSnapshot) {
+    fn merge(&mut self, session: &LifetimeStats) {
         self.total_uptime_secs += session.uptime_secs;
         self.packets_relayed += session.packets_relayed;
         self.bytes_relayed += session.bytes_relayed;
@@ -85,7 +85,7 @@ impl PersistedStats {
         self.bytes_sent += session.bytes_sent;
     }
 
-    fn combined(&self, session: &StatsSnapshot) -> CombinedStats {
+    fn combined(&self, session: &LifetimeStats) -> CombinedStats {
         CombinedStats {
             session_uptime_secs: session.uptime_secs,
             total_uptime_secs: self.total_uptime_secs + session.uptime_secs,
@@ -707,7 +707,7 @@ async fn main() {
     }
 
     let config = Config::load().expect("failed to load config");
-    let identity = load_or_generate_identity().expect("failed to load identity");
+    let identity = load_or_create_persistent_identity().expect("failed to load identity");
 
     let stats_file = stats_path();
     let persisted = PersistedStats::load(&stats_file);
@@ -717,8 +717,8 @@ async fn main() {
         format_uptime(persisted.total_uptime_secs)
     );
 
-    let mut node: Node<TcpTransport> = Node::new(true);
-    let service = node.add_service("relay.stats", &[], &identity);
+    let mut node: Node<TcpTransport> = Node::relay();
+    let service = node.add_service("relay.stats", &[], &identity).unwrap();
 
     let enabled_interfaces = config.enabled_interfaces();
     if enabled_interfaces.is_empty() {
@@ -829,7 +829,7 @@ async fn run_headless(
                 log::debug!("Announced relay");
             }
             _ = stats_tick.tick() => {
-                let session_stats = node_handle.stats().await;
+                let session_stats = node_handle.lifetime_stats();
                 log::info!(
                     "Stats: {} packets relayed, {} received, {} sent",
                     session_stats.packets_relayed,
@@ -846,7 +846,7 @@ async fn run_headless(
                 }
             }
             _ = tokio::signal::ctrl_c() => {
-                let session_stats = node_handle.stats().await;
+                let session_stats = node_handle.lifetime_stats();
                 persisted.merge(&session_stats);
                 persisted.save(&stats_file);
                 eprintln!("\nShutting down. Packets relayed: {}", persisted.packets_relayed);
@@ -891,7 +891,7 @@ async fn run_tui(
                 log::debug!("Announced relay");
             }
             _ = tick.tick() => {
-                let session_stats = node_handle.stats().await;
+                let session_stats = node_handle.lifetime_stats();
                 let combined = persisted.combined(&session_stats);
 
                 let new_achievements = RelayTui::check_milestones(&mut persisted, &combined);
@@ -923,7 +923,7 @@ async fn run_tui(
                     && key.code == KeyCode::Char('c')
                     && key.modifiers.contains(KeyModifiers::CONTROL)
                 {
-                    let session_stats = node_handle.stats().await;
+                    let session_stats = node_handle.lifetime_stats();
                     persisted.merge(&session_stats);
                     persisted.save(&stats_file);
 

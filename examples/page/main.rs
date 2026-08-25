@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use rinse::config::{Config, InterfaceConfig, load_or_generate_identity};
-use rinse::{Address, IncomingRequest, Interface, Node, ServiceId, TcpTransport};
+use rinse::config::{Config, InterfaceConfig, load_or_create_persistent_identity};
+use rinse::{IdentityAddress, IncomingRequest, Interface, Node, ServiceId, TcpTransport};
 use tokio::net::TcpListener;
 
 mod pages;
 
 pub struct PageState {
     pub messages: Vec<(String, String)>,
-    pub known_users: HashMap<Address, String>,
+    pub known_users: HashMap<IdentityAddress, String>,
 }
 
 impl PageState {
@@ -20,11 +20,11 @@ impl PageState {
         }
     }
 
-    pub fn get_username(&self, identity: Option<Address>) -> Option<&str> {
+    pub fn get_username(&self, identity: Option<IdentityAddress>) -> Option<&str> {
         identity.and_then(|id| self.known_users.get(&id).map(|s| s.as_str()))
     }
 
-    pub fn set_username(&mut self, identity: Address, name: String) {
+    pub fn set_username(&mut self, identity: IdentityAddress, name: String) {
         if !name.trim().is_empty() {
             self.known_users.insert(identity, name);
         }
@@ -36,7 +36,7 @@ async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let config = Config::load().expect("Failed to load config");
-    let identity = load_or_generate_identity().expect("Failed to load identity");
+    let identity = load_or_create_persistent_identity().expect("Failed to load identity");
     let state = Arc::new(Mutex::new(PageState::new()));
 
     let node_name = config
@@ -44,10 +44,16 @@ async fn main() {
         .clone()
         .unwrap_or_else(|| "Page Server".to_string());
 
-    let mut node: Node<TcpTransport> = Node::new(config.network.relay);
+    let mut node: Node<TcpTransport> = if config.network.relay {
+        Node::relay()
+    } else {
+        Node::endpoint()
+    };
 
     let paths = vec!["/page/index.mu", "/page/guestbook.mu", "/page/about.mu"];
-    let service = node.add_service("nomadnetwork.node", &paths, &identity);
+    let service = node
+        .add_service("nomadnetwork.node", &paths, &identity)
+        .unwrap();
     let addr = node.service_address(service).unwrap();
     log::info!("Node: {} ({})", node_name, hex::encode(addr));
 
@@ -95,7 +101,7 @@ async fn main() {
 
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        node_clone.announce_with_app_data(service, Some(name_bytes.clone()));
+        node_clone.announce_with_app_data(service, name_bytes.clone());
         log::info!("Announced service");
 
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -103,11 +109,11 @@ async fn main() {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    node_clone.announce_with_app_data(service, Some(name_bytes.clone()));
+                    node_clone.announce_with_app_data(service, name_bytes.clone());
                     log::info!("Re-announced service");
                 }
                 request = node_clone.recv_request(service) => {
-                    let Some(request) = request else { break };
+                    let Ok(request) = request else { break };
                     handle_request(&node_clone, service, &state_clone, &name, request).await;
                 }
             }
@@ -157,12 +163,19 @@ async fn handle_request(
         "Request path='{}' form_data={:?} identity={:?}",
         request.path,
         form_data,
-        request.remote_identity.map(hex::encode)
+        request.authenticated_remote_identity.map(hex::encode)
     );
 
     let response = match request.path.as_str() {
-        "/page/index.mu" => pages::index(state, name, &form_data, request.remote_identity),
-        "/page/guestbook.mu" => pages::guestbook(state, &form_data, request.remote_identity),
+        "/page/index.mu" => pages::index(
+            state,
+            name,
+            &form_data,
+            request.authenticated_remote_identity,
+        ),
+        "/page/guestbook.mu" => {
+            pages::guestbook(state, &form_data, request.authenticated_remote_identity)
+        }
         "/page/about.mu" => pages::about(name),
         _ => pages::not_found(&request.path),
     };

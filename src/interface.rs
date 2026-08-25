@@ -5,10 +5,45 @@ use ed25519_dalek::SigningKey;
 
 use crate::packet::Packet;
 
+pub struct InterfaceAccessCode {
+    signing_key: SigningKey,
+    shared_key: Vec<u8>,
+    transmitted_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterfaceAccessCodeError {
+    EmptySharedKey,
+    InvalidTransmittedBytes { bytes: usize, max: usize },
+}
+
+impl InterfaceAccessCode {
+    pub fn new(
+        signing_secret: [u8; 32],
+        shared_key: Vec<u8>,
+        transmitted_bytes: usize,
+    ) -> Result<Self, InterfaceAccessCodeError> {
+        if shared_key.is_empty() {
+            return Err(InterfaceAccessCodeError::EmptySharedKey);
+        }
+        if !(1..=64).contains(&transmitted_bytes) {
+            return Err(InterfaceAccessCodeError::InvalidTransmittedBytes {
+                bytes: transmitted_bytes,
+                max: 64,
+            });
+        }
+        Ok(Self {
+            signing_key: SigningKey::from_bytes(&signing_secret),
+            shared_key,
+            transmitted_bytes,
+        })
+    }
+}
+
 pub trait Transport: Send {
     fn send(&mut self, data: &[u8]);
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>>;
-    fn bandwidth_available(&self) -> bool;
+    fn send_ready(&self) -> bool;
     fn is_connected(&self) -> bool {
         true
     }
@@ -21,8 +56,8 @@ impl Transport for Box<dyn Transport> {
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
         (**self).poll_recv(cx)
     }
-    fn bandwidth_available(&self) -> bool {
-        (**self).bandwidth_available()
+    fn send_ready(&self) -> bool {
+        (**self).send_ready()
     }
     fn is_connected(&self) -> bool {
         (**self).is_connected()
@@ -74,20 +109,15 @@ impl<T: Transport> Interface<T> {
         }
     }
 
-    pub fn with_access_codes(
-        mut self,
-        signing_key: [u8; 32],
-        shared_key: Vec<u8>,
-        size: usize,
-    ) -> Self {
-        self.ifac_identity = Some(SigningKey::from_bytes(&signing_key));
-        self.ifac_key = Some(shared_key);
-        self.ifac_size = size;
+    pub fn with_interface_access_code(mut self, access_code: InterfaceAccessCode) -> Self {
+        self.ifac_identity = Some(access_code.signing_key);
+        self.ifac_key = Some(access_code.shared_key);
+        self.ifac_size = access_code.transmitted_bytes;
         self
     }
 
-    fn bandwidth_available(&self) -> bool {
-        self.transport.bandwidth_available()
+    fn send_ready(&self) -> bool {
+        self.transport.send_ready()
     }
 
     pub(crate) fn is_connected(&self) -> bool {
@@ -223,7 +253,7 @@ impl<T: Transport> Interface<T> {
     }
 
     pub(crate) fn poll(&mut self) {
-        while self.bandwidth_available() {
+        while self.send_ready() {
             if let Some(queued) = self.queue.pop() {
                 log::trace!("[SEND] {}", queued.packet.log_format());
                 let raw = queued.packet.to_bytes();
@@ -269,7 +299,7 @@ mod tests {
             Poll::Pending
         }
 
-        fn bandwidth_available(&self) -> bool {
+        fn send_ready(&self) -> bool {
             self.bandwidth
         }
     }
@@ -291,8 +321,24 @@ mod tests {
         let iface_with = Interface::new(t_with);
         let iface_without = Interface::new(t_without);
 
-        assert!(iface_with.bandwidth_available());
-        assert!(!iface_without.bandwidth_available());
+        assert!(iface_with.send_ready());
+        assert!(!iface_without.send_ready());
+    }
+
+    #[test]
+    fn access_code_rejects_invalid_inputs() {
+        assert!(matches!(
+            InterfaceAccessCode::new([0; 32], Vec::new(), 8),
+            Err(InterfaceAccessCodeError::EmptySharedKey)
+        ));
+        assert!(matches!(
+            InterfaceAccessCode::new([0; 32], vec![1], 0),
+            Err(InterfaceAccessCodeError::InvalidTransmittedBytes { bytes: 0, max: 64 })
+        ));
+        assert!(matches!(
+            InterfaceAccessCode::new([0; 32], vec![1], 65),
+            Err(InterfaceAccessCodeError::InvalidTransmittedBytes { bytes: 65, max: 64 })
+        ));
     }
 
     #[test]
@@ -356,7 +402,9 @@ mod tests {
         let ifac_key = vec![0xAB; 32];
 
         let (transport, sent) = MockTransport::new(true);
-        let iface = Interface::new(transport).with_access_codes(ifac_identity, ifac_key, 8);
+        let iface = Interface::new(transport).with_interface_access_code(
+            InterfaceAccessCode::new(ifac_identity, ifac_key, 8).unwrap(),
+        );
         (iface, sent)
     }
 
@@ -390,7 +438,9 @@ mod tests {
         rng.fill_bytes(&mut ifac_identity_b);
         let ifac_key_b = vec![0xCD; 32]; // different key
         let (transport_b, _) = MockTransport::new(true);
-        let iface_b = Interface::new(transport_b).with_access_codes(ifac_identity_b, ifac_key_b, 8);
+        let iface_b = Interface::new(transport_b).with_interface_access_code(
+            InterfaceAccessCode::new(ifac_identity_b, ifac_key_b, 8).unwrap(),
+        );
 
         let packet = make_packet([1u8; 16], 5);
         let raw = packet.to_bytes();

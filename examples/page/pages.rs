@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::PageState;
-use rinse::Address;
+use rinse::IdentityAddress;
 
 const INDEX_TEMPLATE: &str = include_str!("templates/index.mu");
 const GUESTBOOK_TEMPLATE: &str = include_str!("templates/guestbook.mu");
@@ -21,7 +21,7 @@ pub fn index(
     state: &Arc<Mutex<PageState>>,
     name: &str,
     form_data: &HashMap<String, String>,
-    remote_identity: Option<Address>,
+    remote_identity: Option<IdentityAddress>,
 ) -> String {
     let mut state = state.lock().unwrap();
 
@@ -44,7 +44,7 @@ pub fn index(
 pub fn guestbook(
     state: &Arc<Mutex<PageState>>,
     form_data: &HashMap<String, String>,
-    remote_identity: Option<Address>,
+    remote_identity: Option<IdentityAddress>,
 ) -> String {
     let mut state = state.lock().unwrap();
 

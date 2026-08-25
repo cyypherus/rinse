@@ -1,7 +1,7 @@
 use std::time::Instant;
 
-use crate::aspect::AspectHash;
-use crate::packet::Address;
+use crate::aspect::ServiceNameHash;
+use crate::packet::DestinationAddress;
 use crate::request::RequestId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -10,9 +10,9 @@ pub struct ServiceId(pub(crate) usize);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestError {
     Timeout,
-    LinkFailed,
-    LinkClosed,
-    TransferFailed,
+    LinkEstablishmentFailed,
+    RuntimeStopped,
+    ServiceNotFound,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,7 +22,7 @@ pub enum RespondError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LinkError {
+pub enum EstablishLinkError {
     DestinationUnreachable,
     Timeout,
 }
@@ -35,7 +35,7 @@ pub enum LinkRttError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExportRatchetsError {
+pub enum RatchetSnapshotError {
     ServiceNotFound,
     RuntimeStopped,
 }
@@ -54,13 +54,27 @@ pub enum AppDecryptError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiveError {
+    ServiceNotFound,
+    RuntimeStopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceRegistrationError {
+    RuntimeStarted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceError {
     LinkClosed,
     InvalidLink,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PathNotFound;
+pub enum RouteDiscoveryError {
+    NotFound,
+    RuntimeStopped,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendError {
@@ -68,11 +82,19 @@ pub enum SendError {
     DestinationUnknown,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendUnreliableError {
+    LinkNotFound,
+    LinkNotActive,
+    PayloadTooLarge { size: usize, max: usize },
+    RuntimeStopped,
+}
+
 pub struct IncomingRequest {
     pub request_id: RequestId,
     pub path: String,
     pub data: Vec<u8>,
-    pub remote_identity: Option<Address>,
+    pub authenticated_remote_identity: Option<crate::IdentityAddress>,
 }
 
 pub struct Response {
@@ -80,7 +102,7 @@ pub struct Response {
     pub metadata: Option<Vec<u8>>,
 }
 
-pub struct Progress {
+pub struct ResponseTransferProgress {
     pub request_id: RequestId,
     pub received_parts: usize,
     pub total_parts: usize,
@@ -90,10 +112,10 @@ pub struct Progress {
 
 #[derive(Clone)]
 pub struct Destination {
-    pub address: Address,
+    pub address: DestinationAddress,
     pub app_data: Option<Vec<u8>>,
     pub hops: u8,
-    pub aspect: AspectHash,
+    pub service_name_hash: ServiceNameHash,
     pub last_seen: Instant,
 }
 
@@ -103,12 +125,12 @@ pub(crate) enum ServiceEvent {
         request_id: RequestId,
         path: String,
         data: Vec<u8>,
-        remote_identity: Option<Address>,
+        remote_identity: Option<DestinationAddress>,
     },
     RequestResult {
         service: ServiceId,
         request_id: RequestId,
-        result: Result<(Address, Vec<u8>, Option<Vec<u8>>), RequestError>,
+        result: Result<(DestinationAddress, Vec<u8>, Option<Vec<u8>>), RequestError>,
     },
     RespondResult {
         service: ServiceId,
@@ -130,12 +152,12 @@ pub(crate) enum ServiceEvent {
     Channel {
         service: ServiceId,
         link: crate::LinkHandle,
-        message: crate::ChannelMessage,
+        message: crate::LinkChannelMessage,
     },
     Buffer {
         service: ServiceId,
         link: crate::LinkHandle,
-        chunk: crate::BufferChunk,
+        chunk: crate::BufferStreamChunk,
     },
     Resource {
         service: ServiceId,
@@ -144,7 +166,7 @@ pub(crate) enum ServiceEvent {
     },
     DestinationsChanged,
     PathRequestResult {
-        destination: Address,
+        destination: DestinationAddress,
         found: bool,
     },
 }

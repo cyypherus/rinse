@@ -6,7 +6,7 @@ use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 use crate::crypto::{LinkEncryption, LinkKeys, sha256, sign, verify};
 use crate::handle::ServiceId;
-use crate::packet::Address;
+use crate::packet::DestinationAddress;
 
 pub type LinkId = [u8; 16];
 
@@ -131,7 +131,7 @@ pub(crate) struct LinkIdentify {
 }
 
 impl LinkIdentify {
-    pub fn create(link_id: &LinkId, identity: &crate::Identity) -> Self {
+    pub fn create(link_id: &LinkId, identity: &crate::PrivateIdentity) -> Self {
         let public_keys = identity.public_key();
         let mut sign_data = Vec::with_capacity(80);
         sign_data.extend_from_slice(link_id);
@@ -208,7 +208,7 @@ pub(crate) struct PendingLink {
     pub initiator_encryption_secret: StaticSecret,
     pub initiator_signing_key: SigningKey,
     pub responder_signing_key: VerifyingKey,
-    pub destination: Address,
+    pub destination: DestinationAddress,
     pub local_service: Option<ServiceId>,
     pub request_time: Instant,
 }
@@ -222,7 +222,7 @@ pub(crate) enum LinkState {
 }
 
 pub(crate) struct EstablishedLink {
-    pub destination: Address,
+    pub destination: DestinationAddress,
     pub local_service: Option<ServiceId>,
     pub is_initiator: bool,
     pub state: LinkState,
@@ -231,7 +231,7 @@ pub(crate) struct EstablishedLink {
     pub last_outbound: Instant,
     pub last_keepalive_sent: Option<Instant>,
     pub rtt_ms: Option<u64>,
-    pub remote_identity: Option<Address>,
+    pub remote_identity: Option<DestinationAddress>,
     pub receiving_interface: usize,
     pub signing_key: SigningKey,
     pub peer_signing_key: VerifyingKey,
@@ -286,7 +286,7 @@ impl EstablishedLink {
         link_id: LinkId,
         responder_secret: &StaticSecret,
         initiator_public: &X25519Public,
-        destination: Address,
+        destination: DestinationAddress,
         local_service: ServiceId,
         responder_signing_key: SigningKey,
         initiator_signing_key: VerifyingKey,
@@ -440,7 +440,7 @@ mod tests {
         let responder_keypair = EphemeralKeyPair::generate(&mut rng);
         let initiator_signing_key = SigningKey::generate(&mut rng);
         let responder_signing_key = SigningKey::generate(&mut rng);
-        let dest: Address = [0xAB; 16];
+        let dest: DestinationAddress = [0xAB; 16];
         let link_id: LinkId = [0xCD; 16];
         let now = Instant::now();
 
@@ -490,7 +490,7 @@ mod tests {
 
         let initiator_enc = EphemeralKeyPair::generate(&mut rng);
         let initiator_sig = SigningKey::generate(&mut rng);
-        let dest: Address = [0xAB; 16];
+        let dest: DestinationAddress = [0xAB; 16];
 
         let request = LinkRequest::new(
             initiator_enc.public,
@@ -572,7 +572,7 @@ mod tests {
         let responder_keypair = EphemeralKeyPair::generate(&mut rng);
         let initiator_signing_key = SigningKey::generate(&mut rng);
         let responder_signing_key = SigningKey::generate(&mut rng);
-        let dest: Address = [0xAB; 16];
+        let dest: DestinationAddress = [0xAB; 16];
         let link_id: LinkId = [0xCD; 16];
 
         let request_time = Instant::now();
@@ -603,7 +603,7 @@ mod tests {
         let responder_keypair = EphemeralKeyPair::generate(&mut rng);
         let initiator_signing_key = SigningKey::generate(&mut rng);
         let responder_signing_key = SigningKey::generate(&mut rng);
-        let dest: Address = [0xAB; 16];
+        let dest: DestinationAddress = [0xAB; 16];
         let link_id: LinkId = [0xCD; 16];
         let now = Instant::now();
 

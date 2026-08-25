@@ -4,7 +4,7 @@ use crate::link::LinkId;
 pub struct LinkHandle(pub(crate) LinkId);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ResourceHandle(pub(crate) [u8; 32]);
+pub(crate) struct ResourceHandle(pub(crate) [u8; 32]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkStatus {

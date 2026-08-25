@@ -12,21 +12,21 @@ const STREAM_MDU: usize = CHANNEL_MDU - 2;
 const MAX_CHUNK_LEN: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BufferChunk {
+pub struct BufferStreamChunk {
     pub stream_id: u16,
     pub data: Vec<u8>,
-    pub eof: bool,
+    pub end_of_stream: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BufferError {
+pub enum BufferStreamError {
     InvalidStreamId,
-    DecompressionFailed,
-    Channel(crate::ChannelError),
+    CompressionFailed,
+    Channel(crate::LinkChannelError),
 }
 
-impl From<crate::ChannelError> for BufferError {
-    fn from(error: crate::ChannelError) -> Self {
+impl From<crate::LinkChannelError> for BufferStreamError {
+    fn from(error: crate::LinkChannelError) -> Self {
         Self::Channel(error)
     }
 }
@@ -34,10 +34,10 @@ impl From<crate::ChannelError> for BufferError {
 pub(crate) fn encode(
     stream_id: u16,
     data: &[u8],
-    eof: bool,
-) -> Result<(Vec<u8>, usize), BufferError> {
+    end_of_stream: bool,
+) -> Result<(Vec<u8>, usize), BufferStreamError> {
     if stream_id > STREAM_ID_MAX {
-        return Err(BufferError::InvalidStreamId);
+        return Err(BufferStreamError::InvalidStreamId);
     }
     let source = &data[..data.len().min(MAX_CHUNK_LEN)];
     let mut selected = None;
@@ -47,10 +47,10 @@ pub(crate) fn encode(
             let mut encoder = BzEncoder::new(Vec::new(), Compression::best());
             encoder
                 .write_all(&source[..length])
-                .map_err(|_| BufferError::DecompressionFailed)?;
+                .map_err(|_| BufferStreamError::CompressionFailed)?;
             let compressed = encoder
                 .finish()
-                .map_err(|_| BufferError::DecompressionFailed)?;
+                .map_err(|_| BufferStreamError::CompressionFailed)?;
             if compressed.len() < STREAM_MDU && compressed.len() < length {
                 selected = Some((compressed, length));
                 break;
@@ -64,7 +64,7 @@ pub(crate) fn encode(
         (source[..length].to_vec(), length, false)
     };
     let mut header = stream_id;
-    if eof {
+    if end_of_stream {
         header |= 0x8000;
     }
     if compressed {
@@ -76,7 +76,7 @@ pub(crate) fn encode(
     Ok((raw, processed))
 }
 
-pub(crate) fn decode(raw: &[u8]) -> Option<BufferChunk> {
+pub(crate) fn decode(raw: &[u8]) -> Option<BufferStreamChunk> {
     if raw.len() < 2 {
         return None;
     }
@@ -97,10 +97,10 @@ pub(crate) fn decode(raw: &[u8]) -> Option<BufferChunk> {
     } else {
         raw[2..].to_vec()
     };
-    Some(BufferChunk {
+    Some(BufferStreamChunk {
         stream_id: header & STREAM_ID_MAX,
         data,
-        eof: header & 0x8000 != 0,
+        end_of_stream: header & 0x8000 != 0,
     })
 }
 
@@ -115,10 +115,10 @@ mod tests {
         assert_eq!(raw, [0x80, 0x07, b'a', b'b', b'c']);
         assert_eq!(
             decode(&raw).unwrap(),
-            BufferChunk {
+            BufferStreamChunk {
                 stream_id: 7,
                 data: b"abc".to_vec(),
-                eof: true,
+                end_of_stream: true,
             }
         );
     }
@@ -136,7 +136,7 @@ mod tests {
     fn rejects_invalid_streams_and_messages() {
         assert_eq!(
             encode(STREAM_ID_MAX + 1, b"", false),
-            Err(BufferError::InvalidStreamId)
+            Err(BufferStreamError::InvalidStreamId)
         );
         assert_eq!(decode(&[0]), None);
         assert_eq!(decode(&[0x40, 0, 1, 2, 3]), None);

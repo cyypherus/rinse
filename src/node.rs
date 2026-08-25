@@ -9,19 +9,19 @@ use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 use crate::announce::{AnnounceBuilder, AnnounceData};
-use crate::aspect::AspectHash;
-use crate::channel::{ChannelError, ChannelMessage, ChannelState};
+use crate::aspect::ServiceNameHash;
+use crate::channel::{ChannelState, LinkChannelError, LinkChannelMessage};
 use crate::crypto::{EphemeralKeyPair, sha256};
 use crate::handle::{
-    AppDecryptError, AppEncryptError, Destination, ExportRatchetsError, LinkRttError, RequestError,
-    RespondError, ServiceEvent, ServiceId,
+    AppDecryptError, AppEncryptError, Destination, LinkRttError, RatchetSnapshotError,
+    RequestError, RespondError, ServiceEvent, ServiceId,
 };
-use crate::stats::{Stats, StatsSnapshot};
+use crate::stats::{LifetimeStats, Stats};
 
 const LINK_MDU: usize = 431;
 const SINGLE_MDU: usize = 383;
 use crate::link::{EstablishedLink, LinkId, LinkProof, LinkRequest, LinkState, PendingLink};
-use crate::packet::{Address, LinkContext, Packet, SingleDestination};
+use crate::packet::{DestinationAddress, LinkContext, Packet, SingleDestination};
 use crate::packet_hashlist::PacketHashlist;
 use crate::request::{PathHash, Request, RequestId, Response, WireRequestId};
 use crate::{Interface, Transport};
@@ -50,7 +50,7 @@ enum Notification {
     RequestResult {
         service: ServiceId,
         request_id: RequestId,
-        result: Result<(Address, Vec<u8>, Option<Vec<u8>>), RequestError>,
+        result: Result<(DestinationAddress, Vec<u8>, Option<Vec<u8>>), RequestError>,
     },
     RespondResult {
         service: ServiceId,
@@ -64,22 +64,22 @@ enum Notification {
     Channel {
         service: ServiceId,
         link: crate::LinkHandle,
-        message: ChannelMessage,
+        message: LinkChannelMessage,
     },
     Buffer {
         service: ServiceId,
         link: crate::LinkHandle,
-        chunk: crate::BufferChunk,
+        chunk: crate::BufferStreamChunk,
     },
     DestinationsChanged,
     PathRequestResult {
-        destination: Address,
+        destination: DestinationAddress,
         found: bool,
     },
 }
 
 struct ServiceEntry {
-    address: Address,
+    address: DestinationAddress,
     name_hash: [u8; 10],
     encryption_secret: StaticSecret,
     encryption_public: X25519Public,
@@ -93,13 +93,13 @@ struct ServiceEntry {
 
 struct Receipt {
     packet_hash: [u8; 32],
-    destination: Address,
+    destination: DestinationAddress,
 }
 
 #[derive(Clone)]
 pub(crate) struct PathEntry {
     timestamp: Instant,
-    next_hop: Address,
+    next_hop: DestinationAddress,
     hops: u8,
     receiving_interface: usize,
     encryption_key: X25519Public,
@@ -113,7 +113,7 @@ pub(crate) struct PathEntry {
 
 #[derive(Debug)]
 struct PendingAnnounce {
-    destination: Address,
+    destination: DestinationAddress,
     source_interface: usize,
     hops: u8,
     has_ratchet: bool,
@@ -146,7 +146,7 @@ struct MultiSegmentTransfer {
 }
 
 struct OutboundMultiSegment {
-    destination: Address,
+    destination: DestinationAddress,
     service_idx: Option<ServiceId>,
     local_request_id: Option<RequestId>,
     full_data: Vec<u8>,
@@ -170,7 +170,7 @@ impl PreparedInbound {
         let mut hasher = Sha256::new();
         hasher.update([raw.first().copied().unwrap_or(0) & 0b0000_1111]);
         let skip = if raw.first().copied().unwrap_or(0) & 0b0100_0000 != 0 {
-            2 + std::mem::size_of::<Address>()
+            2 + std::mem::size_of::<DestinationAddress>()
         } else {
             2
         };
@@ -203,11 +203,11 @@ pub(crate) struct Protocol<T, R = ThreadRng> {
     retries: u8,
     retry_delay_ms: u64,
     rng: R,
-    transport_id: Address,
-    pub(crate) path_table: HashMap<Address, PathEntry>,
+    transport_id: DestinationAddress,
+    pub(crate) path_table: HashMap<DestinationAddress, PathEntry>,
     pending_announces: Vec<PendingAnnounce>,
     seen_packets: PacketHashlist,
-    reverse_table: HashMap<Address, ReverseTableEntry>,
+    reverse_table: HashMap<DestinationAddress, ReverseTableEntry>,
     receipts: Vec<Receipt>,
     services: Vec<ServiceEntry>,
     pub(crate) interfaces: Vec<Interface<T>>,
@@ -218,7 +218,7 @@ pub(crate) struct Protocol<T, R = ThreadRng> {
         [u8; 32],
         (
             LinkId,
-            Address,
+            DestinationAddress,
             Option<ServiceId>,
             Option<RequestId>,
             crate::resource::OutboundResource,
@@ -229,10 +229,11 @@ pub(crate) struct Protocol<T, R = ThreadRng> {
     multi_segment_transfers: HashMap<[u8; 32], MultiSegmentTransfer>,
     outbound_multi_segments: HashMap<[u8; 32], OutboundMultiSegment>,
     inbound_request_links: HashMap<RequestId, (WireRequestId, LinkId, ServiceId)>,
-    pub(crate) destination_links: HashMap<Address, LinkId>,
-    pending_outbound_requests: HashMap<Address, Vec<(ServiceId, RequestId, String, Vec<u8>)>>,
-    pending_path_requests: HashMap<Address, Instant>,
-    discovery_path_requests: HashMap<Address, usize>,
+    pub(crate) destination_links: HashMap<DestinationAddress, LinkId>,
+    pending_outbound_requests:
+        HashMap<DestinationAddress, Vec<(ServiceId, RequestId, String, Vec<u8>)>>,
+    pending_path_requests: HashMap<DestinationAddress, Instant>,
+    discovery_path_requests: HashMap<DestinationAddress, usize>,
     stats: Stats,
     pending_events: Vec<ServiceEvent>,
     pending_resource_requests: Vec<(LinkId, [u8; 32])>,
@@ -281,7 +282,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         }
     }
 
-    pub fn stats(&self) -> StatsSnapshot {
+    pub fn stats(&self) -> LifetimeStats {
         self.stats.snapshot()
     }
 
@@ -298,17 +299,17 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                 address: *addr,
                 app_data: entry.app_data.clone(),
                 hops: entry.hops,
-                aspect: AspectHash::from_bytes(entry.name_hash),
+                service_name_hash: ServiceNameHash::from_bytes(entry.name_hash),
                 last_seen: entry.timestamp,
             })
             .collect()
     }
 
-    pub fn service_address(&self, service: ServiceId) -> Option<Address> {
+    pub fn service_address(&self, service: ServiceId) -> Option<DestinationAddress> {
         self.services.get(service.0).map(|s| s.address)
     }
 
-    fn send_single_data(&mut self, destination: Address, data: &[u8]) {
+    fn send_single_data(&mut self, destination: DestinationAddress, data: &[u8]) {
         use crate::crypto::SingleDestEncryption;
 
         if let Some(entry) = self.path_table.get(&destination) {
@@ -522,7 +523,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
     fn send_request_inner(
         &mut self,
         service: ServiceId,
-        destination: Address,
+        destination: DestinationAddress,
         local_request_id: RequestId,
         path: &str,
         data: Vec<u8>,
@@ -691,7 +692,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         &mut self,
         name: &str,
         paths: &[&str],
-        identity: &crate::identity::Identity,
+        identity: &crate::identity::PrivateIdentity,
     ) -> ServiceId {
         let name_hash: [u8; 10] = sha256(name.as_bytes())[..10].try_into().unwrap();
 
@@ -704,7 +705,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         let mut hash_material = Vec::new();
         hash_material.extend_from_slice(&name_hash);
         hash_material.extend_from_slice(&identity_hash);
-        let address: Address = sha256(&hash_material)[..16].try_into().unwrap();
+        let address: DestinationAddress = sha256(&hash_material)[..16].try_into().unwrap();
 
         log::info!(
             "Added service \"{}\" with address <{}>, identity <{}>",
@@ -741,11 +742,11 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         service_id
     }
 
-    pub fn enable_ratchets(
+    pub fn enable_ratchet_rotation(
         &mut self,
         service: ServiceId,
         interval: std::time::Duration,
-        existing_ratchets: Option<Vec<[u8; 32]>>,
+        restored_ratchet_secrets: Option<Vec<[u8; 32]>>,
         now: Instant,
     ) {
         let Some(entry) = self.services.get_mut(service.0) else {
@@ -754,7 +755,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         entry.ratchet_interval = Some(interval);
         entry.last_ratchet_time = Some(now);
 
-        if let Some(ratchets) = existing_ratchets {
+        if let Some(ratchets) = restored_ratchet_secrets {
             entry.ratchets = ratchets.into_iter().map(StaticSecret::from).collect();
         }
 
@@ -764,14 +765,14 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         }
     }
 
-    pub fn export_ratchets(
+    pub fn ratchet_secret_snapshot(
         &self,
         service: ServiceId,
-    ) -> Result<Vec<[u8; 32]>, ExportRatchetsError> {
+    ) -> Result<Vec<[u8; 32]>, RatchetSnapshotError> {
         let entry = self
             .services
             .get(service.0)
-            .ok_or(ExportRatchetsError::ServiceNotFound)?;
+            .ok_or(RatchetSnapshotError::ServiceNotFound)?;
         Ok(entry.ratchets.iter().map(|r| r.to_bytes()).collect())
     }
 
@@ -840,11 +841,11 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         }
     }
 
-    pub fn has_path(&self, destination: Address) -> bool {
+    pub fn has_path(&self, destination: DestinationAddress) -> bool {
         self.path_table.contains_key(&destination)
     }
 
-    pub fn request_path(&mut self, destination: Address, now: Instant) {
+    pub fn request_path(&mut self, destination: DestinationAddress, now: Instant) {
         log::info!(
             "Sending path request for <{}> on {} interface(s)",
             hex::encode(destination),
@@ -870,7 +871,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
 
     pub fn send_raw(
         &mut self,
-        destination: Address,
+        destination: DestinationAddress,
         data: &[u8],
     ) -> Result<(), crate::handle::SendError> {
         if data.len() > SINGLE_MDU {
@@ -883,27 +884,37 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         Ok(())
     }
 
-    pub fn send_link_data(&mut self, link: crate::LinkHandle, data: &[u8]) {
-        if data.len() <= LINK_MDU {
-            if let Some(established) = self.established_links.get(&link.0)
-                && established.state == LinkState::Active
-            {
-                self.send_link_packet(link.0, LinkContext::None, data);
-            }
-            return;
-        }
-        self.advertise_resource(link, data.to_vec(), None, false);
-    }
-
-    pub fn send_channel(
+    pub(crate) fn send_unreliable(
         &mut self,
         link: crate::LinkHandle,
-        message: ChannelMessage,
-    ) -> Result<(), ChannelError> {
+        data: &[u8],
+    ) -> Result<(), crate::SendUnreliableError> {
+        if data.len() > LINK_MDU {
+            return Err(crate::SendUnreliableError::PayloadTooLarge {
+                size: data.len(),
+                max: LINK_MDU,
+            });
+        }
+        let established = self
+            .established_links
+            .get(&link.0)
+            .ok_or(crate::SendUnreliableError::LinkNotFound)?;
+        if established.state != LinkState::Active {
+            return Err(crate::SendUnreliableError::LinkNotActive);
+        }
+        self.send_link_packet(link.0, LinkContext::None, data);
+        Ok(())
+    }
+
+    pub fn send_link_channel_message(
+        &mut self,
+        link: crate::LinkHandle,
+        message: LinkChannelMessage,
+    ) -> Result<(), LinkChannelError> {
         self.send_channel_data(
             link.0,
-            message.message_type,
-            &message.data,
+            message.message_type(),
+            message.data(),
             false,
             Instant::now(),
         )
@@ -913,7 +924,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         &mut self,
         link: crate::LinkHandle,
         raw: &[u8],
-    ) -> Result<(), ChannelError> {
+    ) -> Result<(), LinkChannelError> {
         self.send_channel_data(
             link.0,
             crate::buffer::STREAM_MESSAGE_TYPE,
@@ -930,13 +941,13 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         data: &[u8],
         system: bool,
         now: Instant,
-    ) -> Result<(), ChannelError> {
-        if self
+    ) -> Result<(), LinkChannelError> {
+        let link = self
             .established_links
             .get(&link_id)
-            .is_none_or(|link| link.state != LinkState::Active)
-        {
-            return Err(ChannelError::InvalidLink);
+            .ok_or(LinkChannelError::LinkNotFound)?;
+        if link.state != LinkState::Active {
+            return Err(LinkChannelError::LinkNotActive);
         }
         let raw = self
             .channels
@@ -959,7 +970,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
     pub fn create_link(
         &mut self,
         service: ServiceId,
-        destination: Address,
+        destination: DestinationAddress,
         now: Instant,
     ) -> Option<crate::LinkHandle> {
         if let Some(&link_id) = self.destination_links.get(&destination) {
@@ -995,15 +1006,17 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         }
     }
 
-    pub fn link_rtt(&self, link: crate::LinkHandle) -> Result<u64, LinkRttError> {
+    pub fn link_rtt(&self, link: crate::LinkHandle) -> Result<Duration, LinkRttError> {
         if self.pending_outbound_links.contains_key(&link.0) {
             return Err(LinkRttError::NotMeasured);
         }
-        self.established_links
+        let milliseconds = self
+            .established_links
             .get(&link.0)
             .ok_or(LinkRttError::LinkNotFound)?
             .rtt_ms
-            .ok_or(LinkRttError::NotMeasured)
+            .ok_or(LinkRttError::NotMeasured)?;
+        Ok(Duration::from_millis(milliseconds))
     }
 
     pub fn close_link(&mut self, link: crate::LinkHandle) {
@@ -1015,7 +1028,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         self.pending_outbound_links.remove(&link.0);
     }
 
-    pub fn self_identify(&mut self, link: crate::LinkHandle, identity: &crate::Identity) {
+    pub fn self_identify(&mut self, link: crate::LinkHandle, identity: &crate::PrivateIdentity) {
         use crate::link::LinkIdentify;
 
         let Some(established) = self.established_links.get(&link.0) else {
@@ -1049,7 +1062,8 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         self.send_link_packet(link.0, LinkContext::LinkIdentify, &identify.to_bytes());
     }
 
-    pub fn link_request(
+    #[cfg(test)]
+    pub(crate) fn link_request(
         &mut self,
         link: crate::LinkHandle,
         path: &str,
@@ -1103,13 +1117,13 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         Some(local_request_id)
     }
 
-    pub fn advertise_resource(
+    pub(crate) fn offer_resource(
         &mut self,
         link: crate::LinkHandle,
         data: Vec<u8>,
         metadata: Option<Vec<u8>>,
         compress: bool,
-    ) -> Option<crate::ResourceHandle> {
+    ) -> Option<crate::link_handle::ResourceHandle> {
         use crate::packet::LinkDataDestination;
 
         let established = self.established_links.get(&link.0)?;
@@ -1154,11 +1168,11 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             iface.send(packet, 0);
         }
 
-        Some(crate::ResourceHandle(hash))
+        Some(crate::link_handle::ResourceHandle(hash))
     }
 
     #[cfg(test)]
-    fn resource_progress(&self, resource: crate::ResourceHandle) -> Option<f32> {
+    fn resource_progress(&self, resource: crate::link_handle::ResourceHandle) -> Option<f32> {
         if let Some((_, _, _, _, outbound)) = self.outbound_resources.get(&resource.0) {
             let total = outbound.transfer_size();
             if total == 0 {
@@ -1177,7 +1191,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         None
     }
 
-    pub fn prove_packet(&mut self, service: ServiceId, packet_data: &[u8]) {
+    pub(crate) fn broadcast_delivery_proof(&mut self, service: ServiceId, packet_data: &[u8]) {
         use crate::packet::ProofDestination;
 
         let Some(service_entry) = self.services.get(service.0) else {
@@ -1214,7 +1228,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
     /// Returns the encrypted blob (ephemeral public key + ciphertext).
     pub fn app_encrypt_for(
         &mut self,
-        destination: Address,
+        destination: DestinationAddress,
         data: &[u8],
     ) -> Result<Vec<u8>, AppEncryptError> {
         use crate::crypto::SingleDestEncryption;
@@ -1272,7 +1286,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
     pub(crate) fn link(
         &mut self,
         service: Option<ServiceId>,
-        destination: Address,
+        destination: DestinationAddress,
         now: Instant,
     ) -> Option<LinkId> {
         // Must have path to this destination
@@ -2180,8 +2194,9 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                                 .receive(&plaintext);
                             if let Some(service) = service {
                                 for message in messages {
-                                    if message.message_type == crate::buffer::STREAM_MESSAGE_TYPE {
-                                        if let Some(chunk) = crate::buffer::decode(&message.data) {
+                                    if message.message_type() == crate::buffer::STREAM_MESSAGE_TYPE
+                                    {
+                                        if let Some(chunk) = crate::buffer::decode(message.data()) {
                                             notifications.push(Notification::Buffer {
                                                 service,
                                                 link: crate::LinkHandle(link_id),
@@ -2620,13 +2635,13 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         link_id: LinkId,
         context: LinkContext,
         plaintext: &[u8],
-    ) -> Result<Packet, ChannelError> {
+    ) -> Result<Packet, LinkChannelError> {
         use crate::packet::LinkDataDestination;
 
         let link = self
             .established_links
             .get(&link_id)
-            .ok_or(ChannelError::InvalidLink)?;
+            .ok_or(LinkChannelError::LinkNotFound)?;
         let data = link.encrypt(&mut self.rng, plaintext);
         Ok(Packet::LinkData {
             hops: 0,
@@ -2931,7 +2946,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         };
 
         // Check for timed out pending links
-        let mut timed_out_pending: Vec<(LinkId, Address)> = Vec::new();
+        let mut timed_out_pending: Vec<(LinkId, DestinationAddress)> = Vec::new();
         for (link_id, pending) in &self.pending_outbound_links {
             let hops = self
                 .path_table
@@ -2961,14 +2976,14 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                     notifications.push(Notification::RequestResult {
                         service,
                         request_id: local_request_id,
-                        result: Err(crate::handle::RequestError::LinkFailed),
+                        result: Err(crate::handle::RequestError::LinkEstablishmentFailed),
                     });
                 }
             }
         }
 
         // Check for timed out path requests
-        let mut timed_out_paths: Vec<Address> = Vec::new();
+        let mut timed_out_paths: Vec<DestinationAddress> = Vec::new();
         for (destination, request_time) in &self.pending_path_requests {
             let elapsed = now.duration_since(*request_time).as_secs();
             if elapsed >= PATH_REQUEST_TIMEOUT_SECS {
@@ -3876,12 +3891,12 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
 
     fn make_announce_packet(
         &self,
-        dest: Address,
+        dest: DestinationAddress,
         hops: u8,
         has_ratchet: bool,
         is_path_response: bool,
         data: Vec<u8>,
-        transport_id: Option<Address>,
+        transport_id: Option<DestinationAddress>,
     ) -> Packet {
         use crate::packet::AnnounceDestination;
         let destination = match transport_id {
@@ -3902,8 +3917,8 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
 
     fn make_link_request_packet(
         &self,
-        dest: Address,
-        transport_id: Option<Address>,
+        dest: DestinationAddress,
+        transport_id: Option<DestinationAddress>,
         data: Vec<u8>,
     ) -> Packet {
         use crate::packet::LinkRequestDestination;
@@ -3962,7 +3977,7 @@ mod tests {
                 .pop_front()
                 .map_or(Poll::Pending, |packet| Poll::Ready(Some(packet)))
         }
-        fn bandwidth_available(&self) -> bool {
+        fn send_ready(&self) -> bool {
             true
         }
     }
@@ -3983,9 +3998,9 @@ mod tests {
         Node::with_rng(StdRng::from_entropy(), transport)
     }
 
-    fn id(seed: u64) -> crate::identity::Identity {
+    fn id(seed: u64) -> crate::identity::PrivateIdentity {
         let mut rng = StdRng::seed_from_u64(seed);
-        crate::identity::Identity::generate(&mut rng)
+        crate::identity::PrivateIdentity::generate(&mut rng)
     }
 
     #[test]
@@ -4105,12 +4120,9 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
 
-        a.send_channel(
+        a.send_link_channel_message(
             crate::LinkHandle(link_id),
-            ChannelMessage {
-                message_type: 0x0101,
-                data: b"hello".to_vec(),
-            },
+            LinkChannelMessage::new(0x0101, b"hello".to_vec()).unwrap(),
         )
         .unwrap();
         a.poll(now);
@@ -4122,8 +4134,8 @@ mod tests {
             ServiceEvent::Channel { service, link, message }
                 if *service == svc_b
                     && *link == crate::LinkHandle(link_id)
-                    && message.message_type == 0x0101
-                    && message.data == b"hello"
+                    && message.message_type() == 0x0101
+                    && message.data() == b"hello"
         )));
 
         transfer(&mut b, 0, &mut a, 0);
@@ -4170,7 +4182,7 @@ mod tests {
                     && *link == crate::LinkHandle(link_id)
                     && chunk.stream_id == 3
                     && chunk.data == data
-                    && chunk.eof
+                    && chunk.end_of_stream
         )));
     }
 
@@ -5176,7 +5188,9 @@ mod tests {
     }
 
     fn make_ifac_interface(ifac_identity: [u8; 32], ifac_key: Vec<u8>) -> Interface<MockTransport> {
-        Interface::new(MockTransport::new()).with_access_codes(ifac_identity, ifac_key, 8)
+        Interface::new(MockTransport::new()).with_interface_access_code(
+            crate::InterfaceAccessCode::new(ifac_identity, ifac_key, 8).unwrap(),
+        )
     }
 
     #[test]
@@ -5264,8 +5278,9 @@ mod tests {
         let mut ifac_identity_a = [0u8; 32];
         rng_a.fill_bytes(&mut ifac_identity_a);
         let ifac_key_a = vec![0xAA; 32];
-        let iface_a =
-            Interface::new(MockTransport::new()).with_access_codes(ifac_identity_a, ifac_key_a, 8);
+        let iface_a = Interface::new(MockTransport::new()).with_interface_access_code(
+            crate::InterfaceAccessCode::new(ifac_identity_a, ifac_key_a, 8).unwrap(),
+        );
         a.add_interface(iface_a);
 
         // B uses different IFAC key
@@ -5273,8 +5288,9 @@ mod tests {
         let mut ifac_identity_b = [0u8; 32];
         rng_b.fill_bytes(&mut ifac_identity_b);
         let ifac_key_b = vec![0xBB; 32];
-        let iface_b =
-            Interface::new(MockTransport::new()).with_access_codes(ifac_identity_b, ifac_key_b, 8);
+        let iface_b = Interface::new(MockTransport::new()).with_interface_access_code(
+            crate::InterfaceAccessCode::new(ifac_identity_b, ifac_key_b, 8).unwrap(),
+        );
         b.add_interface(iface_b);
 
         let svc_b = b.add_service("server", &[], &id(1));
@@ -6407,7 +6423,7 @@ mod tests {
         for i in 1..progress_events.len() {
             assert!(
                 progress_events[i].0 >= progress_events[i - 1].0,
-                "Progress should be monotonic"
+                "ResponseTransferProgress should be monotonic"
             );
         }
 
@@ -6779,7 +6795,7 @@ mod tests {
         let responder_keypair = EphemeralKeyPair::generate(&mut rng);
         let responder_signing_key = SigningKey::generate(&mut rng);
         let initiator_signing_key = SigningKey::generate(&mut rng);
-        let dest: Address = [0xAB; 16];
+        let dest: DestinationAddress = [0xAB; 16];
         let link_id: LinkId = [0xCD; 16];
         let now = Instant::now();
 
@@ -7084,14 +7100,14 @@ mod tests {
     }
 
     #[test]
-    fn prove_packet_sends_proof() {
+    fn broadcast_delivery_proof_sends_proof() {
         let mut a = test_node(true);
         a.add_interface(test_interface());
         let svc_a = a.add_service("server", &[], &id(0));
         let _t = Instant::now();
 
         let packet_data = b"test packet data";
-        a.prove_packet(svc_a, packet_data);
+        a.broadcast_delivery_proof(svc_a, packet_data);
     }
 
     #[test]
@@ -7132,7 +7148,7 @@ mod tests {
         let t = Instant::now();
 
         // Enable ratchets and announce
-        a.enable_ratchets(svc_a, std::time::Duration::from_secs(3600), None, t);
+        a.enable_ratchet_rotation(svc_a, std::time::Duration::from_secs(3600), None, t);
         a.announce(svc_a);
         a.poll(t);
 
@@ -7169,17 +7185,17 @@ mod tests {
         let t = Instant::now();
 
         // Enable ratchets (generates first one)
-        a.enable_ratchets(svc_a, std::time::Duration::from_secs(3600), None, t);
+        a.enable_ratchet_rotation(svc_a, std::time::Duration::from_secs(3600), None, t);
 
         // Export ratchets
-        let exported = a.export_ratchets(svc_a).unwrap();
+        let exported = a.ratchet_secret_snapshot(svc_a).unwrap();
         assert_eq!(exported.len(), 1);
 
         // Simulate restart - create new node and load ratchets
         let mut a2 = test_node(true);
         a2.add_interface(test_interface());
         let svc_a2 = a2.add_service("server", &[], &id(0));
-        a2.enable_ratchets(
+        a2.enable_ratchet_rotation(
             svc_a2,
             std::time::Duration::from_secs(3600),
             Some(exported.clone()),
@@ -7187,7 +7203,7 @@ mod tests {
         );
 
         // Verify loaded ratchets match
-        let reloaded = a2.export_ratchets(svc_a2).unwrap();
+        let reloaded = a2.ratchet_secret_snapshot(svc_a2).unwrap();
         assert_eq!(exported, reloaded);
     }
 
@@ -7665,7 +7681,7 @@ mod tests {
     // Resource Advertisement API
 
     #[test]
-    fn advertise_resource_sends_advertisement() {
+    fn offer_resource_sends_advertisement() {
         let mut a = test_node(true);
         let mut b = test_node(true);
         a.add_interface(test_interface());
@@ -7689,7 +7705,7 @@ mod tests {
         a.poll(t);
 
         let outbox_before = a.interfaces[0].transport.outbox.len();
-        let resource = a.advertise_resource(handle, b"resource data".to_vec(), None, false);
+        let resource = a.offer_resource(handle, b"resource data".to_vec(), None, false);
         assert!(resource.is_some());
         a.poll(t);
 
@@ -7698,7 +7714,7 @@ mod tests {
     }
 
     #[test]
-    fn advertise_resource_with_metadata() {
+    fn offer_resource_with_metadata() {
         let mut a = test_node(true);
         let mut b = test_node(true);
         a.add_interface(test_interface());
@@ -7722,12 +7738,12 @@ mod tests {
         a.poll(t);
 
         let metadata = b"file:test.txt".to_vec();
-        let resource = a.advertise_resource(handle, b"data".to_vec(), Some(metadata), false);
+        let resource = a.offer_resource(handle, b"data".to_vec(), Some(metadata), false);
         assert!(resource.is_some());
     }
 
     #[test]
-    fn advertise_resource_with_compression() {
+    fn offer_resource_with_compression() {
         let mut a = test_node(true);
         let mut b = test_node(true);
         a.add_interface(test_interface());
@@ -7750,7 +7766,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(t);
 
-        let resource = a.advertise_resource(handle, b"compressible data".to_vec(), None, true);
+        let resource = a.offer_resource(handle, b"compressible data".to_vec(), None, true);
         assert!(resource.is_some());
     }
 
@@ -7781,7 +7797,7 @@ mod tests {
         a.poll(t);
 
         let resource = a
-            .advertise_resource(handle, b"test data".to_vec(), None, false)
+            .offer_resource(handle, b"test data".to_vec(), None, false)
             .unwrap();
 
         let progress = a.resource_progress(resource);
@@ -7812,14 +7828,14 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(t);
 
-        a.advertise_resource(handle, b"test data".to_vec(), None, false);
+        a.offer_resource(handle, b"test data".to_vec(), None, false);
         a.poll(t);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(t);
 
         let inbound_resources: Vec<_> = b.inbound_resources.keys().cloned().collect();
         if let Some(hash) = inbound_resources.first() {
-            let progress = b.resource_progress(crate::ResourceHandle(*hash));
+            let progress = b.resource_progress(crate::link_handle::ResourceHandle(*hash));
             assert!(progress.is_some());
         }
     }
@@ -7828,7 +7844,7 @@ mod tests {
     fn resource_progress_unknown_resource() {
         let a = test_node(true);
         let fake_hash = [0u8; 32];
-        let progress = a.resource_progress(crate::ResourceHandle(fake_hash));
+        let progress = a.resource_progress(crate::link_handle::ResourceHandle(fake_hash));
         assert!(progress.is_none());
     }
 
@@ -7840,7 +7856,7 @@ mod tests {
         a.add_interface(test_interface());
 
         let _svc_a = a.add_service("client", &[], &id(0));
-        let unknown_dest: Address = [0xAB; 16];
+        let unknown_dest: DestinationAddress = [0xAB; 16];
         let t = Instant::now();
 
         assert!(!a.path_table.contains_key(&unknown_dest));
@@ -8095,7 +8111,7 @@ mod tests {
         a.poll(t);
 
         let large_data = vec![0u8; 5000];
-        let resource = a.advertise_resource(handle, large_data, None, false);
+        let resource = a.offer_resource(handle, large_data, None, false);
         assert!(resource.is_some());
 
         assert!(a.outbound_resources.contains_key(&resource.unwrap().0));
@@ -8129,7 +8145,7 @@ mod tests {
         a.poll(t);
 
         let data = vec![0u8; 2000];
-        a.advertise_resource(handle, data, None, false);
+        a.offer_resource(handle, data, None, false);
         a.poll(t);
         transfer(&mut a, 0, &mut b, 0);
         b.poll(t);
@@ -8166,7 +8182,7 @@ mod tests {
         transfer(&mut b, 0, &mut a, 0);
         a.poll(t);
 
-        let resource = a.advertise_resource(handle, b"small".to_vec(), None, false);
+        let resource = a.offer_resource(handle, b"small".to_vec(), None, false);
         assert!(resource.is_some());
 
         for _ in 0..10 {
@@ -8264,7 +8280,7 @@ mod tests {
         a.poll(t);
 
         let resource = a
-            .advertise_resource(handle, b"test".to_vec(), None, false)
+            .offer_resource(handle, b"test".to_vec(), None, false)
             .unwrap();
 
         for _ in 0..20 {
@@ -8372,7 +8388,7 @@ mod tests {
         a.add_interface(test_interface());
 
         let _svc_a = a.add_service("client", &[], &id(0));
-        let unknown_dest: Address = [0xDE; 16];
+        let unknown_dest: DestinationAddress = [0xDE; 16];
         let t = Instant::now();
 
         a.request_path(unknown_dest, t);
@@ -8454,7 +8470,7 @@ mod tests {
         a.poll(t);
 
         let large_data = vec![0xAB; 10000];
-        let resource = a.advertise_resource(handle, large_data.clone(), None, false);
+        let resource = a.offer_resource(handle, large_data.clone(), None, false);
         assert!(resource.is_some());
 
         for _ in 0..50 {
@@ -8661,7 +8677,7 @@ mod tests {
         assert_eq!(a.link_status(handle), crate::LinkStatus::Active);
 
         let data = vec![0xEF; 5000];
-        let resource = a.advertise_resource(handle, data, None, false);
+        let resource = a.offer_resource(handle, data, None, false);
         assert!(resource.is_some());
 
         for _ in 0..50 {

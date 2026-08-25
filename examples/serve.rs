@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use rinse::config::{Config, InterfaceConfig, load_or_generate_identity};
+use rinse::config::{Config, InterfaceConfig, load_or_create_persistent_identity};
 use rinse::{IncomingRequest, Interface, Node, ServiceId, TcpTransport};
 use tokio::net::TcpListener;
 
@@ -34,7 +34,7 @@ async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let config = Config::load().expect("failed to load config");
-    let identity = load_or_generate_identity().expect("failed to load identity");
+    let identity = load_or_create_persistent_identity().expect("failed to load identity");
 
     let mut args = std::env::args().skip(1);
     let dir_str = args
@@ -59,10 +59,14 @@ async fn main() {
     log::info!("Loaded {} files from {}", files.len(), dir.display());
     let files = Arc::new(files);
 
-    let mut node: Node<TcpTransport> = Node::new(config.network.relay);
+    let mut node: Node<TcpTransport> = if config.network.relay {
+        Node::relay()
+    } else {
+        Node::endpoint()
+    };
 
     let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-    let service = node.add_service(&aspect, &path_refs, &identity);
+    let service = node.add_service(&aspect, &path_refs, &identity).unwrap();
     let addr = node.service_address(service).unwrap();
     log::info!("Node: {} ({}) aspect={}", name, hex::encode(addr), aspect);
 
@@ -111,11 +115,11 @@ async fn main() {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    node_clone.announce_with_app_data(service, Some(name_bytes.clone()));
+                    node_clone.announce_with_app_data(service, name_bytes.clone());
                     log::debug!("Announced service");
                 }
                 request = node_clone.recv_request(service) => {
-                    let Some(request) = request else { break };
+                    let Ok(request) = request else { break };
                     handle_request(&node_clone, service, &files, request).await;
                 }
             }

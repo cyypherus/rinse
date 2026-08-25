@@ -15,7 +15,7 @@ impl Transport for IdleTransport {
         Poll::Pending
     }
 
-    fn bandwidth_available(&self) -> bool {
+    fn send_ready(&self) -> bool {
         true
     }
 }
@@ -33,14 +33,14 @@ impl Transport for BurstTransport {
             .map_or(Poll::Pending, |packet| Poll::Ready(Some(packet)))
     }
 
-    fn bandwidth_available(&self) -> bool {
+    fn send_ready(&self) -> bool {
         true
     }
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let node: Node<IdleTransport> = Node::new(false);
+    let node: Node<IdleTransport> = Node::endpoint();
     let client = node.clone();
     let runtime = tokio::spawn(node.run());
     let clients = 256;
@@ -52,7 +52,7 @@ async fn main() {
         let node = client.clone();
         tasks.spawn(async move {
             for _ in 0..reads {
-                black_box(node.stats().await);
+                black_box(node.lifetime_stats());
             }
         });
     }
@@ -64,7 +64,7 @@ async fn main() {
     let operations = clients * reads;
     let elapsed = started.elapsed();
     println!(
-        "stats_snapshot {operations} operations {:?} {:.0} ops/s",
+        "lifetime_stats {operations} operations {:?} {:.0} ops/s",
         elapsed,
         operations as f64 / elapsed.as_secs_f64()
     );
@@ -75,7 +75,7 @@ async fn main() {
         let node = client.clone();
         tasks.spawn(async move {
             for _ in 0..reads {
-                black_box(node.known_destinations().await);
+                black_box(node.destination_snapshot());
             }
         });
     }
@@ -101,13 +101,13 @@ async fn main() {
         inbound.push_back(raw);
     }
 
-    let node = Node::new(false);
+    let node = Node::endpoint();
     node.add_interface(Interface::new(BurstTransport { packets: inbound }));
     let client = node.clone();
     let started = Instant::now();
     let runtime = tokio::spawn(node.run());
     loop {
-        if client.stats().await.packets_received == packets as u64 {
+        if client.lifetime_stats().packets_received == packets as u64 {
             break;
         }
         tokio::task::yield_now().await;

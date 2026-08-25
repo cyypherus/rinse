@@ -26,21 +26,24 @@ mod transports;
 #[cfg(feature = "config")]
 pub mod config;
 
-pub use aspect::AspectHash;
-pub use buffer::{BufferChunk, BufferError};
-pub use channel::{ChannelError, ChannelMessage};
+pub use aspect::ServiceNameHash;
+pub use buffer::{BufferStreamChunk, BufferStreamError};
+pub use channel::{LinkChannelError, LinkChannelMessage};
 pub use handle::{
-    AppDecryptError, AppEncryptError, Destination, ExportRatchetsError, IncomingRequest, LinkError,
-    LinkRttError, PathNotFound, Progress, RequestError, ResourceError, RespondError, Response,
-    SendError, ServiceId,
+    AppDecryptError, AppEncryptError, Destination, EstablishLinkError, IncomingRequest,
+    LinkRttError, RatchetSnapshotError, ReceiveError, RequestError, ResourceError, RespondError,
+    Response, ResponseTransferProgress, RouteDiscoveryError, SendError, SendUnreliableError,
+    ServiceId, ServiceRegistrationError,
 };
-pub use identity::Identity;
-pub use interface::{Interface, Transport};
-pub use link_handle::{LinkHandle, LinkStatus, ResourceHandle};
-pub use packet::Address;
+pub use identity::PrivateIdentity;
+pub use interface::{Interface, InterfaceAccessCode, InterfaceAccessCodeError, Transport};
+pub use link_handle::{LinkHandle, LinkStatus};
+pub use packet::DestinationAddress;
 pub use request::RequestId;
 pub(crate) use request::WireRequestId;
-pub use stats::StatsSnapshot;
+pub use stats::LifetimeStats;
+
+pub type IdentityAddress = [u8; 16];
 
 pub use async_io::Node;
 

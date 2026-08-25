@@ -1,10 +1,10 @@
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AspectHash([u8; 10]);
+pub struct ServiceNameHash([u8; 10]);
 
-impl AspectHash {
-    pub fn from_name(name: &str) -> Self {
+impl ServiceNameHash {
+    pub fn from_service_name(name: &str) -> Self {
         let hash = Sha256::digest(name.as_bytes());
         let mut bytes = [0u8; 10];
         bytes.copy_from_slice(&hash[..10]);
@@ -16,13 +16,13 @@ impl AspectHash {
     }
 }
 
-impl std::fmt::Debug for AspectHash {
+impl std::fmt::Debug for ServiceNameHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "AspectHash({})", hex::encode(self.0))
+        write!(f, "ServiceNameHash({})", hex::encode(self.0))
     }
 }
 
-impl std::fmt::Display for AspectHash {
+impl std::fmt::Display for ServiceNameHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", hex::encode(self.0))
     }

@@ -1,5 +1,5 @@
 pub const ADDR_LEN: usize = 16;
-pub type Address = [u8; ADDR_LEN];
+pub type DestinationAddress = [u8; ADDR_LEN];
 
 const DEST_SINGLE: u8 = 0b00;
 const DEST_GROUP: u8 = 0b01;
@@ -14,7 +14,7 @@ const PKT_PROOF: u8 = 0b11;
 const CTX_LRPROOF: u8 = 0xFF;
 const CTX_PATH_RESPONSE: u8 = 0x0B;
 
-pub(crate) const PATH_REQUEST_DEST: Address = [
+pub(crate) const PATH_REQUEST_DEST: DestinationAddress = [
     0x6b, 0x9f, 0x66, 0x01, 0x4d, 0x98, 0x53, 0xfa, 0xab, 0x22, 0x0f, 0xba, 0x47, 0xd0, 0x27, 0x61,
 ];
 
@@ -81,9 +81,9 @@ pub enum Packet {
     },
     PathRequest {
         hops: u8,
-        query_destination: Address,
-        requesting_transport: Option<Address>,
-        tag: Address,
+        query_destination: DestinationAddress,
+        requesting_transport: Option<DestinationAddress>,
+        tag: DestinationAddress,
     },
     SingleData {
         hops: u8,
@@ -92,59 +92,59 @@ pub enum Packet {
     },
     GroupData {
         hops: u8,
-        destination: Address,
+        destination: DestinationAddress,
         ciphertext: Vec<u8>,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProofDestination {
-    Single(Address),
-    Link(Address),
+    Single(DestinationAddress),
+    Link(DestinationAddress),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkRequestDestination {
-    Direct(Address),
+    Direct(DestinationAddress),
     Transport {
-        transport_id: Address,
-        destination: Address,
+        transport_id: DestinationAddress,
+        destination: DestinationAddress,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkProofDestination {
-    Direct(Address),
+    Direct(DestinationAddress),
     Transport {
-        transport_id: Address,
-        link_id: Address,
+        transport_id: DestinationAddress,
+        link_id: DestinationAddress,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkDataDestination {
-    Direct(Address),
+    Direct(DestinationAddress),
     Transport {
-        transport_id: Address,
-        link_id: Address,
+        transport_id: DestinationAddress,
+        link_id: DestinationAddress,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SingleDestination {
-    Direct(Address),
+    Direct(DestinationAddress),
     Transport {
-        transport_id: Address,
-        destination: Address,
+        transport_id: DestinationAddress,
+        destination: DestinationAddress,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnnounceDestination {
-    Single(Address),
+    Single(DestinationAddress),
     Transport {
-        transport_id: Address,
-        destination: Address,
+        transport_id: DestinationAddress,
+        destination: DestinationAddress,
     },
 }
 
@@ -374,13 +374,13 @@ impl Packet {
                         if data.len() < 32 {
                             return Err(ParseError::TooShort);
                         }
-                        let query_destination: Address = data[..16].try_into().unwrap();
+                        let query_destination: DestinationAddress = data[..16].try_into().unwrap();
                         let (requesting_transport, tag) = if data.len() >= 48 {
-                            let transport: Address = data[16..32].try_into().unwrap();
-                            let tag: Address = data[32..48].try_into().unwrap();
+                            let transport: DestinationAddress = data[16..32].try_into().unwrap();
+                            let tag: DestinationAddress = data[32..48].try_into().unwrap();
                             (Some(transport), tag)
                         } else {
-                            let tag: Address = data[16..32].try_into().unwrap();
+                            let tag: DestinationAddress = data[16..32].try_into().unwrap();
                             (None, tag)
                         };
                         Ok(Packet::PathRequest {
@@ -529,7 +529,7 @@ impl Packet {
         *hops = hops.saturating_add(1);
     }
 
-    pub fn destination_hash(&self) -> Address {
+    pub fn destination_hash(&self) -> DestinationAddress {
         match self {
             Packet::Announce { destination, .. } => match destination {
                 AnnounceDestination::Single(a) => *a,
@@ -560,7 +560,7 @@ impl Packet {
         }
     }
 
-    pub fn transport_id(&self) -> Option<Address> {
+    pub fn transport_id(&self) -> Option<DestinationAddress> {
         match self {
             Packet::Announce { destination, .. } => match destination {
                 AnnounceDestination::Transport { transport_id, .. } => Some(*transport_id),
@@ -588,7 +588,7 @@ impl Packet {
         }
     }
 
-    pub fn received_from(&self) -> Address {
+    pub fn received_from(&self) -> DestinationAddress {
         self.transport_id()
             .unwrap_or_else(|| self.destination_hash())
     }
@@ -693,7 +693,7 @@ impl Packet {
         sha256(&self.hashable_part())
     }
 
-    pub fn set_transport_id(&mut self, new_id: Address) {
+    pub fn set_transport_id(&mut self, new_id: DestinationAddress) {
         match self {
             Packet::Announce { destination, .. } => {
                 if let AnnounceDestination::Transport { transport_id, .. } = destination {
@@ -768,7 +768,7 @@ impl Packet {
         }
     }
 
-    pub fn insert_transport(&mut self, next_hop: Address) {
+    pub fn insert_transport(&mut self, next_hop: DestinationAddress) {
         match self {
             Packet::Announce { destination, .. } => {
                 if let AnnounceDestination::Single(dest) = *destination {

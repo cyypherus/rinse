@@ -4,13 +4,14 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::identity::Identity;
+use crate::identity::PrivateIdentity;
 
 #[derive(Debug)]
 pub enum ConfigError {
     Io(std::io::Error),
     Parse(toml::de::Error),
     InvalidIdentity,
+    InvalidRatchetSecrets,
 }
 
 impl std::fmt::Display for ConfigError {
@@ -19,6 +20,7 @@ impl std::fmt::Display for ConfigError {
             ConfigError::Io(e) => write!(f, "io error: {}", e),
             ConfigError::Parse(e) => write!(f, "parse error: {}", e),
             ConfigError::InvalidIdentity => write!(f, "invalid identity data"),
+            ConfigError::InvalidRatchetSecrets => write!(f, "invalid ratchet secret data"),
         }
     }
 }
@@ -159,40 +161,40 @@ impl Config {
     }
 }
 
-pub fn load_or_generate_identity() -> Result<Identity, ConfigError> {
+pub fn load_or_create_persistent_identity() -> Result<PrivateIdentity, ConfigError> {
     let path = data_dir().join("identity");
 
     if path.exists() {
         let hex_str = fs::read_to_string(&path)?;
         let bytes = hex::decode(hex_str.trim()).map_err(|_| ConfigError::InvalidIdentity)?;
-        Identity::from_bytes(&bytes).ok_or(ConfigError::InvalidIdentity)
+        PrivateIdentity::from_secret_bytes(&bytes).ok_or(ConfigError::InvalidIdentity)
     } else {
-        let identity = Identity::generate(&mut rand::thread_rng());
-        save_identity(&identity)?;
+        let identity = PrivateIdentity::generate(&mut rand::thread_rng());
+        save_private_identity(&identity)?;
         Ok(identity)
     }
 }
 
-pub fn save_identity(identity: &Identity) -> Result<(), ConfigError> {
+pub fn save_private_identity(identity: &PrivateIdentity) -> Result<(), ConfigError> {
     let path = data_dir().join("identity");
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let hex_str = hex::encode(identity.to_bytes());
+    let hex_str = hex::encode(identity.to_secret_bytes());
     fs::write(path, hex_str)?;
     Ok(())
 }
 
-pub fn ratchets_path(service_address: &[u8; 16]) -> PathBuf {
+pub fn ratchet_secrets_path(service_address: &[u8; 16]) -> PathBuf {
     data_dir()
         .join("ratchets")
         .join(hex::encode(service_address))
 }
 
-pub fn load_ratchets(service_address: &[u8; 16]) -> Result<Vec<[u8; 32]>, ConfigError> {
-    let path = ratchets_path(service_address);
+pub fn load_ratchet_secrets(service_address: &[u8; 16]) -> Result<Vec<[u8; 32]>, ConfigError> {
+    let path = ratchet_secrets_path(service_address);
 
     if path.exists() {
         let contents = fs::read_to_string(&path)?;
@@ -202,9 +204,9 @@ pub fn load_ratchets(service_address: &[u8; 16]) -> Result<Vec<[u8; 32]>, Config
             if line.is_empty() {
                 continue;
             }
-            let bytes = hex::decode(line).map_err(|_| ConfigError::InvalidIdentity)?;
+            let bytes = hex::decode(line).map_err(|_| ConfigError::InvalidRatchetSecrets)?;
             if bytes.len() != 32 {
-                return Err(ConfigError::InvalidIdentity);
+                return Err(ConfigError::InvalidRatchetSecrets);
             }
             ratchets.push(bytes.try_into().unwrap());
         }
@@ -214,14 +216,17 @@ pub fn load_ratchets(service_address: &[u8; 16]) -> Result<Vec<[u8; 32]>, Config
     }
 }
 
-pub fn save_ratchets(service_address: &[u8; 16], ratchets: &[[u8; 32]]) -> Result<(), ConfigError> {
-    let path = ratchets_path(service_address);
+pub fn save_ratchet_secrets(
+    service_address: &[u8; 16],
+    ratchet_secrets: &[[u8; 32]],
+) -> Result<(), ConfigError> {
+    let path = ratchet_secrets_path(service_address);
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let contents: String = ratchets
+    let contents: String = ratchet_secrets
         .iter()
         .map(hex::encode)
         .collect::<Vec<_>>()

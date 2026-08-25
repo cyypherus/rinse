@@ -23,9 +23,9 @@ impl Stats {
         }
     }
 
-    pub fn snapshot(&self) -> StatsSnapshot {
+    pub fn snapshot(&self) -> LifetimeStats {
         let uptime_secs = self.start_time.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-        StatsSnapshot {
+        LifetimeStats {
             uptime_secs,
             packets_received: self.packets_received,
             bytes_received: self.bytes_received,
@@ -42,7 +42,7 @@ impl Stats {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct StatsSnapshot {
+pub struct LifetimeStats {
     pub uptime_secs: u64,
     pub packets_received: u64,
     pub bytes_received: u64,

@@ -1,4 +1,4 @@
-use rinse::config::{Config, InterfaceConfig, load_or_generate_identity};
+use rinse::config::{Config, InterfaceConfig, load_or_create_persistent_identity};
 use rinse::{Interface, Node, TcpTransport};
 
 #[tokio::main]
@@ -6,7 +6,7 @@ async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let config = Config::load().expect("failed to load config");
-    let identity = load_or_generate_identity().expect("failed to load identity");
+    let identity = load_or_create_persistent_identity().expect("failed to load identity");
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -56,8 +56,14 @@ async fn main() {
             std::process::exit(1);
         });
 
-    let mut node: Node<TcpTransport> = Node::new(config.network.relay);
-    let service = node.add_service("nomadnetwork.node", &[], &identity);
+    let mut node: Node<TcpTransport> = if config.network.relay {
+        Node::relay()
+    } else {
+        Node::endpoint()
+    };
+    let service = node
+        .add_service("nomadnetwork.node", &[], &identity)
+        .unwrap();
 
     for (name, iface) in config.enabled_interfaces() {
         if let InterfaceConfig::TCPClientInterface {
@@ -93,7 +99,10 @@ async fn main() {
     let node_for_progress = node_clone.clone();
     let progress_task = tokio::spawn(async move {
         loop {
-            let Some(progress) = node_for_progress.recv_progress(service).await else {
+            let Ok(progress) = node_for_progress
+                .recv_response_transfer_progress(service)
+                .await
+            else {
                 break;
             };
             let pct = if progress.total_bytes > 0 {
