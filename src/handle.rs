@@ -28,6 +28,32 @@ pub enum LinkError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkRttError {
+    LinkNotFound,
+    NotMeasured,
+    RuntimeStopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportRatchetsError {
+    ServiceNotFound,
+    RuntimeStopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppEncryptError {
+    DestinationUnknown,
+    RuntimeStopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppDecryptError {
+    ServiceNotFound,
+    InvalidCiphertext,
+    RuntimeStopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceError {
     LinkClosed,
     InvalidLink,

@@ -11,7 +11,6 @@ pub trait Transport: Send {
     fn is_connected(&self) -> bool {
         true
     }
-    fn set_inbound_notifier(&mut self, _: std::sync::Arc<tokio::sync::Notify>) {}
 }
 
 impl Transport for Box<dyn Transport> {
@@ -26,9 +25,6 @@ impl Transport for Box<dyn Transport> {
     }
     fn is_connected(&self) -> bool {
         (**self).is_connected()
-    }
-    fn set_inbound_notifier(&mut self, notifier: std::sync::Arc<tokio::sync::Notify>) {
-        (**self).set_inbound_notifier(notifier)
     }
 }
 

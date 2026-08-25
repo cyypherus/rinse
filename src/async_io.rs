@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use tokio::sync::{Mutex as TokioMutex, Notify, mpsc, oneshot, watch};
+use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot, watch};
 
 use crate::handle::{
-    Destination, IncomingRequest, LinkError, RequestError, ResourceError, RespondError, Response,
-    ServiceEvent, ServiceId,
+    AppDecryptError, AppEncryptError, Destination, ExportRatchetsError, IncomingRequest, LinkError,
+    LinkRttError, RequestError, ResourceError, RespondError, Response, ServiceEvent, ServiceId,
 };
 use crate::node::PreparedInbound;
 use crate::packet::Address;
@@ -108,6 +108,22 @@ mod tests {
         tokio::task::yield_now().await;
         runtime.abort();
         assert!(runtime.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            node.export_ratchets(service).await,
+            Err(ExportRatchetsError::RuntimeStopped)
+        );
+        assert_eq!(
+            node.link_rtt(crate::LinkHandle([0; 16])).await,
+            Err(LinkRttError::RuntimeStopped)
+        );
+        assert_eq!(
+            node.app_encrypt_for([0; 16], &[]).await,
+            Err(AppEncryptError::RuntimeStopped)
+        );
+        assert_eq!(
+            node.app_decrypt_as(service, &[]).await,
+            Err(AppDecryptError::RuntimeStopped)
+        );
     }
 }
 
@@ -148,7 +164,6 @@ pub struct AsyncTcpTransport {
     connected: Arc<StdMutex<bool>>,
     shutdown_tx: Option<mpsc::Sender<()>>,
     io_task: Option<tokio::task::JoinHandle<()>>,
-    inbound_notifier: Arc<StdMutex<Option<Arc<Notify>>>>,
 }
 
 #[cfg(feature = "tcp")]
@@ -164,14 +179,11 @@ impl AsyncTcpTransport {
         let outbox: PacketQueue = Arc::new(StdMutex::new(VecDeque::new()));
         let connected = Arc::new(StdMutex::new(true));
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
-        let inbound_notifier = Arc::new(StdMutex::new(None));
-
         let io_task = tokio::spawn(tcp_io_task(
             stream,
             inbox.clone(),
             outbox.clone(),
             connected.clone(),
-            inbound_notifier.clone(),
             shutdown_rx,
         ));
 
@@ -182,7 +194,6 @@ impl AsyncTcpTransport {
             connected,
             shutdown_tx: Some(shutdown_tx),
             io_task: Some(io_task),
-            inbound_notifier,
         })
     }
 
@@ -211,7 +222,6 @@ impl AsyncTcpTransport {
             self.inbox.clone(),
             self.outbox.clone(),
             self.connected.clone(),
-            self.inbound_notifier.clone(),
             shutdown_rx,
         )));
 
@@ -245,10 +255,6 @@ impl Transport for AsyncTcpTransport {
     fn is_connected(&self) -> bool {
         *self.connected.lock().unwrap()
     }
-
-    fn set_inbound_notifier(&mut self, notifier: Arc<Notify>) {
-        *self.inbound_notifier.lock().unwrap() = Some(notifier);
-    }
 }
 
 #[cfg(feature = "tcp")]
@@ -257,7 +263,6 @@ async fn tcp_io_task(
     inbox: PacketQueue,
     outbox: PacketQueue,
     connected: Arc<StdMutex<bool>>,
-    inbound_notifier: Arc<StdMutex<Option<Arc<Notify>>>>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
     let (mut reader, mut writer) = stream.into_split();
@@ -274,9 +279,6 @@ async fn tcp_io_task(
                     hdlc_buf.extend_from_slice(&buf[..n]);
                     while let Some(frame) = hdlc_extract_frame(&mut hdlc_buf) {
                         inbox_clone.lock().unwrap().push_back(frame);
-                        if let Some(notifier) = inbound_notifier.lock().unwrap().as_ref() {
-                            notifier.notify_one();
-                        }
                     }
                 }
                 Err(_) => break,
@@ -359,7 +361,7 @@ enum Command<T: Transport> {
     },
     ExportRatchets {
         service: ServiceId,
-        reply: oneshot::Sender<Option<Vec<[u8; 32]>>>,
+        reply: oneshot::Sender<Result<Vec<[u8; 32]>, ExportRatchetsError>>,
     },
     Request {
         service: ServiceId,
@@ -405,7 +407,7 @@ enum Command<T: Transport> {
     },
     LinkRtt {
         link: crate::LinkHandle,
-        reply: oneshot::Sender<Option<u64>>,
+        reply: oneshot::Sender<Result<u64, LinkRttError>>,
     },
     CloseLink {
         link: crate::LinkHandle,
@@ -442,12 +444,12 @@ enum Command<T: Transport> {
     AppEncryptFor {
         destination: Address,
         data: Vec<u8>,
-        reply: oneshot::Sender<Option<Vec<u8>>>,
+        reply: oneshot::Sender<Result<Vec<u8>, AppEncryptError>>,
     },
     AppDecryptAs {
         service: ServiceId,
         data: Vec<u8>,
-        reply: oneshot::Sender<Option<Vec<u8>>>,
+        reply: oneshot::Sender<Result<Vec<u8>, AppDecryptError>>,
     },
 }
 
@@ -459,7 +461,6 @@ struct Runtime<T: Transport> {
     destinations_changed_tx: watch::Sender<()>,
     destinations_tx: watch::Sender<Vec<Destination>>,
     stats_tx: watch::Sender<StatsSnapshot>,
-    inbound_ready: Arc<Notify>,
 }
 
 pub struct Node<T: Transport> {
@@ -492,7 +493,6 @@ impl<T: Transport> Node<T> {
         let (destinations_changed_tx, destinations_changed_rx) = watch::channel(());
         let (destinations_tx, destinations_rx) = watch::channel(Vec::new());
         let (stats_tx, stats_rx) = watch::channel(StatsSnapshot::default());
-        let inbound_ready = Arc::new(Notify::new());
         let rng = StdRng::from_entropy();
 
         Self {
@@ -510,7 +510,6 @@ impl<T: Transport> Node<T> {
                 destinations_changed_tx,
                 destinations_tx,
                 stats_tx,
-                inbound_ready,
             }))),
         }
     }
@@ -600,13 +599,20 @@ impl<T: Transport> Node<T> {
         });
     }
 
-    pub async fn export_ratchets(&self, service: ServiceId) -> Option<Vec<[u8; 32]>> {
+    pub async fn export_ratchets(
+        &self,
+        service: ServiceId,
+    ) -> Result<Vec<[u8; 32]>, ExportRatchetsError> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.command_tx.send(Command::ExportRatchets {
-            service,
-            reply: reply_tx,
-        });
-        reply_rx.await.ok().flatten()
+        self.command_tx
+            .send(Command::ExportRatchets {
+                service,
+                reply: reply_tx,
+            })
+            .map_err(|_| ExportRatchetsError::RuntimeStopped)?;
+        reply_rx
+            .await
+            .unwrap_or(Err(ExportRatchetsError::RuntimeStopped))
     }
 
     pub async fn send_raw(
@@ -886,13 +892,15 @@ impl<T: Transport> Node<T> {
         reply_rx.await.unwrap_or(crate::LinkStatus::Closed)
     }
 
-    pub async fn link_rtt(&self, link: crate::LinkHandle) -> Option<u64> {
+    pub async fn link_rtt(&self, link: crate::LinkHandle) -> Result<u64, LinkRttError> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.command_tx.send(Command::LinkRtt {
-            link,
-            reply: reply_tx,
-        });
-        reply_rx.await.ok().flatten()
+        self.command_tx
+            .send(Command::LinkRtt {
+                link,
+                reply: reply_tx,
+            })
+            .map_err(|_| LinkRttError::RuntimeStopped)?;
+        reply_rx.await.unwrap_or(Err(LinkRttError::RuntimeStopped))
     }
 
     pub fn self_identify(&self, link: crate::LinkHandle, identity: &crate::Identity) {
@@ -960,14 +968,22 @@ impl<T: Transport> Node<T> {
     ///
     /// The destination must have announced and be in the path table.
     /// Returns the encrypted blob (ephemeral public key + ciphertext).
-    pub async fn app_encrypt_for(&self, destination: Address, data: &[u8]) -> Option<Vec<u8>> {
+    pub async fn app_encrypt_for(
+        &self,
+        destination: Address,
+        data: &[u8],
+    ) -> Result<Vec<u8>, AppEncryptError> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.command_tx.send(Command::AppEncryptFor {
-            destination,
-            data: data.to_vec(),
-            reply: reply_tx,
-        });
-        reply_rx.await.ok().flatten()
+        self.command_tx
+            .send(Command::AppEncryptFor {
+                destination,
+                data: data.to_vec(),
+                reply: reply_tx,
+            })
+            .map_err(|_| AppEncryptError::RuntimeStopped)?;
+        reply_rx
+            .await
+            .unwrap_or(Err(AppEncryptError::RuntimeStopped))
     }
 
     /// Decrypt data that was application-layer encrypted for one of our services.
@@ -977,14 +993,22 @@ impl<T: Transport> Node<T> {
     /// intermediary (e.g., fetched from a store-and-forward server).
     ///
     /// The data format is: ephemeral public key (32 bytes) + ciphertext.
-    pub async fn app_decrypt_as(&self, service: ServiceId, data: &[u8]) -> Option<Vec<u8>> {
+    pub async fn app_decrypt_as(
+        &self,
+        service: ServiceId,
+        data: &[u8],
+    ) -> Result<Vec<u8>, AppDecryptError> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.command_tx.send(Command::AppDecryptAs {
-            service,
-            data: data.to_vec(),
-            reply: reply_tx,
-        });
-        reply_rx.await.ok().flatten()
+        self.command_tx
+            .send(Command::AppDecryptAs {
+                service,
+                data: data.to_vec(),
+                reply: reply_tx,
+            })
+            .map_err(|_| AppDecryptError::RuntimeStopped)?;
+        reply_rx
+            .await
+            .unwrap_or(Err(AppDecryptError::RuntimeStopped))
     }
 
     pub async fn run(self) {
@@ -1006,7 +1030,6 @@ impl<T: Transport> Node<T> {
                 Some(cmd) = inner.command_rx.recv() => {
                     Self::handle_command(&mut inner, cmd, Instant::now());
                 }
-                _ = inner.inbound_ready.notified() => {}
                 _ = tokio::time::sleep(sleep_duration) => {}
             }
             next_wake = Self::poll(&mut inner, &self.services).await;
@@ -1213,10 +1236,7 @@ impl<T: Transport> Node<T> {
 
     fn handle_command(inner: &mut Runtime<T>, cmd: Command<T>, now: Instant) {
         match cmd {
-            Command::AddInterface { mut interface } => {
-                interface
-                    .transport
-                    .set_inbound_notifier(inner.inbound_ready.clone());
+            Command::AddInterface { interface } => {
                 inner.protocol.add_interface(*interface);
             }
             Command::Announce { service, app_data } => {

@@ -11,7 +11,10 @@ use crate::announce::{AnnounceBuilder, AnnounceData};
 use crate::aspect::AspectHash;
 use crate::channel::{ChannelError, ChannelMessage, ChannelState};
 use crate::crypto::{EphemeralKeyPair, sha256};
-use crate::handle::{Destination, RequestError, RespondError, ServiceEvent, ServiceId};
+use crate::handle::{
+    AppDecryptError, AppEncryptError, Destination, ExportRatchetsError, LinkRttError, RequestError,
+    RespondError, ServiceEvent, ServiceId,
+};
 use crate::stats::{Stats, StatsSnapshot};
 
 const LINK_MDU: usize = 431;
@@ -760,9 +763,15 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         }
     }
 
-    pub fn export_ratchets(&self, service: ServiceId) -> Option<Vec<[u8; 32]>> {
-        let entry = self.services.get(service.0)?;
-        Some(entry.ratchets.iter().map(|r| r.to_bytes()).collect())
+    pub fn export_ratchets(
+        &self,
+        service: ServiceId,
+    ) -> Result<Vec<[u8; 32]>, ExportRatchetsError> {
+        let entry = self
+            .services
+            .get(service.0)
+            .ok_or(ExportRatchetsError::ServiceNotFound)?;
+        Ok(entry.ratchets.iter().map(|r| r.to_bytes()).collect())
     }
 
     pub fn announce(&mut self, service: ServiceId) {
@@ -985,8 +994,15 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         }
     }
 
-    pub fn link_rtt(&self, link: crate::LinkHandle) -> Option<u64> {
-        self.established_links.get(&link.0)?.rtt_ms
+    pub fn link_rtt(&self, link: crate::LinkHandle) -> Result<u64, LinkRttError> {
+        if self.pending_outbound_links.contains_key(&link.0) {
+            return Err(LinkRttError::NotMeasured);
+        }
+        self.established_links
+            .get(&link.0)
+            .ok_or(LinkRttError::LinkNotFound)?
+            .rtt_ms
+            .ok_or(LinkRttError::NotMeasured)
     }
 
     pub fn close_link(&mut self, link: crate::LinkHandle) {
@@ -1195,17 +1211,24 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
     ///
     /// The destination must have announced and be in the path table.
     /// Returns the encrypted blob (ephemeral public key + ciphertext).
-    pub fn app_encrypt_for(&mut self, destination: Address, data: &[u8]) -> Option<Vec<u8>> {
+    pub fn app_encrypt_for(
+        &mut self,
+        destination: Address,
+        data: &[u8],
+    ) -> Result<Vec<u8>, AppEncryptError> {
         use crate::crypto::SingleDestEncryption;
 
-        let entry = self.path_table.get(&destination)?;
+        let entry = self
+            .path_table
+            .get(&destination)
+            .ok_or(AppEncryptError::DestinationUnknown)?;
         let target_key = entry.ratchet_key.as_ref().unwrap_or(&entry.encryption_key);
         let (ephemeral_pub, ciphertext) =
             SingleDestEncryption::encrypt(&mut self.rng, target_key, data);
 
         let mut result = ephemeral_pub.as_bytes().to_vec();
         result.extend(ciphertext);
-        Some(result)
+        Ok(result)
     }
 
     /// Decrypt data that was application-layer encrypted for one of our services.
@@ -1215,28 +1238,34 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
     /// intermediary (e.g., fetched from a store-and-forward server).
     ///
     /// The data format is: ephemeral public key (32 bytes) + ciphertext.
-    pub fn app_decrypt_as(&self, service: ServiceId, data: &[u8]) -> Option<Vec<u8>> {
+    pub fn app_decrypt_as(
+        &self,
+        service: ServiceId,
+        data: &[u8],
+    ) -> Result<Vec<u8>, AppDecryptError> {
         use crate::crypto::SingleDestEncryption;
 
-        if data.len() < 32 {
-            return None;
-        }
-
-        let service_entry = self.services.get(service.0)?;
-        let ephemeral_pub = X25519Public::from(<[u8; 32]>::try_from(&data[..32]).ok()?);
-        let ciphertext = &data[32..];
+        let service_entry = self
+            .services
+            .get(service.0)
+            .ok_or(AppDecryptError::ServiceNotFound)?;
+        let (ephemeral_key, ciphertext) = data
+            .split_first_chunk::<32>()
+            .ok_or(AppDecryptError::InvalidCiphertext)?;
+        let ephemeral_pub = X25519Public::from(*ephemeral_key);
 
         // Try ratchet keys first (newest to oldest)
         for ratchet in &service_entry.ratchets {
             if let Some(plaintext) =
                 SingleDestEncryption::decrypt(ratchet, &ephemeral_pub, ciphertext)
             {
-                return Some(plaintext);
+                return Ok(plaintext);
             }
         }
 
         // Fall back to static key
         SingleDestEncryption::decrypt(&service_entry.encryption_secret, &ephemeral_pub, ciphertext)
+            .ok_or(AppDecryptError::InvalidCiphertext)
     }
 
     pub(crate) fn link(
@@ -7196,7 +7225,7 @@ mod tests {
         b.poll(t);
 
         let handle = b.create_link(svc_b, addr_a, t).unwrap();
-        assert!(b.link_rtt(handle).is_none());
+        assert_eq!(b.link_rtt(handle), Err(LinkRttError::NotMeasured));
 
         b.poll(t);
         transfer(&mut b, 0, &mut a, 0);
@@ -7204,7 +7233,11 @@ mod tests {
         transfer(&mut a, 0, &mut b, 0);
         b.poll(t);
 
-        assert!(b.link_rtt(handle).is_some());
+        assert!(b.link_rtt(handle).is_ok());
+        assert_eq!(
+            b.link_rtt(crate::LinkHandle([u8::MAX; 16])),
+            Err(LinkRttError::LinkNotFound)
+        );
     }
 
     #[test]
@@ -8947,7 +8980,7 @@ mod tests {
         let unknown_addr = [0xFFu8; 16];
         let result = a.app_encrypt_for(unknown_addr, b"test");
 
-        assert!(result.is_none());
+        assert_eq!(result, Err(AppEncryptError::DestinationUnknown));
     }
 
     #[test]
@@ -8973,6 +9006,14 @@ mod tests {
 
         // Try to decrypt with wrong service (A's service, not B's)
         let result = a.app_decrypt_as(svc_a, &encrypted);
-        assert!(result.is_none());
+        assert_eq!(result, Err(AppDecryptError::InvalidCiphertext));
+        assert_eq!(
+            a.app_decrypt_as(ServiceId(usize::MAX), &encrypted),
+            Err(AppDecryptError::ServiceNotFound)
+        );
+        assert_eq!(
+            a.app_decrypt_as(svc_a, &[0; 31]),
+            Err(AppDecryptError::InvalidCiphertext)
+        );
     }
 }
