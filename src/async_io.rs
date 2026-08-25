@@ -85,7 +85,7 @@ mod tests {
             .map(|(index, packet)| (packet.to_bytes(), index))
             .collect();
 
-        let prepared = NodeRuntime::<TestTransport>::prepare_received(raw).await;
+        let prepared = NodeRuntime::<TestTransport>::prepare_received(raw);
 
         assert_eq!(prepared.len(), packets.len());
         for (index, (prepared, expected)) in prepared.into_iter().zip(packets).enumerate() {
@@ -148,6 +148,19 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn runtime_runs_without_tokio() {
+        futures_lite::future::block_on(async {
+            let builder: NodeBuilder<TestTransport> = NodeBuilder::non_forwarding_endpoint();
+            let (node, runtime) = builder.build();
+            futures_lite::future::zip(runtime.run(), async move {
+                embassy_time::Timer::after_millis(1).await;
+                drop(node);
+            })
+            .await;
+        });
     }
 
     #[tokio::test]
@@ -768,14 +781,7 @@ impl<T: Transport> Node<T> {
         stream_id: crate::LinkBufferStreamId,
         data: &[u8],
     ) -> Result<crate::QueuedLinkBufferStreamData, crate::ChannelSendError> {
-        let encoded = if data.len() < 1024 {
-            crate::buffer::encode(stream_id, data, false)
-        } else {
-            let data = data.to_vec();
-            tokio::task::spawn_blocking(move || crate::buffer::encode(stream_id, &data, false))
-                .await
-                .map_err(|_| crate::ChannelSendError::RuntimeStopped)?
-        };
+        let encoded = crate::buffer::encode(stream_id, data, false);
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
             .send(Command::SendBuffer {
@@ -1140,35 +1146,45 @@ impl<T: Transport> NodeRuntime<T> {
         let mut next_wake = Self::poll(&mut self.runtime, &self.services, Vec::new()).await;
 
         loop {
+            enum Ready<C> {
+                Received(Vec<(Vec<u8>, usize)>),
+                Command(Option<C>),
+                Deadline,
+            }
+
             let deadline = async {
                 match next_wake {
-                    Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
-                    None => std::future::pending().await,
+                    Some(deadline) => {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        embassy_time::Timer::after(embassy_time::Duration::from_micros(
+                            remaining.as_micros().min(u64::MAX as u128) as u64,
+                        ))
+                        .await;
+                    }
+                    None => futures_lite::future::pending().await,
                 }
+                Ready::Deadline
             };
-            let mut command = None;
-            let mut commands_closed = false;
-            let mut received = Vec::new();
             let protocol = &mut self.runtime.protocol;
             let command_rx = &mut self.runtime.command_rx;
-
-            tokio::select! {
-                biased;
-                raw = std::future::poll_fn(|cx| protocol.poll_received(cx)) => {
-                    received = raw;
+            let received = async {
+                Ready::Received(
+                    futures_lite::future::poll_fn(|cx| protocol.poll_received(cx)).await,
+                )
+            };
+            let command = async { Ready::Command(command_rx.recv().await) };
+            let ready =
+                futures_lite::future::or(received, futures_lite::future::or(command, deadline))
+                    .await;
+            let received = match ready {
+                Ready::Received(received) => received,
+                Ready::Command(Some(command)) => {
+                    Self::handle_command(&mut self.runtime, command, Instant::now());
+                    Vec::new()
                 }
-                cmd = command_rx.recv() => match cmd {
-                    Some(cmd) => command = Some(cmd),
-                    None => commands_closed = true,
-                },
-                _ = deadline => {}
-            }
-            if commands_closed {
-                break;
-            }
-            if let Some(command) = command {
-                Self::handle_command(&mut self.runtime, command, Instant::now());
-            }
+                Ready::Command(None) => break,
+                Ready::Deadline => Vec::new(),
+            };
             next_wake = Self::poll(&mut self.runtime, &self.services, received).await;
         }
     }
@@ -1179,7 +1195,7 @@ impl<T: Transport> NodeRuntime<T> {
         received: Vec<(Vec<u8>, usize)>,
     ) -> Option<Instant> {
         let now = Instant::now();
-        let received = Self::prepare_received(received).await;
+        let received = Self::prepare_received(received);
         let (events, next_wake) = inner.protocol.poll_prepared(now, received);
 
         while let Some((link, message, _)) = inner.pending_channel_sends.front() {
@@ -1268,7 +1284,7 @@ impl<T: Transport> NodeRuntime<T> {
         next_wake
     }
 
-    async fn prepare_received(received: Vec<(Vec<u8>, usize)>) -> Vec<PreparedInbound> {
+    fn prepare_received(received: Vec<(Vec<u8>, usize)>) -> Vec<PreparedInbound> {
         if received.len() < 32
             || received.iter().map(|(raw, _)| raw.len()).sum::<usize>() / received.len() < 256
         {
@@ -1278,36 +1294,22 @@ impl<T: Transport> NodeRuntime<T> {
                 .collect();
         }
 
-        let workers = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1)
-            .min(received.len());
-        let chunk_size = received.len().div_ceil(workers);
-        let mut tasks = tokio::task::JoinSet::new();
-        let mut chunks: Vec<Vec<_>> = (0..workers)
-            .map(|_| Vec::with_capacity(chunk_size))
-            .collect();
-        for (index, item) in received.into_iter().enumerate() {
-            chunks[index / chunk_size].push((index, item));
-        }
-        for chunk in chunks.into_iter().filter(|chunk| !chunk.is_empty()) {
-            tasks.spawn_blocking(move || {
-                chunk
-                    .into_iter()
-                    .filter_map(|(index, (raw, source))| {
-                        PreparedInbound::parse(raw, source).map(|packet| (index, packet))
-                    })
-                    .collect::<Vec<_>>()
-            });
-        }
+        #[cfg(feature = "parallel-packet-processing")]
+        {
+            use rayon::prelude::*;
 
-        let mut prepared = Vec::new();
-        while let Some(result) = tasks.join_next().await {
-            let mut chunk = result.expect("packet preparation task failed");
-            prepared.append(&mut chunk);
+            received
+                .into_par_iter()
+                .filter_map(|(raw, source)| PreparedInbound::parse(raw, source))
+                .collect()
         }
-        prepared.sort_unstable_by_key(|(index, _)| *index);
-        prepared.into_iter().map(|(_, packet)| packet).collect()
+        #[cfg(not(feature = "parallel-packet-processing"))]
+        {
+            received
+                .into_iter()
+                .filter_map(|(raw, source)| PreparedInbound::parse(raw, source))
+                .collect()
+        }
     }
 
     fn dispatch_events(
