@@ -1143,17 +1143,18 @@ impl<T: Transport> OutboundLinkBufferStream<'_, T> {
 
 impl<T: Transport> NodeRuntime<T> {
     pub async fn run(mut self) {
-        let mut next_wake = Self::poll(&mut self.runtime, &self.services, Vec::new()).await;
+        enum Activity<C> {
+            Received(Vec<(Vec<u8>, usize)>),
+            Command(Option<C>),
+            Deadline,
+        }
+
+        let mut protocol_deadline =
+            Self::advance_protocol(&mut self.runtime, &self.services, Vec::new());
 
         loop {
-            enum Ready<C> {
-                Received(Vec<(Vec<u8>, usize)>),
-                Command(Option<C>),
-                Deadline,
-            }
-
             let deadline = async {
-                match next_wake {
+                match protocol_deadline {
                     Some(deadline) => {
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         embassy_time::Timer::after(embassy_time::Duration::from_micros(
@@ -1163,40 +1164,40 @@ impl<T: Transport> NodeRuntime<T> {
                     }
                     None => futures_lite::future::pending().await,
                 }
-                Ready::Deadline
+                Activity::Deadline
             };
             let protocol = &mut self.runtime.protocol;
             let command_rx = &mut self.runtime.command_rx;
             let received = async {
-                Ready::Received(
+                Activity::Received(
                     futures_lite::future::poll_fn(|cx| protocol.poll_received(cx)).await,
                 )
             };
-            let command = async { Ready::Command(command_rx.recv().await) };
-            let ready =
+            let command = async { Activity::Command(command_rx.recv().await) };
+            let activity =
                 futures_lite::future::or(received, futures_lite::future::or(command, deadline))
                     .await;
-            let received = match ready {
-                Ready::Received(received) => received,
-                Ready::Command(Some(command)) => {
+            let received = match activity {
+                Activity::Received(received) => received,
+                Activity::Command(Some(command)) => {
                     Self::handle_command(&mut self.runtime, command, Instant::now());
                     Vec::new()
                 }
-                Ready::Command(None) => break,
-                Ready::Deadline => Vec::new(),
+                Activity::Command(None) => break,
+                Activity::Deadline => Vec::new(),
             };
-            next_wake = Self::poll(&mut self.runtime, &self.services, received).await;
+            protocol_deadline = Self::advance_protocol(&mut self.runtime, &self.services, received);
         }
     }
 
-    async fn poll(
+    fn advance_protocol(
         inner: &mut Runtime<T>,
         services: &Arc<StdMutex<HashMap<ServiceId, ServiceChannels>>>,
         received: Vec<(Vec<u8>, usize)>,
     ) -> Option<Instant> {
         let now = Instant::now();
         let received = Self::prepare_received(received);
-        let (events, next_wake) = inner.protocol.poll_prepared(now, received);
+        let (events, protocol_deadline) = inner.protocol.advance(now, received);
 
         while let Some((link, message, _)) = inner.pending_channel_sends.front() {
             match inner
@@ -1281,7 +1282,7 @@ impl<T: Transport> NodeRuntime<T> {
             }
         });
 
-        next_wake
+        protocol_deadline
     }
 
     fn prepare_received(received: Vec<(Vec<u8>, usize)>) -> Vec<PreparedInbound> {

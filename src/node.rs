@@ -2866,14 +2866,14 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         }
     }
 
-    pub(crate) fn poll_prepared(
+    pub(crate) fn advance(
         &mut self,
         now: Instant,
         received: Vec<PreparedInbound>,
     ) -> (Vec<ServiceEvent>, Option<Instant>) {
-        let mut next_wake: Option<Instant> = None;
-        let mut update_wake = |t: Instant| {
-            next_wake = Some(next_wake.map_or(t, |w| w.min(t)));
+        let mut deadline: Option<Instant> = None;
+        let mut include_deadline = |t: Instant| {
+            deadline = Some(deadline.map_or(t, |current| current.min(t)));
         };
 
         for received in received {
@@ -2904,10 +2904,10 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                     pending.source_interface,
                 ));
                 if pending.retries_remaining > 0 {
-                    update_wake(pending.retry_at);
+                    include_deadline(pending.retry_at);
                 }
             } else if pending.retries_remaining > 0 {
-                update_wake(pending.retry_at);
+                include_deadline(pending.retry_at);
             }
         }
         // Remove announces with no retries left
@@ -2942,13 +2942,13 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             self.pending_events.push(ServiceEvent::DestinationsChanged);
         }
         for entry in self.path_table.values() {
-            update_wake(entry.timestamp + PATH_TIMEOUT);
+            include_deadline(entry.timestamp + PATH_TIMEOUT);
         }
 
         self.reverse_table
             .retain(|_, entry| now.saturating_duration_since(entry.timestamp) <= REVERSE_TIMEOUT);
         for entry in self.reverse_table.values() {
-            update_wake(entry.timestamp + REVERSE_TIMEOUT);
+            include_deadline(entry.timestamp + REVERSE_TIMEOUT);
         }
 
         let mut channel_retries = Vec::new();
@@ -2967,7 +2967,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             if failed {
                 failed_channels.push(*link_id);
             } else if let Some(next) = channel.next_retry(rtt) {
-                update_wake(next);
+                include_deadline(next);
             }
         }
         for (link_id, packet) in channel_retries {
@@ -2982,7 +2982,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         }
 
         if let Some(t) = self.maintain_links(now) {
-            update_wake(t);
+            include_deadline(t);
         }
 
         // Remove disconnected interfaces
@@ -2993,7 +2993,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             log::debug!("Removed {} disconnected interface(s)", removed);
         }
 
-        (std::mem::take(&mut self.pending_events), next_wake)
+        (std::mem::take(&mut self.pending_events), deadline)
     }
 
     #[cfg(test)]
@@ -3006,7 +3006,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         .into_iter()
         .filter_map(|(raw, source)| PreparedInbound::parse(raw, source))
         .collect();
-        let result = self.poll_prepared(now, received);
+        let result = self.advance(now, received);
         for iface in &mut self.interfaces {
             let _ = iface.poll_send(&mut Context::from_waker(std::task::Waker::noop()));
         }
@@ -3014,9 +3014,9 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
     }
 
     fn maintain_links(&mut self, now: Instant) -> Option<Instant> {
-        let mut next_wake: Option<Instant> = None;
-        let mut update_wake = |t: Instant| {
-            next_wake = Some(next_wake.map_or(t, |w| w.min(t)));
+        let mut deadline: Option<Instant> = None;
+        let mut include_deadline = |t: Instant| {
+            deadline = Some(deadline.map_or(t, |current| current.min(t)));
         };
 
         // Check for timed out pending links
@@ -3035,7 +3035,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             } else {
                 let timeout_at =
                     pending.request_time + std::time::Duration::from_secs(timeout_secs);
-                update_wake(timeout_at);
+                include_deadline(timeout_at);
             }
         }
 
@@ -3064,7 +3064,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             } else {
                 let timeout_at =
                     *request_time + std::time::Duration::from_secs(PATH_REQUEST_TIMEOUT_SECS);
-                update_wake(timeout_at);
+                include_deadline(timeout_at);
             }
         }
 
@@ -3145,14 +3145,14 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                         .last_keepalive_sent
                         .map(|t| t + std::time::Duration::from_secs(keepalive_secs))
                         .unwrap_or(now);
-                    update_wake(next_inbound_check.max(next_keepalive_check));
+                    include_deadline(next_inbound_check.max(next_keepalive_check));
                 }
             }
 
             // Schedule wake for stale check
             let stale_at = link.last_inbound + std::time::Duration::from_secs(stale_secs);
             if stale_at > now {
-                update_wake(stale_at);
+                include_deadline(stale_at);
             }
         }
 
@@ -3211,7 +3211,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             self.established_links.remove(&link_id);
         }
 
-        next_wake
+        deadline
     }
 
     fn handle_keepalive(&mut self, link_id: LinkId, data: &[u8]) {
