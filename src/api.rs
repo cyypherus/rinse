@@ -123,45 +123,48 @@ pub(crate) enum Command {
     Shutdown,
 }
 
-async fn ask<T>(
-    commands: &async_channel::Sender<Command>,
-    command: impl FnOnce(Reply<T>) -> Command,
-) -> Option<T> {
-    let (reply, result) = oneshot::channel();
-    commands.send(command(reply)).await.ok()?;
-    result.await.ok()
-}
-
 #[derive(Clone, Copy)]
-pub(crate) enum DroppedResource {
+pub(crate) enum RegisteredResource {
     Service(ServiceId),
     Link(LinkId),
     Channel(LinkId),
 }
 
-pub(crate) struct DropNotice {
-    lifecycle: async_channel::Sender<DroppedResource>,
-    dropped: DroppedResource,
+#[derive(Clone)]
+pub(crate) struct NodeClient {
+    pub(crate) commands: async_channel::Sender<Command>,
+    pub(crate) resource_drops: async_channel::Sender<RegisteredResource>,
 }
 
-impl DropNotice {
-    pub(crate) fn new(
-        lifecycle: async_channel::Sender<DroppedResource>,
-        dropped: DroppedResource,
-    ) -> Self {
-        Self { lifecycle, dropped }
-    }
-}
-
-impl Drop for DropNotice {
-    fn drop(&mut self) {
-        match self.lifecycle.try_send(self.dropped) {
-            Ok(()) | Err(async_channel::TrySendError::Closed(_)) => {}
-            Err(async_channel::TrySendError::Full(_)) => {
-                unreachable!("lifecycle capacity covers every live resource")
-            }
+impl NodeClient {
+    fn resource_dropped(&self, resource: RegisteredResource) {
+        if let Err(async_channel::TrySendError::Full(_)) = self.resource_drops.try_send(resource) {
+            unreachable!("lifecycle capacity covers every live resource");
         }
     }
+}
+
+pub(crate) struct ResourceRegistration {
+    client: NodeClient,
+    resource: RegisteredResource,
+}
+
+impl ResourceRegistration {
+    pub(crate) fn new(client: NodeClient, resource: RegisteredResource) -> Self {
+        Self { client, resource }
+    }
+}
+
+impl Drop for ResourceRegistration {
+    fn drop(&mut self) {
+        self.client.resource_dropped(self.resource);
+    }
+}
+
+async fn ask<T>(client: &NodeClient, command: impl FnOnce(Reply<T>) -> Command) -> Option<T> {
+    let (reply, result) = oneshot::channel();
+    client.commands.send(command(reply)).await.ok()?;
+    result.await.ok()
 }
 
 pub(crate) type ShutdownFuture =
@@ -169,8 +172,7 @@ pub(crate) type ShutdownFuture =
 
 #[derive(Clone)]
 pub struct NodeHandle {
-    pub(crate) commands: async_channel::Sender<Command>,
-    pub(crate) _resource_lifecycle: async_channel::Sender<DroppedResource>,
+    pub(crate) client: NodeClient,
     pub(crate) shutdown: ShutdownFuture,
 }
 
@@ -185,7 +187,7 @@ impl NodeHandle {
     where
         I: Interface + Send + 'static,
     {
-        ask(&self.commands, |reply| Command::AttachInterface {
+        ask(&self.client, |reply| Command::AttachInterface {
             interface: Arc::new(interface),
             limits,
             reply,
@@ -195,13 +197,13 @@ impl NodeHandle {
     }
 
     pub async fn generate_identity(&self) -> Result<PrivateIdentity, NodeError> {
-        ask(&self.commands, |reply| Command::GenerateIdentity { reply })
+        ask(&self.client, |reply| Command::GenerateIdentity { reply })
             .await
             .unwrap_or(Err(NodeError::NodeStopping))
     }
 
     pub async fn register_service(&self, config: ServiceConfig) -> Result<Service, NodeError> {
-        ask(&self.commands, |reply| Command::RegisterService {
+        ask(&self.client, |reply| Command::RegisterService {
             config: Box::new(config),
             reply,
         })
@@ -213,7 +215,7 @@ impl NodeHandle {
         if body.len() > Self::MAX_DATAGRAM_BYTES {
             return Err(SendError::PayloadTooLarge);
         }
-        ask(&self.commands, |reply| Command::SendDestination {
+        ask(&self.client, |reply| Command::SendDestination {
             destination,
             body,
             reply,
@@ -223,7 +225,7 @@ impl NodeHandle {
     }
 
     pub async fn open_link(&self, destination: Destination) -> Result<Link, LinkError> {
-        ask(&self.commands, |reply| Command::OpenLink {
+        ask(&self.client, |reply| Command::OpenLink {
             destination,
             reply,
         })
@@ -232,7 +234,7 @@ impl NodeHandle {
     }
 
     pub async fn shutdown(&self) -> ShutdownReport {
-        let _ = self.commands.send(Command::Shutdown).await;
+        let _ = self.client.commands.send(Command::Shutdown).await;
         self.shutdown.clone().await
     }
 }
@@ -240,8 +242,7 @@ impl NodeHandle {
 pub struct Service {
     pub(crate) id: ServiceId,
     pub(crate) destination: Destination,
-    pub(crate) commands: async_channel::Sender<Command>,
-    pub(crate) _drop_notice: DropNotice,
+    pub(crate) registration: ResourceRegistration,
 }
 
 impl Service {
@@ -260,7 +261,7 @@ impl Service {
         if application_data.len() > Self::MAX_ANNOUNCEMENT_BYTES {
             return Err(AnnounceError::ApplicationDataTooLarge);
         }
-        ask(&self.commands, |reply| Command::Announce {
+        ask(&self.registration.client, |reply| Command::Announce {
             service: self.id,
             application_data,
             ratchet,
@@ -271,7 +272,7 @@ impl Service {
     }
 
     pub async fn receive(&mut self) -> Result<ServiceEvent, ServiceReceiveError> {
-        ask(&self.commands, |reply| Command::ReceiveService {
+        ask(&self.registration.client, |reply| Command::ReceiveService {
             service: self.id,
             reply,
         })
@@ -307,12 +308,12 @@ impl DiscoveredService {
 
 pub struct IncomingLink {
     pub(crate) offer: LinkOfferId,
-    pub(crate) commands: async_channel::Sender<Command>,
+    pub(crate) client: NodeClient,
 }
 
 impl IncomingLink {
     pub async fn accept(self) -> Result<Link, LinkError> {
-        ask(&self.commands, |reply| Command::AcceptLink {
+        ask(&self.client, |reply| Command::AcceptLink {
             offer: self.offer,
             reply,
         })
@@ -321,7 +322,7 @@ impl IncomingLink {
     }
 
     pub async fn reject(self) -> Result<(), LinkError> {
-        ask(&self.commands, |reply| Command::RejectLink {
+        ask(&self.client, |reply| Command::RejectLink {
             offer: self.offer,
             reply,
         })
@@ -331,18 +332,21 @@ impl IncomingLink {
 }
 
 pub struct Link {
-    pub(crate) sender: LinkSender,
-    pub(crate) _drop_notice: DropNotice,
+    pub(crate) id: LinkId,
+    pub(crate) registration: ResourceRegistration,
 }
 
 impl Link {
     pub fn send_handle(&self) -> LinkSender {
-        self.sender.clone()
+        LinkSender {
+            id: self.id,
+            client: self.registration.client.clone(),
+        }
     }
 
     pub async fn receive(&mut self) -> Result<LinkEvent, LinkReceiveError> {
-        ask(&self.sender.commands, |reply| Command::ReceiveLink {
-            link: self.sender.id,
+        ask(&self.registration.client, |reply| Command::ReceiveLink {
+            link: self.id,
             reply,
         })
         .await
@@ -350,8 +354,8 @@ impl Link {
     }
 
     pub async fn close(self) -> Result<(), LinkError> {
-        ask(&self.sender.commands, |reply| Command::CloseLink {
-            link: self.sender.id,
+        ask(&self.registration.client, |reply| Command::CloseLink {
+            link: self.id,
             reply,
         })
         .await
@@ -362,7 +366,7 @@ impl Link {
 #[derive(Clone)]
 pub struct LinkSender {
     pub(crate) id: LinkId,
-    pub(crate) commands: async_channel::Sender<Command>,
+    pub(crate) client: NodeClient,
 }
 
 impl LinkSender {
@@ -373,7 +377,7 @@ impl LinkSender {
         if body.len() > Self::MAX_DATAGRAM_BYTES {
             return Err(LinkError::PayloadTooLarge);
         }
-        ask(&self.commands, |reply| Command::SendLinkDatagram {
+        ask(&self.client, |reply| Command::SendLinkDatagram {
             link: self.id,
             body,
             reply,
@@ -386,7 +390,7 @@ impl LinkSender {
         if body.len() > Self::MAX_REQUEST_BODY_BYTES {
             return Err(LinkError::PayloadTooLarge);
         }
-        ask(&self.commands, |reply| Command::Request {
+        ask(&self.client, |reply| Command::Request {
             link: self.id,
             path,
             body,
@@ -397,7 +401,7 @@ impl LinkSender {
     }
 
     pub async fn open_channel(&self) -> Result<Channel, ChannelError> {
-        ask(&self.commands, |reply| Command::OpenChannel {
+        ask(&self.client, |reply| Command::OpenChannel {
             link: self.id,
             reply,
         })
@@ -408,10 +412,15 @@ impl LinkSender {
 
 impl Service {
     pub async fn identify_on(&self, link: &LinkSender) -> Result<(), IdentifyError> {
-        if !self.commands.same_channel(&link.commands) {
+        if !self
+            .registration
+            .client
+            .commands
+            .same_channel(&link.client.commands)
+        {
             return Err(IdentifyError::DifferentNode);
         }
-        ask(&self.commands, |reply| Command::Identify {
+        ask(&self.registration.client, |reply| Command::Identify {
             link: link.id,
             service: self.id,
             reply,
@@ -443,7 +452,7 @@ pub struct IncomingRequest {
     pub(crate) id: IncomingRequestId,
     pub(crate) path: RequestPath,
     pub(crate) body: Bytes,
-    pub(crate) commands: async_channel::Sender<Command>,
+    pub(crate) client: NodeClient,
 }
 
 impl IncomingRequest {
@@ -460,7 +469,7 @@ impl IncomingRequest {
         if response.len() > Self::MAX_RESPONSE_BYTES {
             return Err(LinkError::PayloadTooLarge);
         }
-        ask(&self.commands, |reply| Command::Respond {
+        ask(&self.client, |reply| Command::Respond {
             link: self.link,
             request: self.id,
             response,
@@ -472,17 +481,20 @@ impl IncomingRequest {
 }
 
 pub struct Channel {
-    pub(crate) sender: ChannelSender,
-    pub(crate) _drop_notice: DropNotice,
+    pub(crate) link: LinkId,
+    pub(crate) registration: ResourceRegistration,
 }
 
 impl Channel {
     pub fn send_handle(&self) -> ChannelSender {
-        self.sender.clone()
+        ChannelSender {
+            link: self.link,
+            client: self.registration.client.clone(),
+        }
     }
     pub async fn receive(&mut self) -> Result<ChannelReceive, ChannelReceiveError> {
-        ask(&self.sender.commands, |reply| Command::ReceiveChannel {
-            link: self.sender.link,
+        ask(&self.registration.client, |reply| Command::ReceiveChannel {
+            link: self.link,
             reply,
         })
         .await
@@ -493,12 +505,12 @@ impl Channel {
 #[derive(Clone)]
 pub struct ChannelSender {
     pub(crate) link: LinkId,
-    pub(crate) commands: async_channel::Sender<Command>,
+    pub(crate) client: NodeClient,
 }
 
 impl ChannelSender {
     pub async fn send(&self, message: ChannelMessage) -> Result<(), ChannelError> {
-        ask(&self.commands, |reply| Command::SendChannel {
+        ask(&self.client, |reply| Command::SendChannel {
             link: self.link,
             message,
             reply,
@@ -508,7 +520,7 @@ impl ChannelSender {
     }
 
     pub async fn open_buffer(&self, stream: StreamId) -> Result<BufferSender, BufferError> {
-        ask(&self.commands, |reply| Command::OpenBuffer {
+        ask(&self.client, |reply| Command::OpenBuffer {
             link: self.link,
             stream,
             reply,
@@ -518,7 +530,7 @@ impl ChannelSender {
         Ok(BufferSender {
             link: self.link,
             stream,
-            commands: self.commands.clone(),
+            client: self.client.clone(),
         })
     }
 }
@@ -540,7 +552,7 @@ pub enum BufferChunk {
 pub struct BufferSender {
     link: LinkId,
     stream: StreamId,
-    commands: async_channel::Sender<Command>,
+    client: NodeClient,
 }
 
 impl BufferSender {
@@ -551,7 +563,7 @@ impl BufferSender {
         if input.len() > crate::buffer::MAX_INPUT_BYTES {
             return Err(BufferError::InputTooLarge);
         }
-        ask(&self.commands, |reply| Command::WriteBuffer {
+        ask(&self.client, |reply| Command::WriteBuffer {
             link: self.link,
             stream: self.stream,
             input,
@@ -569,7 +581,7 @@ impl BufferSender {
         let mut queued = 0;
         while queued < input.len() {
             let remaining = input.slice(queued..);
-            let result = ask(&self.commands, |reply| Command::FinishBuffer {
+            let result = ask(&self.client, |reply| Command::FinishBuffer {
                 link: self.link,
                 stream: self.stream,
                 input: remaining,
@@ -582,7 +594,7 @@ impl BufferSender {
                 return Ok(queued);
             }
         }
-        let result = ask(&self.commands, |reply| Command::FinishBuffer {
+        let result = ask(&self.client, |reply| Command::FinishBuffer {
             link: self.link,
             stream: self.stream,
             input: Bytes::new(),

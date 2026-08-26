@@ -412,17 +412,6 @@ impl NodeOwner {
         request.local
     }
 
-    #[cfg(all(test, any()))]
-    pub fn request(
-        &mut self,
-        _service: ServiceId,
-        link: LinkId,
-        path: &str,
-        data: &[u8],
-    ) -> Option<RequestId> {
-        self.request_checked(link, path, data).ok()
-    }
-
     pub(crate) fn prepare_response(
         &mut self,
         link_id: LinkId,
@@ -545,17 +534,6 @@ impl NodeOwner {
                 self.outbound_multi_segments.insert(hash, transfer);
             }
         }
-    }
-
-    #[cfg(all(test, any()))]
-    pub fn respond(
-        &mut self,
-        request_id: RequestId,
-        data: &[u8],
-        metadata: Option<&[u8]>,
-        compress: bool,
-    ) {
-        let _ = self.respond_checked(request_id, data, metadata, compress);
     }
 
     pub fn add_service(
@@ -797,16 +775,6 @@ impl NodeOwner {
         })
     }
 
-    #[cfg(all(test, any()))]
-    pub fn send_raw(
-        &mut self,
-        destination: DestinationAddress,
-        data: &[u8],
-    ) -> Result<(), SendError> {
-        self.prepare_destination_datagram(destination, data)
-            .map(|_| ())
-    }
-
     pub(crate) fn prepare_link_datagram(
         &mut self,
         link: LinkId,
@@ -985,135 +953,6 @@ impl NodeOwner {
         ) {
             link.local_identity = crate::link::LocalIdentityState::Bound(identify.identity);
         }
-    }
-
-    #[cfg(all(test, any()))]
-    pub fn self_identify(&mut self, link: crate::LinkHandle, identity: &crate::PrivateIdentity) {
-        let _ = self.authenticate_to_link_peer(link, identity);
-    }
-
-    #[cfg(all(test, any()))]
-    pub(crate) fn link_request(
-        &mut self,
-        link: crate::LinkHandle,
-        path: &str,
-        data: &[u8],
-        now: MonoTime,
-    ) -> Option<RequestId> {
-        use crate::packet::RoutedDestination;
-
-        let link_entry = self.established_links.get_mut(&link.0)?;
-        if !link_entry.is_active() {
-            return None;
-        }
-
-        let req = Request::new(path, data.to_vec());
-        let encoded = req.encode();
-        let ciphertext = link_entry.encrypt(&mut self.rng, &encoded);
-        let target_interface = link_entry.receiving_interface;
-
-        let packet = Packet::LinkData {
-            hops: 0,
-            destination: RoutedDestination::direct(link.0),
-            context: LinkContext::Request,
-            data: ciphertext,
-        };
-
-        let mut id_bytes = [0u8; 16];
-        self.rng.fill_bytes(&mut id_bytes);
-        let local_request_id = RequestId(id_bytes);
-        let wire_request_id = WireRequestId(packet.packet_hash()[..16].try_into().unwrap());
-
-        let service_id = self
-            .services
-            .iter()
-            .position(Option::is_some)
-            .map(ServiceId)
-            .unwrap_or(ServiceId(0));
-        link_entry
-            .pending_requests
-            .insert(wire_request_id, (service_id, local_request_id));
-
-        if self.queue_packet(target_interface, packet.clone(), 0) {
-            self.stats.packets_sent += 1;
-            self.stats.bytes_sent += packet.to_bytes().len() as u64;
-        }
-
-        if let Some(link_entry) = self.established_links.get_mut(&link.0) {
-            link_entry.touch_outbound(now);
-        }
-
-        Some(local_request_id)
-    }
-
-    #[cfg(all(test, any()))]
-    pub(crate) fn offer_resource(
-        &mut self,
-        link: crate::LinkHandle,
-        data: Vec<u8>,
-        metadata: Option<Vec<u8>>,
-        compress: bool,
-    ) -> Option<crate::link_handle::ResourceHandle> {
-        use crate::packet::RoutedDestination;
-
-        let established = self.established_links.get(&link.0)?;
-        if !established.is_active() {
-            return None;
-        }
-        let target_interface = established.receiving_interface;
-
-        let mut resource = crate::resource::OutboundResource::new_segment(
-            &mut self.rng,
-            established,
-            data,
-            metadata,
-            compress,
-            None,
-            crate::resource::ResourceSegment::First {
-                total_data_size: None,
-            },
-        );
-
-        let adv = resource.advertisement(91);
-        let adv_data = adv.encode();
-        let hash = resource.hash;
-
-        let ciphertext = established.encrypt(&mut self.rng, &adv_data);
-        let packet = Packet::LinkData {
-            hops: 0,
-            destination: RoutedDestination::direct(link.0),
-            context: LinkContext::ResourceAdv,
-            data: ciphertext,
-        };
-
-        self.outbound_resources.insert(hash, (link.0, resource));
-
-        if self.queue_packet(target_interface, packet.clone(), 0) {
-            self.stats.packets_sent += 1;
-            self.stats.bytes_sent += packet.to_bytes().len() as u64;
-        }
-
-        Some(crate::link_handle::ResourceHandle(hash))
-    }
-
-    #[cfg(all(test, any()))]
-    fn resource_progress(&self, resource: crate::link_handle::ResourceHandle) -> Option<f32> {
-        if let Some((_, outbound)) = self.outbound_resources.get(&resource.0) {
-            let total = outbound.transfer_size();
-            if total == 0 {
-                return Some(1.0);
-            }
-            return Some(0.0);
-        }
-        if let Some((_, inbound)) = self.inbound_resources.get(&resource.0) {
-            let received = inbound.received_count();
-            let total = inbound.num_parts();
-            if total == 0 {
-                return Some(1.0);
-            }
-            return Some(received as f32 / total as f32);
-        }
-        None
     }
 
     pub(crate) fn begin_outbound_link(
@@ -3070,8 +2909,6 @@ impl NodeOwner {
                 );
                 let mut completed = None;
                 let mut need_more = None;
-                #[cfg(all(test, any()))]
-                let mut progress_event = None;
                 for (hash, (res_link_id, resource)) in &mut self.inbound_resources {
                     if *res_link_id == link_id {
                         let accepted = resource.receive_part(plaintext.to_vec());
@@ -3083,41 +2920,6 @@ impl NodeOwner {
                             resource.outstanding_parts()
                         );
                         if accepted {
-                            // Emit progress event if this is a response with a request_id
-                            #[cfg(all(test, any()))]
-                            if let Some(ref req_id_bytes) = resource.request_id
-                                && let Some(wire_req_id) = req_id_bytes
-                                    .get(..16)
-                                    .and_then(|b| <[u8; 16]>::try_from(b).ok())
-                                    .map(WireRequestId)
-                            {
-                                let (received_bytes, total_bytes) = if resource.total_segments > 1 {
-                                    let accumulated = self
-                                        .multi_segment_transfers
-                                        .get(&resource.original_hash)
-                                        .map(|t| t.accumulated_data.len())
-                                        .unwrap_or(0);
-                                    let current_received = resource.bytes_received();
-                                    let current_total = resource.total_bytes();
-                                    let remaining =
-                                        resource.total_segments - resource.segment_index;
-                                    (
-                                        accumulated + current_received,
-                                        accumulated + current_total + remaining * current_total,
-                                    )
-                                } else {
-                                    (resource.bytes_received(), resource.total_bytes())
-                                };
-                                progress_event = Some((
-                                    wire_req_id,
-                                    resource.original_hash,
-                                    resource.received_count(),
-                                    resource.num_parts(),
-                                    received_bytes,
-                                    total_bytes,
-                                ));
-                            }
-
                             if resource.is_complete() {
                                 completed = Some(*hash);
                             } else {
@@ -3129,38 +2931,6 @@ impl NodeOwner {
                             }
                         }
                         break;
-                    }
-                }
-
-                // Emit progress event
-                #[cfg(all(test, any()))]
-                if let Some((
-                    wire_req_id,
-                    original_hash,
-                    _,
-                    total_parts,
-                    received_bytes,
-                    total_bytes,
-                )) = progress_event
-                {
-                    // Try pending_requests first (first segment), then multi_segment_transfers (continuation)
-                    let request_info = self
-                        .established_links
-                        .get(&link_id)
-                        .and_then(|link| link.pending_requests.get(&wire_req_id).copied())
-                        .or_else(|| {
-                            self.multi_segment_transfers
-                                .get(&original_hash)
-                                .map(|t| t.local_request_id)
-                        });
-
-                    if let Some(request_id) = request_info {
-                        self.pending_events.push(ProtocolEvent::ResourceProgress {
-                            request_id,
-                            total_parts,
-                            received_bytes,
-                            total_bytes,
-                        });
                     }
                 }
 

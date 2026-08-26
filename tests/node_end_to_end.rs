@@ -10,7 +10,8 @@ use rinse::{
     BufferChunk, ChannelMessage, ChannelReceive, Clock, EmbassyClock, InboundPacket,
     InlinePacketWork, Interface, InterfaceError, InterfaceLimits, Link, LinkEvent, MessageType,
     MonoTime, NodeBuilder, NodeConfig, OutboundPacket, PrivateIdentity, RatchetAction, RequestPath,
-    SendError, Service, ServiceConfig, ServiceEvent, ServiceName, StreamId, SystemEntropy,
+    SendError, Service, ServiceConfig, ServiceEvent, ServiceName, ShutdownReason, StreamId,
+    SystemEntropy,
 };
 
 struct MemoryInterface {
@@ -167,6 +168,15 @@ async fn accept_link(service: &mut Service) -> Link {
             return link.accept().await.unwrap();
         }
     }
+}
+
+#[tokio::test]
+async fn dropping_the_last_client_stops_the_node() {
+    let (interface, _peer, _) = connected_interfaces();
+    let (node, task) = node(interface);
+    drop(node);
+    let report = task.run().await.unwrap();
+    assert_eq!(report.reason, ShutdownReason::LastHandleDropped);
 }
 
 #[tokio::test]

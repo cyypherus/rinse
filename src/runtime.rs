@@ -85,12 +85,13 @@ where
             .into_iter()
             .map(|(interface, limits)| InterfaceSlot::new(interface, limits))
             .collect();
-        let (command_tx, command_rx) = async_channel::bounded(self.config.limits.command_capacity);
-        let weak_command_sender = command_tx.downgrade();
-        let (lifecycle_tx, lifecycle_rx) = async_channel::bounded(
+        let (command_sender, command_receiver) =
+            async_channel::bounded(self.config.limits.command_capacity);
+        let commands_for_new_clients = command_sender.downgrade();
+        let (resource_drop_sender, resource_drop_receiver) = async_channel::bounded(
             self.config.limits.maximum_services + self.config.limits.maximum_links * 2,
         );
-        let weak_lifecycle_sender = lifecycle_tx.downgrade();
+        let resource_drops_for_new_clients = resource_drop_sender.downgrade();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let shutdown = async move {
             shutdown_rx.await.unwrap_or(ShutdownReport {
@@ -104,8 +105,10 @@ where
         .boxed()
         .shared();
         let handle = NodeHandle {
-            commands: command_tx,
-            _resource_lifecycle: lifecycle_tx,
+            client: NodeClient {
+                commands: command_sender,
+                resource_drops: resource_drop_sender,
+            },
             shutdown,
         };
         let (work_tx, work_rx) = async_channel::bounded(self.config.limits.preparation_in_flight);
@@ -145,10 +148,10 @@ where
                 pending_path_requests: HashMap::new(),
                 discovery_path_requests: HashMap::new(),
                 pending_resource_requests: HashSet::new(),
-                commands: Some(command_rx),
-                weak_command_sender,
-                lifecycle: Some(lifecycle_rx),
-                weak_lifecycle_sender,
+                command_receiver: Some(command_receiver),
+                commands_for_new_clients,
+                resource_drop_receiver: Some(resource_drop_receiver),
+                resource_drops_for_new_clients,
                 interfaces,
                 send_operations: FuturesUnordered::new(),
                 close_operations: FuturesUnordered::new(),
@@ -428,10 +431,10 @@ pub(crate) struct NodeOwner {
     pub(crate) pending_path_requests: HashMap<crate::packet::DestinationAddress, MonoTime>,
     pub(crate) discovery_path_requests: HashMap<crate::packet::DestinationAddress, usize>,
     pub(crate) pending_resource_requests: HashSet<([u8; 16], [u8; 32])>,
-    commands: Option<async_channel::Receiver<Command>>,
-    weak_command_sender: async_channel::WeakSender<Command>,
-    lifecycle: Option<async_channel::Receiver<DroppedResource>>,
-    weak_lifecycle_sender: async_channel::WeakSender<DroppedResource>,
+    command_receiver: Option<async_channel::Receiver<Command>>,
+    commands_for_new_clients: async_channel::WeakSender<Command>,
+    resource_drop_receiver: Option<async_channel::Receiver<RegisteredResource>>,
+    resource_drops_for_new_clients: async_channel::WeakSender<RegisteredResource>,
     pub(crate) interfaces: Vec<InterfaceSlot>,
     send_operations: FuturesUnordered<InterfaceOperation>,
     close_operations: FuturesUnordered<InterfaceOperation>,
@@ -487,7 +490,7 @@ enum WaitingChannelOperation {
 
 enum RuntimeEvent {
     Command(Result<Command, async_channel::RecvError>),
-    Lifecycle(Result<DroppedResource, async_channel::RecvError>),
+    ResourceDropped(Result<RegisteredResource, async_channel::RecvError>),
     Sent((InterfaceId, Result<(), crate::InterfaceError>)),
     Closed((InterfaceId, Result<(), crate::InterfaceError>)),
     PipelineStopped(PipelineStopped),
@@ -581,8 +584,9 @@ where
             }
             let deadline = owner.timers.next_deadline();
             let event = {
-                let command = receive_if_present(owner.commands.as_ref()).fuse();
-                let lifecycle = receive_if_present(owner.lifecycle.as_ref()).fuse();
+                let command = receive_if_present(owner.command_receiver.as_ref()).fuse();
+                let resource_dropped =
+                    receive_if_present(owner.resource_drop_receiver.as_ref()).fuse();
                 let send = next_operation(&mut owner.send_operations).fuse();
                 let close = next_operation(&mut owner.close_operations).fuse();
                 let pipeline = next_operation(&mut owner.pipeline_tasks).fuse();
@@ -594,10 +598,18 @@ where
                     }
                 }
                 .fuse();
-                futures_util::pin_mut!(command, lifecycle, send, close, pipeline, prepared, timer);
+                futures_util::pin_mut!(
+                    command,
+                    resource_dropped,
+                    send,
+                    close,
+                    pipeline,
+                    prepared,
+                    timer
+                );
                 futures_util::select_biased! {
                     command = command => RuntimeEvent::Command(command),
-                    lifecycle = lifecycle => RuntimeEvent::Lifecycle(lifecycle),
+                    dropped = resource_dropped => RuntimeEvent::ResourceDropped(dropped),
                     send = send => RuntimeEvent::Sent(send),
                     close = close => RuntimeEvent::Closed(close),
                     pipeline = pipeline => RuntimeEvent::PipelineStopped(pipeline),
@@ -609,13 +621,15 @@ where
             match event {
                 RuntimeEvent::Command(Ok(command)) => owner.handle_command(command, now),
                 RuntimeEvent::Command(Err(_)) => {
-                    owner.commands = None;
+                    owner.command_receiver = None;
                     if matches!(owner.phase, NodePhase::Running) {
                         owner.begin_shutdown(ShutdownReason::LastHandleDropped, now);
                     }
                 }
-                RuntimeEvent::Lifecycle(Ok(resource)) => owner.handle_dropped_resource(resource),
-                RuntimeEvent::Lifecycle(Err(_)) => owner.lifecycle = None,
+                RuntimeEvent::ResourceDropped(Ok(resource)) => {
+                    owner.handle_dropped_resource(resource)
+                }
+                RuntimeEvent::ResourceDropped(Err(_)) => owner.resource_drop_receiver = None,
                 RuntimeEvent::Sent(result) => owner.handle_send_completion(result)?,
                 RuntimeEvent::Closed(result) => owner.handle_close_completion(result)?,
                 RuntimeEvent::PipelineStopped(PipelineStopped::Interface(interface)) => {
@@ -650,6 +664,13 @@ where
 }
 
 impl NodeOwner {
+    fn new_client(&self) -> Option<NodeClient> {
+        Some(NodeClient {
+            commands: self.commands_for_new_clients.upgrade()?,
+            resource_drops: self.resource_drops_for_new_clients.upgrade()?,
+        })
+    }
+
     pub(crate) fn outbound_interfaces(
         interfaces: &[InterfaceSlot],
     ) -> impl Iterator<Item = usize> + '_ {
@@ -659,15 +680,15 @@ impl NodeOwner {
             .filter_map(|(id, interface)| interface.accepts_outbound().then_some(id))
     }
 
-    fn handle_dropped_resource(&mut self, resource: DroppedResource) {
+    fn handle_dropped_resource(&mut self, resource: RegisteredResource) {
         match resource {
-            DroppedResource::Service(service) => {
+            RegisteredResource::Service(service) => {
                 for link in self.remove_service(service) {
                     self.close_link(link, LinkCloseReason::LocalClosed);
                 }
             }
-            DroppedResource::Link(link) => self.close_link(link.0, LinkCloseReason::LocalClosed),
-            DroppedResource::Channel(link) => {
+            RegisteredResource::Link(link) => self.close_link(link.0, LinkCloseReason::LocalClosed),
+            RegisteredResource::Channel(link) => {
                 self.close_link_channel(link.0, ChannelReceiveError::ChannelClosed)
             }
         }
@@ -808,7 +829,7 @@ impl NodeOwner {
     }
 
     fn deliver_waiting_request(&mut self, link: [u8; 16]) {
-        let Some(commands) = self.weak_command_sender.upgrade() else {
+        let Some(client) = self.new_client() else {
             return;
         };
         let mut event_queue_closed = false;
@@ -832,7 +853,7 @@ impl NodeOwner {
                 id: IncomingRequestId(request),
                 path,
                 body,
-                commands: commands.clone(),
+                client: client.clone(),
             };
             match events.events.push(LinkEvent::Request(incoming), 0) {
                 Ok(()) => {
@@ -935,19 +956,16 @@ impl NodeOwner {
                     restart_ratchet,
                     events,
                 );
-                let commands = self
-                    .weak_command_sender
-                    .upgrade()
-                    .expect("command sender disappeared while registering service");
-                let lifecycle = self
-                    .weak_lifecycle_sender
-                    .upgrade()
-                    .expect("lifecycle sender disappeared while registering service");
+                let client = self
+                    .new_client()
+                    .expect("node client disappeared while registering service");
                 let _ = reply.send(Ok(Service {
                     id,
                     destination,
-                    commands,
-                    _drop_notice: DropNotice::new(lifecycle, DroppedResource::Service(id)),
+                    registration: ResourceRegistration::new(
+                        client,
+                        RegisteredResource::Service(id),
+                    ),
                 }));
             }
             Command::ReceiveService { service, reply } => {
@@ -1031,22 +1049,14 @@ impl NodeOwner {
                         .get_mut(&offer.0)
                         .expect("accepted link disappeared")
                         .events = Some(events);
-                    let commands = self
-                        .weak_command_sender
-                        .upgrade()
-                        .expect("command sender disappeared while accepting link");
-                    let lifecycle = self
-                        .weak_lifecycle_sender
-                        .upgrade()
-                        .expect("lifecycle sender disappeared while accepting link");
+                    let client = self
+                        .new_client()
+                        .expect("node client disappeared while accepting link");
                     let _ = reply.send(Ok(Link {
-                        sender: LinkSender {
-                            id: LinkId(offer.0),
-                            commands,
-                        },
-                        _drop_notice: DropNotice::new(
-                            lifecycle,
-                            DroppedResource::Link(LinkId(offer.0)),
+                        id: LinkId(offer.0),
+                        registration: ResourceRegistration::new(
+                            client,
+                            RegisteredResource::Link(LinkId(offer.0)),
                         ),
                     }));
                 } else {
@@ -1202,17 +1212,15 @@ impl NodeOwner {
                         ended_incoming_streams: HashSet::new(),
                         pending_delivery_replies: HashMap::new(),
                     });
-                    let commands = self
-                        .weak_command_sender
-                        .upgrade()
-                        .expect("command sender disappeared while opening channel");
-                    let lifecycle = self
-                        .weak_lifecycle_sender
-                        .upgrade()
-                        .expect("lifecycle sender disappeared while opening channel");
+                    let client = self
+                        .new_client()
+                        .expect("node client disappeared while opening channel");
                     let _ = reply.send(Ok(Channel {
-                        sender: ChannelSender { link, commands },
-                        _drop_notice: DropNotice::new(lifecycle, DroppedResource::Channel(link)),
+                        link,
+                        registration: ResourceRegistration::new(
+                            client,
+                            RegisteredResource::Channel(link),
+                        ),
                     }));
                 }
                 Err(QueueChannelError::AlreadyOpen) => {
@@ -1485,13 +1493,13 @@ impl NodeOwner {
     }
 
     pub(crate) fn enqueue_incoming_link(&mut self, service: ServiceId, link: [u8; 16]) {
-        let Some(commands) = self.weak_command_sender.upgrade() else {
+        let Some(client) = self.new_client() else {
             self.reject_incoming_link(link);
             return;
         };
         let incoming = IncomingLink {
             offer: LinkOfferId(link),
-            commands,
+            client,
         };
         let queued = self
             .services
@@ -1522,17 +1530,13 @@ impl NodeOwner {
             .get_mut(&link)
             .expect("established link disappeared")
             .events = Some(pending.events);
-        if let Some(commands) = self.weak_command_sender.upgrade() {
-            let lifecycle = self
-                .weak_lifecycle_sender
-                .upgrade()
-                .expect("lifecycle sender disappeared while opening link");
+        if let Some(client) = self.new_client() {
             let _ = pending.reply.send(Ok(Link {
-                sender: LinkSender {
-                    id: LinkId(link),
-                    commands,
-                },
-                _drop_notice: DropNotice::new(lifecycle, DroppedResource::Link(LinkId(link))),
+                id: LinkId(link),
+                registration: ResourceRegistration::new(
+                    client,
+                    RegisteredResource::Link(LinkId(link)),
+                ),
             }));
         } else {
             self.close_link(link, LinkCloseReason::LocalClosed);
@@ -1763,7 +1767,7 @@ impl NodeOwner {
         if !matches!(self.phase, NodePhase::Running) {
             return;
         }
-        if let Some(commands) = self.commands.take() {
+        if let Some(commands) = self.command_receiver.take() {
             commands.close();
         }
         for service in self.services.iter_mut().flatten() {
