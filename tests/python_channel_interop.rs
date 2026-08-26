@@ -1,4 +1,4 @@
-#![cfg(feature = "tcp")]
+#![cfg(all(feature = "tcp", feature = "std-clock"))]
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
@@ -6,8 +6,9 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use rinse::{
-    ChannelMessage, ChannelMessageType, Interface, LinkBufferStreamId, NodeBuilder,
-    PrivateIdentity, TcpTransport,
+    BufferChunk, ChannelMessage, ChannelReceive, Destination, EmbassyClock, InlinePacketWork,
+    InterfaceLimits, MessageType, NodeBuilder, NodeConfig, ServiceConfig, ServiceName, StreamId,
+    SystemEntropy, TcpHdlcInterface as TcpHdlc,
 };
 
 const PYTHON_NODE: &str = r#"
@@ -43,6 +44,13 @@ def buffer_ready(_):
         buffer_received = True
         check_done()
 
+def finish_writer():
+    timeout = time.time() + 2
+    while not channel.is_ready_to_send() and time.time() < timeout:
+        time.sleep(0.01)
+    writer.close()
+    check_done()
+
 def message_received(message):
     global channel_received
     if isinstance(message, BytesMessage) and message.data == b"rust-channel":
@@ -50,11 +58,7 @@ def message_received(message):
         channel.send(BytesMessage(b"python-channel"))
         writer.write(b"python-buffer")
         writer.flush()
-        timeout = time.time() + 2
-        while not channel.is_ready_to_send() and time.time() < timeout:
-            time.sleep(0.01)
-        writer.close()
-        check_done()
+        threading.Thread(target=finish_writer, daemon=True).start()
         return True
     return False
 
@@ -135,77 +139,88 @@ async fn python_and_rust_exchange_channels_and_buffers() {
     };
     let destination: [u8; 16] = hex::decode(destination.trim()).unwrap().try_into().unwrap();
 
-    let mut builder: NodeBuilder<TcpTransport> = NodeBuilder::non_forwarding_endpoint();
-    let mut rng = rand::thread_rng();
-    let service = builder
-        .register_local_service(
-            "rinseinterop.client",
-            &[],
-            &PrivateIdentity::generate(&mut rng),
-        )
-        .id;
-    let transport = TcpTransport::connect(&format!("127.0.0.1:{port}"))
+    let interface = TcpHdlc::connect(&format!("127.0.0.1:{port}"))
         .await
         .unwrap();
-    builder.add_initial_interface(Interface::new(transport));
-    let (node, runtime) = builder.build();
-    let client = node.clone();
-    let run = tokio::spawn(runtime.run());
-
-    tokio::time::timeout(Duration::from_secs(10), client.ensure_route_to(destination))
-        .await
-        .unwrap()
-        .unwrap();
-    let link = tokio::time::timeout(
-        Duration::from_secs(10),
-        client.establish_link_from(service, destination),
+    let builder = NodeBuilder::new(
+        NodeConfig::endpoint(),
+        EmbassyClock,
+        InlinePacketWork,
+        SystemEntropy,
     )
-    .await
-    .unwrap()
-    .unwrap();
-
-    client
-        .queue_channel_message(
-            link,
-            ChannelMessage::new(
-                ChannelMessageType::new(0x0101).unwrap(),
-                b"rust-channel".to_vec(),
+    .interface(
+        interface,
+        InterfaceLimits::new(2048, 256, 1_048_576).unwrap(),
+    );
+    let (node, runtime) = builder.build().unwrap();
+    let run = tokio::spawn(runtime.run());
+    let identity = node.generate_identity().await.unwrap();
+    let service = node
+        .register_service(
+            ServiceConfig::new(
+                ServiceName::new("rinseinterop.client").unwrap(),
+                identity,
+                [],
+                None,
             )
             .unwrap(),
         )
         .await
         .unwrap();
-    let (_, message) = tokio::time::timeout(
+
+    let link = tokio::time::timeout(
         Duration::from_secs(10),
-        client.recv_channel_message(service),
+        node.open_link(Destination::from_bytes(destination)),
     )
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(message.message_type().as_u16(), 0x0101);
-    assert_eq!(message.data(), b"python-channel");
-
-    let mut buffer_stream =
-        client.begin_link_buffer_stream(link, LinkBufferStreamId::new(7).unwrap());
+    let mut channel = link.send_handle().open_channel().await.unwrap();
+    let sender = channel.send_handle();
+    sender
+        .send(
+            ChannelMessage::new(
+                MessageType::new(0x0101).unwrap(),
+                bytes::Bytes::from_static(b"rust-channel"),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut buffer = sender.open_buffer(StreamId::new(7).unwrap()).await.unwrap();
     assert_eq!(
-        buffer_stream
-            .queue_data(b"rust-buffer")
+        buffer
+            .write(bytes::Bytes::from_static(b"rust-buffer"))
             .await
-            .unwrap()
-            .input_prefix_bytes_queued,
+            .unwrap(),
         11
     );
-    buffer_stream.finish().await.unwrap();
+    assert_eq!(buffer.finish(bytes::Bytes::new()).await.unwrap(), 0);
 
-    let (_, chunk) = tokio::time::timeout(
-        Duration::from_secs(10),
-        client.recv_link_buffer_stream_chunk(service),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(chunk.stream_id(), LinkBufferStreamId::new(8).unwrap());
-    assert_eq!(chunk.data(), b"python-buffer");
+    let mut message_received = false;
+    let mut buffer_received = Vec::new();
+    while !message_received || buffer_received != b"python-buffer" {
+        match tokio::time::timeout(Duration::from_secs(10), channel.receive())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            ChannelReceive::Message(message) => {
+                assert_eq!(message.message_type().get(), 0x0101);
+                assert_eq!(message.body(), b"python-channel");
+                message_received = true;
+            }
+            ChannelReceive::Buffer { stream, chunk } => {
+                assert_eq!(stream, StreamId::new(8).unwrap());
+                match chunk {
+                    BufferChunk::Data(data) | BufferChunk::End(data) => {
+                        buffer_received.extend_from_slice(&data);
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(service.destination().as_bytes().len(), 16);
 
     let python_result = tokio::task::spawn_blocking(move || {
         loop {
@@ -219,8 +234,12 @@ async fn python_and_rust_exchange_channels_and_buffers() {
     .unwrap();
     assert_eq!(python_result, "PYTHON_RECEIVED");
 
-    run.abort();
-    let _ = child.kill();
-    let _ = child.wait();
+    let report = tokio::time::timeout(Duration::from_secs(10), node.shutdown())
+        .await
+        .unwrap();
+    assert_eq!(run.await.unwrap().unwrap(), report);
+    tokio::task::spawn_blocking(move || child.wait().unwrap())
+        .await
+        .unwrap();
     let _ = std::fs::remove_dir_all(temp);
 }

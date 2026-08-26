@@ -285,6 +285,7 @@ impl Packet {
         }
     }
 
+    #[cfg(test)]
     pub fn from_bytes(raw: &[u8]) -> Result<Self, ParseError> {
         Self::from_vec(raw.to_vec())
     }

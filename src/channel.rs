@@ -1,81 +1,22 @@
+pub(crate) use crate::model::ChannelMessage;
+use crate::{MonoTime, TimeSpan};
 use std::collections::{BTreeMap, VecDeque};
-use std::time::{Duration, Instant};
 
 pub(crate) const CHANNEL_MDU: usize = 425;
 const MAX_WINDOW: u16 = 48;
 const MAX_TRIES: u8 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChannelMessage {
-    message_type: ChannelMessageType,
-    data: Vec<u8>,
-}
-
-impl ChannelMessage {
-    pub fn new(
-        message_type: ChannelMessageType,
-        data: Vec<u8>,
-    ) -> Result<Self, ChannelMessageTooLarge> {
-        if data.len() > CHANNEL_MDU {
-            return Err(ChannelMessageTooLarge {
-                size: data.len(),
-                max: CHANNEL_MDU,
-            });
-        }
-        Ok(Self { message_type, data })
-    }
-
-    pub fn message_type(&self) -> ChannelMessageType {
-        self.message_type
-    }
-
-    pub fn data(&self) -> &[u8] {
-        &self.data
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChannelMessageType(u16);
-
-impl ChannelMessageType {
-    pub fn new(value: u16) -> Result<Self, InvalidChannelMessageType> {
-        if value >= 0xf000 {
-            return Err(InvalidChannelMessageType);
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_u16(self) -> u16 {
-        self.0
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InvalidChannelMessageType;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChannelMessageTooLarge {
-    pub size: usize,
-    pub max: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChannelSendError {
-    LinkNotFound,
-    LinkNotActive,
-    RuntimeStopped,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum QueueChannelError {
     LinkNotFound,
     LinkNotActive,
+    AlreadyOpen,
     WindowFull,
 }
 
 struct OutboundEnvelope {
     packet: crate::packet::Packet,
-    sent_at: Instant,
+    sent_at: MonoTime,
     tries: u8,
 }
 
@@ -117,7 +58,7 @@ impl ChannelState {
         Ok(raw)
     }
 
-    pub(crate) fn track(&mut self, packet: crate::packet::Packet, now: Instant) {
+    pub(crate) fn track(&mut self, packet: crate::packet::Packet, now: MonoTime) {
         self.outbound.push_back(OutboundEnvelope {
             packet,
             sent_at: now,
@@ -136,6 +77,12 @@ impl ChannelState {
         self.outbound.remove(index);
         self.window = (self.window + 1).min(MAX_WINDOW as usize);
         true
+    }
+
+    pub(crate) fn pending_hashes(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
+        self.outbound
+            .iter()
+            .map(|envelope| envelope.packet.packet_hash())
     }
 
     pub(crate) fn receive(&mut self, raw: &[u8]) -> Vec<(u16, Vec<u8>)> {
@@ -161,23 +108,23 @@ impl ChannelState {
         messages
     }
 
-    fn retry_timeout(tries: u8, rtt: Duration, ring_len: usize) -> Duration {
-        let base = rtt.mul_f64(2.5).max(Duration::from_millis(25));
+    fn retry_timeout(tries: u8, rtt: TimeSpan, ring_len: usize) -> TimeSpan {
+        let base = rtt.mul_f64(2.5).max(TimeSpan::from_millis(25));
         base.mul_f64(1.5_f64.powi(tries.saturating_sub(1) as i32))
             .mul_f64(ring_len as f64 + 1.5)
     }
 
     pub(crate) fn retries(
         &mut self,
-        now: Instant,
-        rtt: Duration,
+        now: MonoTime,
+        rtt: TimeSpan,
     ) -> (Vec<crate::packet::Packet>, bool) {
         let ring_len = self.outbound.len();
         let mut retry = Vec::new();
         let mut failed = false;
         for envelope in &mut self.outbound {
             let timeout = Self::retry_timeout(envelope.tries, rtt, ring_len);
-            if now.saturating_duration_since(envelope.sent_at) >= timeout {
+            if now.duration_since(envelope.sent_at) >= timeout {
                 if envelope.tries >= MAX_TRIES {
                     failed = true;
                 } else {
@@ -190,17 +137,17 @@ impl ChannelState {
         (retry, failed)
     }
 
-    pub(crate) fn next_retry(&self, rtt: Duration) -> Option<Instant> {
+    pub(crate) fn next_retry(&self, rtt: TimeSpan) -> Option<MonoTime> {
         let ring_len = self.outbound.len();
         self.outbound
             .iter()
-            .map(|envelope| envelope.sent_at + Self::retry_timeout(envelope.tries, rtt, ring_len))
+            .map(|envelope| {
+                envelope
+                    .sent_at
+                    .checked_add(Self::retry_timeout(envelope.tries, rtt, ring_len))
+                    .expect("channel retry deadline overflow")
+            })
             .min()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_idle(&self) -> bool {
-        self.outbound.is_empty()
     }
 }
 
@@ -232,17 +179,14 @@ mod tests {
     #[test]
     fn rejects_reserved_and_oversized_user_messages() {
         assert_eq!(
-            ChannelMessageType::new(0xf000),
-            Err(InvalidChannelMessageType)
+            crate::MessageType::new(0xf000),
+            Err(crate::ReservedMessageType)
         );
-        let message_type = ChannelMessageType::new(1).unwrap();
-        assert_eq!(
-            ChannelMessage::new(message_type, vec![0; CHANNEL_MDU + 1]),
-            Err(ChannelMessageTooLarge {
-                size: CHANNEL_MDU + 1,
-                max: CHANNEL_MDU,
-            })
-        );
+        let message_type = crate::MessageType::new(1).unwrap();
+        assert!(matches!(
+            ChannelMessage::new(message_type, vec![0; CHANNEL_MDU + 1].into()),
+            Err(crate::ChannelMessageTooLarge)
+        ));
     }
 
     #[test]

@@ -1,29 +1,51 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 pub(crate) struct PacketHashlist {
-    current: HashSet<[u8; 32]>,
-    prev: HashSet<[u8; 32]>,
-    max_size: usize,
+    limit: usize,
+    order: VecDeque<[u8; 32]>,
+    members: HashSet<[u8; 32]>,
 }
 
 impl PacketHashlist {
-    pub(crate) fn new(max_size: usize) -> Self {
+    pub(crate) fn new(limit: usize) -> Self {
         Self {
-            current: HashSet::new(),
-            prev: HashSet::new(),
-            max_size,
+            limit,
+            order: VecDeque::new(),
+            members: HashSet::new(),
         }
     }
 
     pub(crate) fn contains(&self, hash: &[u8; 32]) -> bool {
-        self.current.contains(hash) || self.prev.contains(hash)
+        self.members.contains(hash)
     }
 
-    pub(crate) fn insert(&mut self, hash: [u8; 32]) {
-        if self.current.len() > self.max_size / 2 {
-            std::mem::swap(&mut self.current, &mut self.prev);
-            self.current.clear();
+    pub(crate) fn insert(&mut self, hash: [u8; 32]) -> bool {
+        if self.members.contains(&hash) {
+            return false;
         }
-        self.current.insert(hash);
+        if self.order.len() == self.limit {
+            let oldest = self.order.pop_front().unwrap();
+            self.members.remove(&oldest);
+        }
+        self.members.insert(hash);
+        self.order.push_back(hash);
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_does_not_refresh_eviction_order() {
+        let mut hashes = PacketHashlist::new(2);
+        assert!(hashes.insert([1; 32]));
+        assert!(hashes.insert([2; 32]));
+        assert!(!hashes.insert([1; 32]));
+        assert!(hashes.insert([3; 32]));
+        assert!(!hashes.contains(&[1; 32]));
+        assert!(hashes.contains(&[2; 32]));
+        assert!(hashes.contains(&[3; 32]));
     }
 }

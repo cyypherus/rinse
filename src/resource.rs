@@ -1,7 +1,7 @@
+use crate::MonoTime;
 use crate::crypto::sha256;
 use crate::link::EstablishedLink;
 use rand::RngCore;
-use std::time::Instant;
 
 pub(crate) const MAPHASH_LEN: usize = 4;
 pub(crate) const HASHMAP_IS_NOT_EXHAUSTED: u8 = 0x00;
@@ -232,12 +232,10 @@ pub(crate) struct InboundResource {
     pub(crate) window_min: usize,
     completed_prefix: usize,
     bytes_received: usize,
-    #[cfg(test)]
-    total_bytes: usize,
     bytes_at_req_sent: usize,
     fast_rate_rounds: usize,
     very_slow_rate_rounds: usize,
-    req_sent: Option<Instant>,
+    req_sent: Option<MonoTime>,
 }
 
 impl InboundResource {
@@ -279,8 +277,6 @@ impl InboundResource {
             window_min: WINDOW_MIN,
             completed_prefix: 0,
             bytes_received: 0,
-            #[cfg(test)]
-            total_bytes: adv.transfer_size,
             bytes_at_req_sent: 0,
             fast_rate_rounds: 0,
             very_slow_rate_rounds: 0,
@@ -407,16 +403,6 @@ impl InboundResource {
         self.parts.len()
     }
 
-    #[cfg(test)]
-    pub fn bytes_received(&self) -> usize {
-        self.bytes_received
-    }
-
-    #[cfg(test)]
-    pub fn total_bytes(&self) -> usize {
-        self.total_bytes
-    }
-
     pub fn is_last_segment(&self) -> bool {
         self.segment_index == self.total_segments
     }
@@ -499,7 +485,7 @@ impl InboundResource {
         Some((result, proof))
     }
 
-    pub fn mark_req_sent(&mut self, now: Instant) {
+    pub fn mark_req_sent(&mut self, now: MonoTime) {
         // Only mark if this is the start of a new batch (req_sent is None)
         // With pipelining, we send requests frequently but only measure rate per batch
         if self.req_sent.is_none() {
@@ -508,7 +494,7 @@ impl InboundResource {
         }
     }
 
-    pub fn complete_batch(&mut self, now: Instant) {
+    pub fn complete_batch(&mut self, now: MonoTime) {
         // Mark batch as complete, record current window for next batch BEFORE growth
         self.last_batch_received_count = self.received_count;
         self.batch_window = self.window;

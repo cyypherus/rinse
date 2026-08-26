@@ -4,7 +4,7 @@ use serde_bytes::ByteBuf;
 use crate::crypto::sha256;
 use rmpv::Value;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct RequestId(pub(crate) [u8; 16]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

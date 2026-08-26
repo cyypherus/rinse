@@ -1,94 +1,81 @@
 use std::collections::VecDeque;
-use std::hint::black_box;
-use std::task::{Context, Poll};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use rinse::{Interface, NodeBuilder, Transport};
-use tokio::task::JoinSet;
+use rinse::{
+    Clock, CryptoEntropy, EntropyUnavailable, InboundPacket, Interface, InterfaceError,
+    InterfaceLimits, MonoTime, NodeBuilder, NodeConfig, OutboundPacket, PacketWork,
+    PacketWorkError, PreparePacket, PreparedPacket,
+};
 
-struct IdleTransport;
+struct TokioClock(std::time::Instant);
 
-impl Transport for IdleTransport {
-    fn poll_send(&mut self, _: &mut Context<'_>, _: &[u8]) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
+impl Clock for TokioClock {
+    type Sleep<'a> = std::pin::Pin<Box<tokio::time::Sleep>>;
+
+    fn now(&self) -> MonoTime {
+        MonoTime::from_micros(self.0.elapsed().as_micros() as u64)
     }
 
-    fn poll_receive(&mut self, _: &mut Context<'_>) -> Poll<std::io::Result<Option<Vec<u8>>>> {
-        Poll::Pending
+    fn sleep_until(&self, deadline: MonoTime) -> Self::Sleep<'_> {
+        let remaining = deadline
+            .checked_duration_since(self.now())
+            .unwrap_or_default();
+        Box::pin(tokio::time::sleep(remaining))
     }
 }
 
-struct BurstTransport {
-    packets: VecDeque<Vec<u8>>,
+struct OsEntropy;
+
+impl CryptoEntropy for OsEntropy {
+    fn fill_seed(&mut self, seed: &mut [u8; 32]) -> Result<(), EntropyUnavailable> {
+        rand::RngCore::try_fill_bytes(&mut rand::rngs::OsRng, seed).map_err(|_| EntropyUnavailable)
+    }
 }
 
-impl Transport for BurstTransport {
-    fn poll_send(&mut self, _: &mut Context<'_>, _: &[u8]) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
+struct BurstInterface {
+    packets: Mutex<VecDeque<Vec<u8>>>,
+}
 
-    fn poll_receive(&mut self, _: &mut Context<'_>) -> Poll<std::io::Result<Option<Vec<u8>>>> {
-        self.packets
-            .pop_front()
-            .map_or(Poll::Pending, |packet| Poll::Ready(Ok(Some(packet))))
+impl Interface for BurstInterface {
+    async fn receive(&self) -> Result<InboundPacket, InterfaceError> {
+        let packet = self.packets.lock().unwrap().pop_front();
+        match packet {
+            Some(packet) => Ok(InboundPacket::new(packet)),
+            None => std::future::pending().await,
+        }
+    }
+    async fn send(&self, _: OutboundPacket) -> Result<(), InterfaceError> {
+        Ok(())
+    }
+    async fn close(&self) -> Result<(), InterfaceError> {
+        Ok(())
+    }
+}
+
+struct MeasuredWork<W> {
+    work: W,
+    completed: Arc<AtomicUsize>,
+}
+
+impl<W: PacketWork> PacketWork for MeasuredWork<W> {
+    async fn prepare(&self, job: PreparePacket) -> Result<PreparedPacket, PacketWorkError> {
+        let result = self.work.prepare(job).await;
+        if result.is_ok() {
+            self.completed.fetch_add(1, Ordering::Release);
+        }
+        result
     }
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let builder: NodeBuilder<IdleTransport> = NodeBuilder::non_forwarding_endpoint();
-    let (node, node_runtime) = builder.build();
-    let client = node.clone();
-    let runtime = tokio::spawn(node_runtime.run());
-    let clients = 256;
-    let reads = 10_000;
-    let started = Instant::now();
-    let mut tasks = JoinSet::new();
-
-    for _ in 0..clients {
-        let node = client.clone();
-        tasks.spawn(async move {
-            for _ in 0..reads {
-                black_box(node.lifetime_stats());
-            }
-        });
-    }
-
-    while let Some(result) = tasks.join_next().await {
-        result.unwrap();
-    }
-
-    let operations = clients * reads;
-    let elapsed = started.elapsed();
-    println!(
-        "lifetime_stats {operations} operations {:?} {:.0} ops/s",
-        elapsed,
-        operations as f64 / elapsed.as_secs_f64()
-    );
-
-    let started = Instant::now();
-    let mut tasks = JoinSet::new();
-    for _ in 0..clients {
-        let node = client.clone();
-        tasks.spawn(async move {
-            for _ in 0..reads {
-                black_box(node.known_destinations());
-            }
-        });
-    }
-    while let Some(result) = tasks.join_next().await {
-        result.unwrap();
-    }
-    let elapsed = started.elapsed();
-    println!(
-        "known_destinations {operations} operations {:?} {:.0} ops/s",
-        elapsed,
-        operations as f64 / elapsed.as_secs_f64()
-    );
-    runtime.abort();
-    assert!(runtime.await.unwrap_err().is_cancelled());
-
-    let packets = 100_000;
+    #[cfg(feature = "std-clock")]
+    rinse::EmbassyClock
+        .sleep_until(MonoTime::from_micros(1))
+        .await;
+    let packets = 1_000_000;
     let mut inbound = VecDeque::with_capacity(packets);
     for index in 0..packets {
         let mut raw = vec![0x0c, 0x00];
@@ -97,25 +84,36 @@ async fn main() {
         raw.extend_from_slice(&[0; 1024]);
         inbound.push_back(raw);
     }
-
-    let mut builder = NodeBuilder::non_forwarding_endpoint();
-    builder.add_initial_interface(Interface::new(BurstTransport { packets: inbound }));
-    let (node, node_runtime) = builder.build();
-    let client = node.clone();
+    let completed = Arc::new(AtomicUsize::new(0));
+    let work = rinse::InlinePacketWork;
+    let builder = NodeBuilder::new(
+        NodeConfig::endpoint(),
+        TokioClock(std::time::Instant::now()),
+        MeasuredWork {
+            work,
+            completed: completed.clone(),
+        },
+        OsEntropy,
+    )
+    .interface(
+        BurstInterface {
+            packets: Mutex::new(inbound),
+        },
+        InterfaceLimits::new(2048, 256, 1_048_576).unwrap(),
+    );
+    let (node, task) = builder.build().unwrap();
     let started = Instant::now();
-    let runtime = tokio::spawn(node_runtime.run());
-    loop {
-        if client.lifetime_stats().packets_received == packets as u64 {
-            break;
-        }
+    let runtime = tokio::spawn(task.run());
+    while completed.load(Ordering::Acquire) != packets {
         tokio::task::yield_now().await;
     }
+    let report = node.shutdown().await;
+    runtime.await.unwrap().unwrap();
     let elapsed = started.elapsed();
     println!(
-        "inbound_parallel {packets} packets {:?} {:.0} packets/s",
+        "inbound_inline {packets} packets {:?} {:.0} packets/s shutdown={:?}",
         elapsed,
-        packets as f64 / elapsed.as_secs_f64()
+        packets as f64 / elapsed.as_secs_f64(),
+        report.reason
     );
-    runtime.abort();
-    assert!(runtime.await.unwrap_err().is_cancelled());
 }

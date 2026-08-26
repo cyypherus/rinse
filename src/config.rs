@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{DestinationAddress, identity::PrivateIdentity};
+use crate::{Destination, RatchetSecret, identity::PrivateIdentity};
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -163,7 +163,10 @@ pub fn load_or_create_persistent_identity(
     if path.exists() {
         let hex_str = fs::read_to_string(path)?;
         let bytes = hex::decode(hex_str.trim()).map_err(|_| ConfigError::InvalidIdentity)?;
-        PrivateIdentity::from_secret_bytes(&bytes).map_err(|_| ConfigError::InvalidIdentity)
+        PrivateIdentity::from_secret_bytes(
+            bytes.try_into().map_err(|_| ConfigError::InvalidIdentity)?,
+        )
+        .map_err(|_| ConfigError::InvalidIdentity)
     } else {
         let identity = PrivateIdentity::generate(&mut rand::thread_rng());
         save_private_identity(path, &identity)?;
@@ -184,11 +187,11 @@ pub fn save_private_identity(
 
 pub fn load_ratchet_keys_for_restart(
     storage_directory: impl AsRef<Path>,
-    service_address: DestinationAddress,
-) -> Result<crate::RatchetKeysForRestart, ConfigError> {
+    service: Destination,
+) -> Result<Vec<RatchetSecret>, ConfigError> {
     let path = storage_directory
         .as_ref()
-        .join(hex::encode(service_address));
+        .join(hex::encode(service.as_bytes()));
 
     if path.exists() {
         let contents = fs::read_to_string(&path)?;
@@ -202,27 +205,30 @@ pub fn load_ratchet_keys_for_restart(
             if bytes.len() != 32 {
                 return Err(ConfigError::InvalidRatchetSecrets);
             }
-            ratchets.push(bytes.try_into().unwrap());
+            ratchets.push(
+                RatchetSecret::from_bytes(bytes.try_into().unwrap())
+                    .map_err(|_| ConfigError::InvalidRatchetSecrets)?,
+            );
         }
-        Ok(crate::RatchetKeysForRestart(ratchets))
+        Ok(ratchets)
     } else {
-        Ok(crate::RatchetKeysForRestart(Vec::new()))
+        Ok(Vec::new())
     }
 }
 
 pub fn save_ratchet_keys_for_restart(
     storage_directory: impl AsRef<Path>,
-    service_address: DestinationAddress,
-    ratchet_keys: &crate::RatchetKeysForRestart,
+    service: Destination,
+    ratchet_keys: &[RatchetSecret],
 ) -> Result<(), ConfigError> {
     let path = storage_directory
         .as_ref()
-        .join(hex::encode(service_address));
+        .join(hex::encode(service.as_bytes()));
 
     create_parent_directory(&path)?;
     let contents: String = ratchet_keys
-        .0
         .iter()
+        .map(RatchetSecret::to_bytes)
         .map(hex::encode)
         .collect::<Vec<_>>()
         .join("\n");
@@ -286,19 +292,24 @@ mod tests {
     #[test]
     fn ratchet_files_are_bound_to_service_address() {
         let directory = test_directory();
-        let first_service = [1; 16];
-        let second_service = [2; 16];
-        let persisted = crate::RatchetKeysForRestart(vec![[3; 32]]);
+        let first_service = Destination::from_bytes([1; 16]);
+        let second_service = Destination::from_bytes([2; 16]);
+        let persisted = [RatchetSecret::from_bytes([3; 32]).unwrap()];
 
         save_ratchet_keys_for_restart(&directory, first_service, &persisted).unwrap();
 
         assert_eq!(
-            load_ratchet_keys_for_restart(&directory, first_service).unwrap(),
-            persisted
+            load_ratchet_keys_for_restart(&directory, first_service)
+                .unwrap()
+                .into_iter()
+                .map(|secret| secret.to_bytes())
+                .collect::<Vec<_>>(),
+            vec![[3; 32]]
         );
-        assert_eq!(
-            load_ratchet_keys_for_restart(&directory, second_service).unwrap(),
-            crate::RatchetKeysForRestart(Vec::new())
+        assert!(
+            load_ratchet_keys_for_restart(&directory, second_service)
+                .unwrap()
+                .is_empty()
         );
         std::fs::remove_dir_all(directory).unwrap();
     }

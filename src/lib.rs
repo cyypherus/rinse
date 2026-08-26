@@ -1,78 +1,57 @@
+#[cfg(not(target_has_atomic = "ptr"))]
+compile_error!("rinse requires pointer-width atomics");
+
+#[cfg(all(target_arch = "xtensa", not(target_os = "espidf")))]
+compile_error!("Xtensa is supported only through an ESP-IDF std target");
+
 mod announce;
+mod api;
 mod aspect;
 mod buffer;
 mod channel;
 mod crypto;
-mod handle;
+mod entropy;
 mod identity;
 mod interface;
 mod link;
-mod link_handle;
+mod model;
 mod node;
 mod packet;
 mod packet_hashlist;
 mod request;
 mod resource;
-mod stats;
-
-mod async_io;
-
+mod runtime;
 #[cfg(feature = "tcp")]
-mod transports;
+mod tcp;
+mod time;
+mod timer;
+mod work;
 
 #[cfg(feature = "config")]
 pub mod config;
 
-pub use aspect::ServiceNameHash;
-pub use buffer::{
-    InvalidLinkBufferStreamId, LinkBufferStreamChunk, LinkBufferStreamId,
-    QueuedLinkBufferStreamData,
+pub use api::*;
+pub use aspect::ServiceHash;
+#[cfg(feature = "std-clock")]
+pub use entropy::SystemEntropy;
+pub use entropy::{CryptoEntropy, EntropyUnavailable};
+pub use identity::{IdentityError, PrivateIdentity};
+pub use interface::{
+    AccessControlledInterface, InboundPacket, Interface, InterfaceAccessCode,
+    InterfaceAccessCodeError, InterfaceError, OutboundPacket,
 };
-pub use channel::{
-    ChannelMessage, ChannelMessageTooLarge, ChannelMessageType, ChannelSendError,
-    InvalidChannelMessageType,
+pub use model::{
+    ChannelMessage, ChannelMessageTooLarge, Destination, EmptyRequestPath, EmptyServiceName,
+    IdentityHash, InterfaceLimits, InterfaceLimitsError, InvalidRatchetSecret, MessageType,
+    NodeConfig, NodeLimits, RatchetAction, RatchetSecret, RequestPath, ReservedMessageType,
+    ServiceConfig, ServiceName, StreamId, StreamIdOutOfRange, TooManyRequestPaths,
 };
-pub use handle::{
-    AnnounceError, DecryptLaterDeliveredPayloadError, DestinationCiphertext,
-    EncryptForLaterDeliveryError, EstablishLinkError, IncomingRequest,
-    InvalidDestinationCiphertext, KnownDestination, LinkLookupError, LinkPeerAuthenticationError,
-    LinkRttError, LocalServiceId, RatchetConfigurationError, RatchetKeysForRestart,
-    RatchetKeysForRestartError, ReceiveError, ReceivedDatagram, RegisteredLocalService,
-    RequestError, RespondError, Response, RouteDiscoveryError, RuntimeStopped,
-    SendDestinationDatagramError, SendLinkDatagramError,
-};
-pub use identity::{InvalidPrivateIdentityBytes, PrivateIdentity};
-pub use interface::{Interface, InterfaceAccessCode, InterfaceAccessCodeError, Transport};
-pub use link_handle::{LinkHandle, LinkStatus};
-pub use packet::DestinationAddress;
-pub use request::RequestId;
+pub(crate) use request::RequestId;
 pub(crate) use request::WireRequestId;
-pub use stats::LifetimeStats;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct IdentityAddress([u8; 16]);
-
-impl IdentityAddress {
-    pub fn from_bytes(bytes: [u8; 16]) -> Self {
-        Self(bytes)
-    }
-
-    pub fn as_bytes(&self) -> &[u8; 16] {
-        &self.0
-    }
-
-    pub fn to_bytes(self) -> [u8; 16] {
-        self.0
-    }
-}
-
-impl AsRef<[u8]> for IdentityAddress {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-pub use async_io::{Node, NodeBuilder, NodeRuntime, OutboundLinkBufferStream};
-
+pub use runtime::{NodeBuilder, NodeTask};
 #[cfg(feature = "tcp")]
-pub use async_io::AsyncTcpTransport as TcpTransport;
+pub use tcp::TcpHdlcInterface;
+#[cfg(feature = "embassy-clock")]
+pub use time::EmbassyClock;
+pub use time::{Clock, MonoTime, TimeSpan};
+pub use work::{InlinePacketWork, PacketWork, PacketWorkError, PreparePacket, PreparedPacket};

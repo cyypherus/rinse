@@ -1,11 +1,11 @@
-use std::time::{Duration, Instant};
+use crate::{MonoTime, TimeSpan};
 
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use rand::RngCore;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
+use crate::api::ServiceId;
 use crate::crypto::{LinkEncryption, LinkKeys, sha256, sign, verify};
-use crate::handle::ServiceId;
 use crate::packet::DestinationAddress;
 
 pub type LinkId = [u8; 16];
@@ -131,12 +131,14 @@ pub(crate) struct LinkIdentify {
 }
 
 impl LinkIdentify {
-    pub fn create(link_id: &LinkId, identity: &crate::PrivateIdentity) -> Self {
-        let public_keys = identity.public_key();
+    pub fn create(link_id: &LinkId, encryption_public: [u8; 32], signing_key: &SigningKey) -> Self {
+        let mut public_keys = [0; 64];
+        public_keys[..32].copy_from_slice(&encryption_public);
+        public_keys[32..].copy_from_slice(signing_key.verifying_key().as_bytes());
         let mut sign_data = Vec::with_capacity(80);
         sign_data.extend_from_slice(link_id);
         sign_data.extend_from_slice(&public_keys);
-        let signature = sign(&identity.signing_key, &sign_data);
+        let signature = sign(signing_key, &sign_data);
         Self {
             public_keys,
             signature,
@@ -210,7 +212,8 @@ pub(crate) struct PendingLink {
     pub responder_signing_key: VerifyingKey,
     pub destination: DestinationAddress,
     pub local_service: Option<ServiceId>,
-    pub request_time: Instant,
+    pub request_time: MonoTime,
+    pub(crate) open: Option<crate::runtime::PendingOpenLink>,
 }
 
 pub(crate) struct LinkResponder<'a> {
@@ -223,7 +226,7 @@ pub(crate) struct LinkResponder<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinkState {
     ResponderHandshake { local_service: ServiceId },
-    Active { rtt: Duration, role: ActiveLinkRole },
+    Active { rtt: TimeSpan, role: ActiveLinkRole },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,19 +235,27 @@ enum ActiveLinkRole {
     Responder { local_service: ServiceId },
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum LocalIdentityState {
+    Anonymous,
+    Bound([u8; 16]),
+}
+
 pub(crate) struct EstablishedLink {
     pub destination: DestinationAddress,
     state: LinkState,
-    pub last_inbound: Instant,
-    pub last_outbound: Instant,
-    pub last_keepalive_sent: Option<Instant>,
+    pub last_inbound: MonoTime,
+    pub last_outbound: MonoTime,
+    pub last_keepalive_sent: Option<MonoTime>,
     pub remote_identity: Option<DestinationAddress>,
+    pub(crate) local_identity: LocalIdentityState,
     pub receiving_interface: usize,
     pub signing_key: SigningKey,
     pub peer_signing_key: VerifyingKey,
     keys: LinkKeys,
-    pub(crate) pending_requests:
-        std::collections::HashMap<crate::WireRequestId, (ServiceId, crate::RequestId)>,
+    pub(crate) channel: Option<crate::runtime::RuntimeChannel>,
+    pub(crate) events: Option<crate::runtime::LinkEvents>,
+    pub(crate) pending_requests: std::collections::HashMap<crate::WireRequestId, crate::RequestId>,
 }
 
 const KEEPALIVE_MAX_SECS: u64 = 360;
@@ -256,7 +267,7 @@ impl EstablishedLink {
         pending: PendingLink,
         responder_public: &X25519Public,
         receiving_interface: usize,
-        now: Instant,
+        now: MonoTime,
     ) -> Self {
         let shared_key = pending
             .initiator_encryption_secret
@@ -267,7 +278,7 @@ impl EstablishedLink {
         Self {
             destination: pending.destination,
             state: LinkState::Active {
-                rtt: Duration::from_millis(rtt_ms),
+                rtt: TimeSpan::from_millis(rtt_ms),
                 role: ActiveLinkRole::Initiator {
                     local_service: pending.local_service,
                 },
@@ -276,10 +287,13 @@ impl EstablishedLink {
             last_outbound: now,
             last_keepalive_sent: None,
             remote_identity: None,
+            local_identity: LocalIdentityState::Anonymous,
             receiving_interface,
             signing_key: pending.initiator_signing_key,
             peer_signing_key: pending.responder_signing_key,
             keys,
+            channel: None,
+            events: None,
             pending_requests: std::collections::HashMap::new(),
         }
     }
@@ -290,7 +304,7 @@ impl EstablishedLink {
         initiator_public: &X25519Public,
         initiator_signing_key: VerifyingKey,
         receiving_interface: usize,
-        now: Instant,
+        now: MonoTime,
     ) -> Self {
         let shared_key = responder
             .encryption_secret
@@ -306,10 +320,13 @@ impl EstablishedLink {
             last_outbound: now,
             last_keepalive_sent: None,
             remote_identity: None,
+            local_identity: LocalIdentityState::Anonymous,
             receiving_interface,
             signing_key: responder.signing_key,
             peer_signing_key: initiator_signing_key,
             keys,
+            channel: None,
+            events: None,
             pending_requests: std::collections::HashMap::new(),
         }
     }
@@ -322,11 +339,11 @@ impl EstablishedLink {
         LinkEncryption::decrypt(&self.keys, ciphertext)
     }
 
-    pub(crate) fn touch_inbound(&mut self, now: Instant) {
+    pub(crate) fn touch_inbound(&mut self, now: MonoTime) {
         self.last_inbound = now;
     }
 
-    pub(crate) fn touch_outbound(&mut self, now: Instant) {
+    pub(crate) fn touch_outbound(&mut self, now: MonoTime) {
         self.last_outbound = now;
     }
 
@@ -338,12 +355,12 @@ impl EstablishedLink {
             LinkState::Active { role, .. } => role,
         };
         self.state = LinkState::Active {
-            rtt: Duration::from_millis(rtt_ms),
+            rtt: TimeSpan::from_millis(rtt_ms),
             role,
         };
     }
 
-    pub(crate) fn rtt(&self) -> Option<Duration> {
+    pub(crate) fn rtt(&self) -> Option<TimeSpan> {
         match self.state {
             LinkState::ResponderHandshake { .. } => None,
             LinkState::Active { rtt, .. } => Some(rtt),
@@ -375,13 +392,6 @@ impl EstablishedLink {
                 role: ActiveLinkRole::Initiator { local_service },
                 ..
             } => local_service,
-        }
-    }
-
-    pub(crate) fn status(&self) -> crate::LinkStatus {
-        match self.state {
-            LinkState::ResponderHandshake { .. } => crate::LinkStatus::Pending,
-            LinkState::Active { .. } => crate::LinkStatus::Active,
         }
     }
 
@@ -481,7 +491,7 @@ mod tests {
         let responder_signing_key = SigningKey::generate(&mut rng);
         let dest: DestinationAddress = [0xAB; 16];
         let link_id: LinkId = [0xCD; 16];
-        let now = Instant::now();
+        let now = MonoTime::from_micros(1_000_000);
 
         let pending = PendingLink {
             link_id,
@@ -491,6 +501,7 @@ mod tests {
             destination: dest,
             local_service: None,
             request_time: now,
+            open: None,
         };
 
         let initiator_link =
@@ -527,7 +538,7 @@ mod tests {
         use crate::packet::{Packet, RoutedDestination};
 
         let mut rng = test_rng();
-        let now = Instant::now();
+        let now = MonoTime::from_micros(1_000_000);
 
         let initiator_enc = EphemeralKeyPair::generate(&mut rng);
         let initiator_sig = SigningKey::generate(&mut rng);
@@ -559,6 +570,7 @@ mod tests {
             destination: dest,
             local_service: None,
             request_time: now,
+            open: None,
         };
         let initiator_link =
             EstablishedLink::from_initiator(pending, &responder_enc.public, 0, now);
@@ -618,9 +630,8 @@ mod tests {
         let dest: DestinationAddress = [0xAB; 16];
         let link_id: LinkId = [0xCD; 16];
 
-        let request_time = Instant::now();
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        let proof_time = Instant::now();
+        let request_time = MonoTime::from_micros(1_000_000);
+        let proof_time = request_time.checked_add(TimeSpan::from_millis(10)).unwrap();
 
         let pending = PendingLink {
             link_id,
@@ -630,13 +641,14 @@ mod tests {
             destination: dest,
             local_service: None,
             request_time,
+            open: None,
         };
 
         let link =
             EstablishedLink::from_initiator(pending, &responder_keypair.public, 0, proof_time);
 
         assert!(link.rtt().is_some());
-        assert!(link.rtt().unwrap() >= Duration::from_millis(10));
+        assert!(link.rtt().unwrap() >= TimeSpan::from_millis(10));
     }
 
     #[test]
@@ -648,7 +660,7 @@ mod tests {
         let responder_signing_key = SigningKey::generate(&mut rng);
         let dest: DestinationAddress = [0xAB; 16];
         let link_id: LinkId = [0xCD; 16];
-        let now = Instant::now();
+        let now = MonoTime::from_micros(1_000_000);
 
         let pending = PendingLink {
             link_id,
@@ -658,6 +670,7 @@ mod tests {
             destination: dest,
             local_service: None,
             request_time: now,
+            open: None,
         };
 
         let mut link = EstablishedLink::from_initiator(pending, &responder_keypair.public, 0, now);

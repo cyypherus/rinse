@@ -1,127 +1,105 @@
+mod common;
+
+use bytes::Bytes;
 use rinse::config::{Config, InterfaceConfig, load_or_create_persistent_identity};
-use rinse::{Interface, NodeBuilder, TcpTransport};
+use rinse::{
+    Destination, EmbassyClock, InlinePacketWork, InterfaceLimits, NodeBuilder, NodeConfig,
+    RequestPath, ServiceConfig, ServiceName, SystemEntropy,
+};
 
 #[tokio::main]
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
     let config = Config::load_from(".rinse/config.toml").expect("failed to load config");
     let identity =
         load_or_create_persistent_identity(".rinse/identity").expect("failed to load identity");
-
-    let args: Vec<String> = std::env::args().collect();
-
-    let mut node_id_arg = None;
-    let mut path_arg = None;
-    let mut output_file = None;
-
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--output" | "-o" => {
-                output_file = Some(args.get(i + 1).expect("--output requires a path").clone());
-                i += 2;
-            }
-            arg if !arg.starts_with('-') && node_id_arg.is_none() => {
-                node_id_arg = Some(arg.to_string());
-                i += 1;
-            }
-            arg if !arg.starts_with('-') && path_arg.is_none() => {
-                path_arg = Some(arg.to_string());
-                i += 1;
-            }
-            _ => {
-                eprintln!("Unknown argument: {}", args[i]);
-                std::process::exit(1);
-            }
+    let mut args = std::env::args().skip(1);
+    let destination = args.next().unwrap_or_else(|| usage());
+    let path = args.next().unwrap_or_else(|| usage());
+    let mut output = None;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--output" | "-o" => output = Some(args.next().unwrap_or_else(|| usage())),
+            _ => usage(),
         }
     }
-
-    let node_id_hex = node_id_arg.unwrap_or_else(|| {
-        eprintln!("Usage: request <node_id> <path> [options]");
-        eprintln!("  --output <file>    - Write response to file instead of stdout");
-        std::process::exit(1);
-    });
-
-    let path = path_arg.unwrap_or_else(|| {
-        eprintln!("Usage: request <node_id> <path> [options]");
-        eprintln!("  --output <file>    - Write response to file instead of stdout");
-        std::process::exit(1);
-    });
-
-    let node_id: [u8; 16] = hex::decode(&node_id_hex)
-        .ok()
-        .and_then(|v| v.try_into().ok())
-        .unwrap_or_else(|| {
-            eprintln!("Error: node_id must be 32 hex characters (16 bytes)");
-            std::process::exit(1);
-        });
-
-    let mut builder: NodeBuilder<TcpTransport> = if config.network.relay {
-        NodeBuilder::packet_forwarding_relay()
+    let destination = Destination::from_bytes(
+        hex::decode(destination)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .unwrap_or_else(|| {
+                eprintln!("destination must be 32 hex characters");
+                std::process::exit(1);
+            }),
+    );
+    let mode = if config.network.relay {
+        NodeConfig::relay()
     } else {
-        NodeBuilder::non_forwarding_endpoint()
+        NodeConfig::endpoint()
     };
-    let service = builder
-        .register_local_service("nomadnetwork.node", &[], &identity)
-        .id;
-
-    for (name, iface) in config.enabled_interfaces() {
+    let mut builder = NodeBuilder::new(mode, EmbassyClock, InlinePacketWork, SystemEntropy);
+    for (name, interface) in config.enabled_interfaces() {
         if let InterfaceConfig::TCPClientInterface {
             target_host,
             target_port,
             ..
-        } = iface
+        } = interface
         {
-            let addr = format!("{}:{}", target_host, target_port);
-            log::info!("[{}] Connecting to {}", name, addr);
-            match TcpTransport::connect(&addr).await {
-                Ok(transport) => {
-                    builder.add_initial_interface(Interface::new(transport));
+            let address = format!("{target_host}:{target_port}");
+            match common::TcpHdlc::connect(&address).await {
+                Ok(interface) => {
+                    builder = builder.interface(interface, interface_limits());
+                    log::info!("[{name}] connected to {address}");
                 }
-                Err(e) => {
-                    log::warn!("[{}] Failed to connect: {}", name, e);
-                }
+                Err(error) => log::warn!("[{name}] failed to connect to {address}: {error}"),
             }
         }
     }
-
-    log::info!(
-        "Requesting path '{}' from node {}",
-        path,
-        hex::encode(node_id)
-    );
-
-    let (node, runtime) = builder.build();
-    let node_clone = node.clone();
-    let node_task = tokio::spawn(runtime.run());
-
-    let link = node_clone
-        .establish_link_from(service, node_id)
+    let (node, task) = builder.build().expect("failed to build node");
+    let running = tokio::spawn(task.run());
+    let service = node
+        .register_service(
+            ServiceConfig::new(
+                ServiceName::new("nomadnetwork.node").unwrap(),
+                identity,
+                [],
+                None,
+            )
+            .unwrap(),
+        )
         .await
-        .expect("Failed to establish link");
-    let response = node_clone.request(link, &path, &[]).await;
-
-    match response {
-        Ok(resp) => {
-            log::info!("Received {} bytes", resp.data.len());
-            if let Some(output_path) = output_file {
-                tokio::fs::write(&output_path, &resp.data)
-                    .await
-                    .expect("failed to write output file");
-                log::info!("Written to {}", output_path);
-            } else {
-                use std::io::Write;
-                std::io::stdout()
-                    .write_all(&resp.data)
-                    .expect("failed to write to stdout");
-            }
-        }
-        Err(e) => {
-            eprintln!("Request failed: {:?}", e);
-            std::process::exit(1);
-        }
+        .expect("failed to register local service");
+    let link = node
+        .open_link(destination)
+        .await
+        .expect("failed to establish link");
+    let sender = link.send_handle();
+    service
+        .identify_on(&sender)
+        .await
+        .expect("failed to identify link");
+    let response = sender
+        .request(RequestPath::new(path).unwrap(), Bytes::new())
+        .await
+        .expect("request failed");
+    if let Some(path) = output {
+        std::fs::write(&path, &response).expect("failed to write response");
+        log::info!("wrote {} bytes to {path}", response.len());
+    } else {
+        use std::io::Write;
+        std::io::stdout()
+            .write_all(&response)
+            .expect("failed to write response");
     }
+    node.shutdown().await;
+    running.await.unwrap().unwrap();
+}
 
-    node_task.abort();
+fn interface_limits() -> InterfaceLimits {
+    InterfaceLimits::new(65_535, 256, 1_048_576).unwrap()
+}
+
+fn usage() -> ! {
+    eprintln!("usage: request <destination> <path> [-o <file>]");
+    std::process::exit(1)
 }

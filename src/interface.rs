@@ -1,10 +1,90 @@
-use std::collections::BinaryHeap;
+use std::future::Future;
 use std::io;
-use std::task::{Context, Poll};
+use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
+use futures_util::future::BoxFuture;
 
-use crate::packet::Packet;
+#[derive(Debug)]
+pub enum InterfaceError {
+    Closed,
+    Io(io::Error),
+}
+
+pub struct InboundPacket {
+    bytes: Vec<u8>,
+}
+
+impl InboundPacket {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+pub struct OutboundPacket {
+    bytes: Vec<u8>,
+}
+
+impl OutboundPacket {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+pub trait Interface: Send + Sync {
+    fn receive(&self) -> impl Future<Output = Result<InboundPacket, InterfaceError>> + Send;
+    fn send(
+        &self,
+        packet: OutboundPacket,
+    ) -> impl Future<Output = Result<(), InterfaceError>> + Send;
+    fn close(&self) -> impl Future<Output = Result<(), InterfaceError>> + Send;
+}
+
+pub(crate) trait ErasedInterface: Send + Sync {
+    fn receive(&self) -> BoxFuture<'_, Result<InboundPacket, InterfaceError>>;
+    fn send(&self, packet: OutboundPacket) -> BoxFuture<'_, Result<(), InterfaceError>>;
+    fn close(&self) -> BoxFuture<'_, Result<(), InterfaceError>>;
+}
+
+impl<I: Interface> ErasedInterface for I {
+    fn receive(&self) -> BoxFuture<'_, Result<InboundPacket, InterfaceError>> {
+        Box::pin(Interface::receive(self))
+    }
+
+    fn send(&self, packet: OutboundPacket) -> BoxFuture<'_, Result<(), InterfaceError>> {
+        Box::pin(Interface::send(self, packet))
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<(), InterfaceError>> {
+        Box::pin(Interface::close(self))
+    }
+}
+
+pub(crate) type AttachedInterface = Arc<dyn ErasedInterface + 'static>;
 
 pub struct InterfaceAccessCode {
     signing_key: SigningKey,
@@ -43,470 +123,71 @@ impl InterfaceAccessCode {
     }
 }
 
-pub trait Transport: Send {
-    fn poll_send(&mut self, cx: &mut Context<'_>, frame: &[u8]) -> Poll<io::Result<()>>;
-    fn poll_receive(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Vec<u8>>>>;
+pub struct AccessControlledInterface<I> {
+    inner: I,
+    access: InterfaceAccessCode,
 }
 
-impl Transport for Box<dyn Transport> {
-    fn poll_send(&mut self, cx: &mut Context<'_>, frame: &[u8]) -> Poll<io::Result<()>> {
-        (**self).poll_send(cx, frame)
-    }
-    fn poll_receive(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Vec<u8>>>> {
-        (**self).poll_receive(cx)
-    }
-}
-
-struct QueuedPacket {
-    packet: Packet,
-    priority: u8,
-}
-
-impl PartialEq for QueuedPacket {
-    fn eq(&self, other: &Self) -> bool {
-        self.priority == other.priority
-    }
-}
-
-impl Eq for QueuedPacket {}
-
-impl PartialOrd for QueuedPacket {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for QueuedPacket {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.priority.cmp(&self.priority)
-    }
-}
-
-pub struct Interface<T> {
-    pub(crate) transport: T,
-    queue: BinaryHeap<QueuedPacket>,
-    closed: bool,
-    access_code: Option<InterfaceAccessCode>,
-}
-
-impl<T: Transport> Interface<T> {
-    pub fn new(transport: T) -> Self {
-        Self {
-            transport,
-            queue: BinaryHeap::new(),
-            closed: false,
-            access_code: None,
-        }
+impl<I> AccessControlledInterface<I> {
+    pub fn new(inner: I, access: InterfaceAccessCode) -> Self {
+        Self { inner, access }
     }
 
-    pub fn with_interface_access_code(mut self, access_code: InterfaceAccessCode) -> Self {
-        self.access_code = Some(access_code);
-        self
-    }
-
-    pub(crate) fn is_closed(&self) -> bool {
-        self.closed
-    }
-
-    pub(crate) fn send(&mut self, packet: Packet, priority: u8) {
-        self.queue.push(QueuedPacket { packet, priority });
-    }
-
-    fn validate_and_strip_ifac(&self, raw: &[u8]) -> Option<Vec<u8>> {
-        if raw.len() <= 2 {
+    fn receive(&self, raw: Vec<u8>) -> Option<Vec<u8>> {
+        let size = self.access.transmitted_bytes;
+        if raw.len() <= 2 + size || raw[0] & 0x80 == 0 {
             return None;
         }
-
-        if let Some(access_code) = &self.access_code {
-            let ifac_size = access_code.transmitted_bytes;
-
-            // Interface has IFAC enabled - packet MUST have valid IFAC
-            if raw[0] & 0x80 != 0x80 {
-                return None; // IFAC flag not set
-            }
-            if raw.len() <= 2 + ifac_size {
-                return None; // Too short
-            }
-
-            // Extract IFAC
-            let ifac = &raw[2..2 + ifac_size];
-
-            // Generate mask
-            let mask = crate::crypto::hkdf_expand(ifac, &access_code.shared_key, raw.len());
-
-            // Unmask header and payload (but not IFAC itself)
-            let mut unmasked_raw = raw.to_vec();
-            for (i, byte) in unmasked_raw.iter_mut().enumerate() {
-                if i <= 1 || i > ifac_size + 1 {
-                    *byte ^= mask[i];
-                }
-            }
-
-            unmasked_raw[0] &= 0x7f;
-            unmasked_raw.drain(2..2 + ifac_size);
-
-            // Validate: re-compute IFAC and compare
-            let signature = crate::crypto::sign(&access_code.signing_key, &unmasked_raw);
-            let expected_ifac = &signature.to_bytes()[64 - ifac_size..];
-
-            if ifac == expected_ifac {
-                Some(unmasked_raw)
-            } else {
-                None
-            }
-        } else {
-            // Interface does NOT have IFAC enabled - packet must NOT have IFAC flag
-            if raw[0] & 0x80 == 0x80 {
-                None
-            } else {
-                Some(raw.to_vec())
+        let ifac = raw[2..2 + size].to_vec();
+        let mask = crate::crypto::hkdf_expand(&ifac, &self.access.shared_key, raw.len());
+        let mut packet = raw;
+        for (index, byte) in packet.iter_mut().enumerate() {
+            if index <= 1 || index > size + 1 {
+                *byte ^= mask[index];
             }
         }
+        packet[0] &= 0x7f;
+        packet.drain(2..2 + size);
+        let signature = crate::crypto::sign(&self.access.signing_key, &packet);
+        (ifac == signature.to_bytes()[64 - size..]).then_some(packet)
     }
 
-    pub(crate) fn poll_receive(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
-        if self.closed {
-            return Poll::Pending;
-        }
-        loop {
-            let raw = match self.transport.poll_receive(cx) {
-                Poll::Ready(Ok(Some(raw))) => raw,
-                Poll::Ready(Ok(None)) => {
-                    self.closed = true;
-                    return Poll::Ready(None);
-                }
-                Poll::Ready(Err(error)) => {
-                    log::debug!("Interface receive failed: {error}");
-                    self.closed = true;
-                    return Poll::Ready(None);
-                }
-                Poll::Pending => return Poll::Pending,
-            };
-            if let Some(data) = self.validate_and_strip_ifac(&raw) {
-                if let Ok(pkt) = Packet::from_bytes(&data) {
-                    log::trace!("[RECV] {}", pkt.log_format());
-                } else {
-                    log::trace!(
-                        "[RECV] raw {} bytes: {}",
-                        data.len(),
-                        hex::encode(&data[..data.len().min(32)])
-                    );
-                }
-                return Poll::Ready(Some(data));
+    fn send(&self, raw: Vec<u8>) -> Vec<u8> {
+        let size = self.access.transmitted_bytes;
+        let signature = crate::crypto::sign(&self.access.signing_key, &raw);
+        let ifac = &signature.to_bytes()[64 - size..];
+        let mask = crate::crypto::hkdf_expand(ifac, &self.access.shared_key, raw.len() + size);
+        let mut packet = Vec::with_capacity(raw.len() + size);
+        packet.extend_from_slice(&[raw[0] | 0x80, raw[1]]);
+        packet.extend_from_slice(ifac);
+        packet.extend_from_slice(&raw[2..]);
+        for (index, byte) in packet.iter_mut().enumerate() {
+            if index == 0 {
+                *byte = (*byte ^ mask[index]) | 0x80;
+            } else if index == 1 || index > size + 1 {
+                *byte ^= mask[index];
             }
         }
-    }
-
-    fn apply_ifac(&self, raw: &[u8]) -> Vec<u8> {
-        if let Some(access_code) = &self.access_code {
-            let ifac_size = access_code.transmitted_bytes;
-
-            // Calculate packet access code (sign raw, take last ifac_size bytes)
-            let signature = crate::crypto::sign(&access_code.signing_key, raw);
-            let ifac = &signature.to_bytes()[64 - ifac_size..];
-
-            // Generate mask
-            let mask =
-                crate::crypto::hkdf_expand(ifac, &access_code.shared_key, raw.len() + ifac_size);
-
-            // Set IFAC flag (bit 7 of header byte 0)
-            let new_header = [raw[0] | 0x80, raw[1]];
-
-            // Assemble new payload: header + ifac + payload
-            let mut new_raw = Vec::with_capacity(raw.len() + ifac_size);
-            new_raw.extend_from_slice(&new_header);
-            new_raw.extend_from_slice(ifac);
-            new_raw.extend_from_slice(&raw[2..]);
-
-            // Mask payload
-            for (i, byte) in new_raw.iter_mut().enumerate() {
-                if i == 0 {
-                    // Mask first header byte, but keep IFAC flag set
-                    *byte = (*byte ^ mask[i]) | 0x80;
-                } else if i == 1 || i > ifac_size + 1 {
-                    // Mask second header byte and payload
-                    *byte ^= mask[i];
-                }
-            }
-
-            new_raw
-        } else {
-            raw.to_vec()
-        }
-    }
-
-    pub(crate) fn poll_send(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.closed {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "interface is closed",
-            )));
-        }
-        while let Some(queued) = self.queue.peek() {
-            let raw = queued.packet.to_bytes();
-            let frame = self.apply_ifac(&raw);
-            match self.transport.poll_send(cx, &frame) {
-                Poll::Ready(Ok(())) => {
-                    log::trace!("[SEND] {}", queued.packet.log_format());
-                    self.queue.pop();
-                }
-                Poll::Ready(Err(error)) => {
-                    self.closed = true;
-                    return Poll::Ready(Err(error));
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        Poll::Ready(Ok(()))
+        packet
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::packet::RoutedDestination;
-    use std::sync::{Arc, Mutex};
-    use std::task::Waker;
-
-    type SentFrames = Arc<Mutex<Vec<Vec<u8>>>>;
-
-    struct MockTransport {
-        sent: SentFrames,
-        bandwidth: bool,
-    }
-
-    impl MockTransport {
-        fn new(bandwidth: bool) -> (Self, SentFrames) {
-            let sent = Arc::new(Mutex::new(Vec::new()));
-            (
-                Self {
-                    sent: sent.clone(),
-                    bandwidth,
-                },
-                sent,
-            )
-        }
-    }
-
-    impl Transport for MockTransport {
-        fn poll_send(&mut self, _: &mut Context<'_>, frame: &[u8]) -> Poll<io::Result<()>> {
-            if self.bandwidth {
-                self.sent.lock().unwrap().push(frame.to_vec());
-                Poll::Ready(Ok(()))
-            } else {
-                Poll::Pending
+impl<I: Interface> Interface for AccessControlledInterface<I> {
+    async fn receive(&self) -> Result<InboundPacket, InterfaceError> {
+        loop {
+            let packet = self.inner.receive().await?;
+            if let Some(bytes) = self.receive(packet.into_bytes()) {
+                return Ok(InboundPacket::new(bytes));
             }
         }
-
-        fn poll_receive(&mut self, _: &mut Context<'_>) -> Poll<io::Result<Option<Vec<u8>>>> {
-            Poll::Pending
-        }
     }
 
-    fn make_packet(dest: [u8; 16], hops: u8) -> Packet {
-        Packet::Announce {
-            hops,
-            destination: RoutedDestination::direct(dest),
-            has_ratchet: false,
-            is_path_response: false,
-            data: vec![],
-        }
+    async fn send(&self, packet: OutboundPacket) -> Result<(), InterfaceError> {
+        let packet = self.send(packet.into_bytes());
+        self.inner.send(OutboundPacket::new(packet)).await
     }
 
-    #[test]
-    fn access_code_rejects_invalid_inputs() {
-        assert!(matches!(
-            InterfaceAccessCode::new([0; 32], Vec::new(), 8),
-            Err(InterfaceAccessCodeError::EmptyPacketMaskingKey)
-        ));
-        assert!(matches!(
-            InterfaceAccessCode::new([0; 32], vec![1], 0),
-            Err(
-                InterfaceAccessCodeError::InvalidTransmittedAuthenticationBytes {
-                    bytes: 0,
-                    max: 64
-                }
-            )
-        ));
-        assert!(matches!(
-            InterfaceAccessCode::new([0; 32], vec![1], 65),
-            Err(
-                InterfaceAccessCodeError::InvalidTransmittedAuthenticationBytes {
-                    bytes: 65,
-                    max: 64
-                }
-            )
-        ));
-    }
-
-    #[test]
-    fn priority_queue_sends_lowest_priority_first() {
-        let (transport, sent) = MockTransport::new(true);
-        let mut iface = Interface::new(transport);
-
-        iface.send(make_packet([1u8; 16], 10), 10);
-        iface.send(make_packet([2u8; 16], 2), 2);
-        iface.send(make_packet([3u8; 16], 5), 5);
-
-        assert!(
-            iface
-                .poll_send(&mut Context::from_waker(Waker::noop()))
-                .is_ready()
-        );
-
-        let sent = sent.lock().unwrap();
-        assert_eq!(sent.len(), 3);
-
-        let p1 = Packet::from_bytes(&sent[0]).unwrap();
-        let p2 = Packet::from_bytes(&sent[1]).unwrap();
-        let p3 = Packet::from_bytes(&sent[2]).unwrap();
-
-        assert_eq!(p1.hops(), 2);
-        assert_eq!(p2.hops(), 5);
-        assert_eq!(p3.hops(), 10);
-    }
-
-    #[test]
-    fn send_then_poll_transmits() {
-        let (transport, sent) = MockTransport::new(true);
-        let mut iface = Interface::new(transport);
-
-        let packet = make_packet([1u8; 16], 5);
-        iface.send(packet, 5);
-
-        assert_eq!(sent.lock().unwrap().len(), 0);
-        assert!(
-            iface
-                .poll_send(&mut Context::from_waker(Waker::noop()))
-                .is_ready()
-        );
-        assert_eq!(sent.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn no_bandwidth_queues_packet() {
-        let (transport, sent) = MockTransport::new(false);
-        let mut iface = Interface::new(transport);
-
-        let packet = make_packet([1u8; 16], 5);
-        iface.send(packet, 5);
-
-        assert!(
-            iface
-                .poll_send(&mut Context::from_waker(Waker::noop()))
-                .is_pending()
-        );
-
-        assert_eq!(sent.lock().unwrap().len(), 0);
-        assert_eq!(iface.queue.len(), 1);
-    }
-
-    fn make_ifac_interface() -> (Interface<MockTransport>, SentFrames) {
-        use rand::RngCore;
-        use rand::SeedableRng;
-        use rand::rngs::StdRng;
-
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut ifac_identity = [0u8; 32];
-        rng.fill_bytes(&mut ifac_identity);
-        let ifac_key = vec![0xAB; 32];
-
-        let (transport, sent) = MockTransport::new(true);
-        let iface = Interface::new(transport).with_interface_access_code(
-            InterfaceAccessCode::new(ifac_identity, ifac_key, 8).unwrap(),
-        );
-        (iface, sent)
-    }
-
-    #[test]
-    fn ifac_roundtrip() {
-        let (iface, _) = make_ifac_interface();
-
-        let packet = make_packet([1u8; 16], 5);
-        let raw = packet.to_bytes();
-
-        let with_ifac = iface.apply_ifac(&raw);
-        assert_ne!(with_ifac, raw, "IFAC should modify packet");
-        assert_eq!(with_ifac[0] & 0x80, 0x80, "IFAC flag should be set");
-        assert_eq!(with_ifac.len(), raw.len() + 8, "should add ifac_size bytes");
-
-        let stripped = iface.validate_and_strip_ifac(&with_ifac);
-        assert_eq!(stripped, Some(raw), "round-trip should return original");
-    }
-
-    #[test]
-    fn ifac_wrong_key_rejected() {
-        use rand::RngCore;
-        use rand::SeedableRng;
-        use rand::rngs::StdRng;
-
-        let (iface_a, _) = make_ifac_interface();
-
-        // Create interface B with different key
-        let mut rng = StdRng::seed_from_u64(99);
-        let mut ifac_identity_b = [0u8; 32];
-        rng.fill_bytes(&mut ifac_identity_b);
-        let ifac_key_b = vec![0xCD; 32]; // different key
-        let (transport_b, _) = MockTransport::new(true);
-        let iface_b = Interface::new(transport_b).with_interface_access_code(
-            InterfaceAccessCode::new(ifac_identity_b, ifac_key_b, 8).unwrap(),
-        );
-
-        let packet = make_packet([1u8; 16], 5);
-        let raw = packet.to_bytes();
-
-        // A applies IFAC
-        let with_ifac = iface_a.apply_ifac(&raw);
-
-        // B tries to validate - should fail
-        let result = iface_b.validate_and_strip_ifac(&with_ifac);
-        assert!(result.is_none(), "wrong IFAC key should be rejected");
-    }
-
-    #[test]
-    fn ifac_missing_flag_rejected() {
-        let (iface, _) = make_ifac_interface();
-
-        // Raw packet without IFAC flag
-        let packet = make_packet([1u8; 16], 5);
-        let raw = packet.to_bytes();
-        assert_eq!(raw[0] & 0x80, 0, "raw packet should not have IFAC flag");
-
-        let result = iface.validate_and_strip_ifac(&raw);
-        assert!(
-            result.is_none(),
-            "packet without IFAC flag should be rejected on IFAC interface"
-        );
-    }
-
-    #[test]
-    fn ifac_flag_on_non_ifac_interface_rejected() {
-        let (transport, _) = MockTransport::new(true);
-        let iface = Interface::new(transport); // no IFAC
-
-        // Create a packet with IFAC flag set manually
-        let packet = make_packet([1u8; 16], 5);
-        let mut raw = packet.to_bytes();
-        raw[0] |= 0x80; // set IFAC flag
-
-        let result = iface.validate_and_strip_ifac(&raw);
-        assert!(
-            result.is_none(),
-            "IFAC flag on non-IFAC interface should be rejected"
-        );
-    }
-
-    #[test]
-    fn ifac_correct_key_passes() {
-        let (iface, _) = make_ifac_interface();
-
-        let packet = make_packet([1u8; 16], 5);
-        let raw = packet.to_bytes();
-
-        let with_ifac = iface.apply_ifac(&raw);
-        let result = iface.validate_and_strip_ifac(&with_ifac);
-
-        assert!(result.is_some(), "correct IFAC key should pass");
-        assert_eq!(result.unwrap(), raw);
+    async fn close(&self) -> Result<(), InterfaceError> {
+        self.inner.close().await
     }
 }

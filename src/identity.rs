@@ -3,20 +3,21 @@ use rand::{CryptoRng, RngCore};
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 use crate::crypto::sha256;
+use crate::model::{Destination, ServiceName};
 
 pub struct PrivateIdentity {
     pub(crate) encryption_secret: StaticSecret,
     pub(crate) signing_key: SigningKey,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InvalidPrivateIdentityBytes {
-    pub bytes: usize,
-    pub expected: usize,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IdentityError {
+    InvalidSigningSecret,
+    InvalidAgreementSecret,
 }
 
 impl PrivateIdentity {
-    pub fn generate<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
+    pub(crate) fn generate<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
         let mut enc_bytes = [0u8; 32];
         rng.fill_bytes(&mut enc_bytes);
         let encryption_secret = StaticSecret::from(enc_bytes);
@@ -31,16 +32,15 @@ impl PrivateIdentity {
         }
     }
 
-    pub fn from_secret_bytes(bytes: &[u8]) -> Result<Self, InvalidPrivateIdentityBytes> {
-        if bytes.len() != 64 {
-            return Err(InvalidPrivateIdentityBytes {
-                bytes: bytes.len(),
-                expected: 64,
-            });
-        }
-
+    pub fn from_secret_bytes(bytes: [u8; 64]) -> Result<Self, IdentityError> {
         let enc_bytes: [u8; 32] = bytes[..32].try_into().unwrap();
-        let sig_bytes: [u8; 32] = bytes[32..64].try_into().unwrap();
+        let sig_bytes: [u8; 32] = bytes[32..].try_into().unwrap();
+        if enc_bytes == [0; 32] {
+            return Err(IdentityError::InvalidAgreementSecret);
+        }
+        if sig_bytes == [0; 32] {
+            return Err(IdentityError::InvalidSigningSecret);
+        }
 
         let encryption_secret = StaticSecret::from(enc_bytes);
         let signing_key = SigningKey::from_bytes(&sig_bytes);
@@ -58,6 +58,15 @@ impl PrivateIdentity {
         out
     }
 
+    pub fn destination(&self, name: &ServiceName) -> Destination {
+        let name_hash = sha256(name.as_str().as_bytes());
+        let identity_hash = self.hash();
+        let mut material = [0; 26];
+        material[..10].copy_from_slice(&name_hash[..10]);
+        material[10..].copy_from_slice(&identity_hash);
+        Destination::from_bytes(sha256(&material)[..16].try_into().unwrap())
+    }
+
     pub(crate) fn public_key(&self) -> [u8; 64] {
         let mut out = [0u8; 64];
         out[..32].copy_from_slice(X25519Public::from(&self.encryption_secret).as_bytes());
@@ -67,12 +76,6 @@ impl PrivateIdentity {
 
     pub(crate) fn hash(&self) -> [u8; 16] {
         sha256(&self.public_key())[..16].try_into().unwrap()
-    }
-}
-
-impl Clone for PrivateIdentity {
-    fn clone(&self) -> Self {
-        Self::from_secret_bytes(&self.to_secret_bytes()).unwrap()
     }
 }
 
@@ -87,7 +90,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let id = PrivateIdentity::generate(&mut rng);
         let bytes = id.to_secret_bytes();
-        let id2 = PrivateIdentity::from_secret_bytes(&bytes).unwrap();
+        let id2 = PrivateIdentity::from_secret_bytes(bytes).unwrap();
 
         assert_eq!(id.public_key(), id2.public_key());
         assert_eq!(id.signing_key.as_bytes(), id2.signing_key.as_bytes());
