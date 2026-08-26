@@ -22,6 +22,8 @@ use crate::{Clock, MonoTime, PrivateIdentity};
 const LINK_HANDSHAKE_TIMEOUT: crate::TimeSpan = crate::TimeSpan::from_secs(15);
 const REQUEST_TIMEOUT: crate::TimeSpan = crate::TimeSpan::from_secs(30);
 const SHUTDOWN_GRACE: crate::TimeSpan = crate::TimeSpan::from_secs(5);
+const KEEP_STREAM_OPEN: bool = false;
+const FINISH_STREAM: bool = true;
 
 pub struct NodeBuilder<C, W, E> {
     config: NodeConfig,
@@ -72,11 +74,11 @@ where
         seed.zeroize();
         let relay = matches!(self.config.mode, NodeMode::Relay);
         let duplicate_packet_hashes = self.config.limits.duplicate_packet_hashes;
-        let mut transport_id = [0; 16];
-        rng.fill_bytes(&mut transport_id);
+        let mut relay_address = [0; 16];
+        rng.fill_bytes(&mut relay_address);
         log::info!(
-            "Node started with transport_id <{}>",
-            hex::encode(transport_id)
+            "Node started with relay_address <{}>",
+            hex::encode(relay_address)
         );
         let interfaces = self
             .interfaces
@@ -84,11 +86,11 @@ where
             .map(|(interface, limits)| InterfaceSlot::new(interface, limits))
             .collect();
         let (command_tx, command_rx) = async_channel::bounded(self.config.limits.command_capacity);
-        let command_handles = command_tx.downgrade();
+        let weak_command_sender = command_tx.downgrade();
         let (lifecycle_tx, lifecycle_rx) = async_channel::bounded(
             self.config.limits.maximum_services + self.config.limits.maximum_links * 2,
         );
-        let lifecycle_handles = lifecycle_tx.downgrade();
+        let weak_lifecycle_sender = lifecycle_tx.downgrade();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let shutdown = async move {
             shutdown_rx.await.unwrap_or(ShutdownReport {
@@ -106,16 +108,15 @@ where
             _resource_lifecycle: lifecycle_tx,
             shutdown,
         };
-        let packet_work = Arc::new(self.packet_work);
         let (work_tx, work_rx) = async_channel::bounded(self.config.limits.preparation_in_flight);
         let (prepared_tx, prepared_rx) = async_channel::bounded(1);
-        let preparing = Arc::new(AtomicUsize::new(0));
-        let pipelines = FuturesUnordered::new();
-        pipelines.push(
+        let preparing_packets = Arc::new(AtomicUsize::new(0));
+        let pipeline_tasks = FuturesUnordered::new();
+        pipeline_tasks.push(
             prepare_packets(
                 work_rx,
                 prepared_tx,
-                packet_work.clone(),
+                Arc::new(self.packet_work),
                 self.config.limits.preparation_in_flight,
             )
             .boxed(),
@@ -125,8 +126,8 @@ where
             owner: NodeOwner {
                 config: self.config,
                 rng,
-                transport: relay,
-                transport_id,
+                relays_packets: relay,
+                relay_address,
                 path_table: HashMap::new(),
                 pending_announces: Vec::new(),
                 seen_packets: crate::packet_hashlist::PacketHashlist::new(duplicate_packet_hashes),
@@ -145,23 +146,22 @@ where
                 discovery_path_requests: HashMap::new(),
                 pending_resource_requests: HashSet::new(),
                 commands: Some(command_rx),
-                command_handles,
+                weak_command_sender,
                 lifecycle: Some(lifecycle_rx),
-                lifecycle_handles,
+                weak_lifecycle_sender,
                 interfaces,
-                sends: FuturesUnordered::new(),
-                closes: FuturesUnordered::new(),
-                pipelines,
-                work: work_tx,
-                prepared: prepared_rx,
-                preparing,
+                send_operations: FuturesUnordered::new(),
+                close_operations: FuturesUnordered::new(),
+                pipeline_tasks,
+                prepare_jobs: work_tx,
+                prepared_batches: prepared_rx,
+                preparing_packets,
                 timers: TimerQueue::default(),
                 shutdown_tx: Some(shutdown_tx),
                 phase: NodePhase::Running,
                 services: Vec::new(),
-                pending_requests: HashMap::new(),
+                outbound_request_replies: HashMap::new(),
                 route_waits: HashMap::new(),
-                interfaces_failed: 0,
             },
         };
         Ok((handle, task))
@@ -177,7 +177,7 @@ enum NodePhase {
     Running,
     Closing {
         reason: ShutdownReason,
-        links: usize,
+        links_closed: usize,
         deadline_expired: bool,
     },
 }
@@ -188,8 +188,8 @@ pub(crate) struct InterfaceSlot {
     outbound: VecDeque<(u8, OutboundPacket)>,
     outbound_bytes: usize,
     phase: InterfacePhase,
-    next_apply: u64,
-    completed: BTreeMap<u64, crate::work::PreparedPacket>,
+    next_sequence: u64,
+    prepared_by_sequence: BTreeMap<u64, crate::work::PreparedPacket>,
 }
 
 enum InterfacePhase {
@@ -197,26 +197,22 @@ enum InterfacePhase {
     Draining { sending: bool },
     Failed,
     Closing { failed: bool },
-    Closed,
+    Closed { failed: bool },
 }
 
-pub(crate) struct Events<T, E> {
+pub(crate) struct ReceiveQueue<T, E> {
     queued: VecDeque<(T, usize)>,
     queued_bytes: usize,
-    waiting_receive: Option<oneshot::Sender<Result<T, E>>>,
-    terminal: Option<E>,
+    waiting_receiver_reply: Option<oneshot::Sender<Result<T, E>>>,
+    terminal_error: Option<E>,
     item_limit: usize,
-    byte_limit: usize,
+    max_queued_bytes: usize,
 }
 
 pub(crate) struct LinkEvents {
-    events: Events<LinkEvent, LinkReceiveError>,
-    inbound_requests: BTreeMap<[u8; 16], InboundRequestState>,
+    events: ReceiveQueue<LinkEvent, LinkReceiveError>,
+    inbound_requests: BTreeMap<[u8; 16], InboundRequestPhase>,
     requests_awaiting_delivery: VecDeque<[u8; 16]>,
-}
-
-struct InboundRequestState {
-    phase: InboundRequestPhase,
 }
 
 enum InboundRequestPhase {
@@ -230,7 +226,7 @@ enum InboundRequestPhase {
 impl LinkEvents {
     fn new(capacity: usize) -> Self {
         Self {
-            events: Events::new(capacity, 0),
+            events: ReceiveQueue::new(capacity, usize::MAX),
             inbound_requests: BTreeMap::new(),
             requests_awaiting_delivery: VecDeque::new(),
         }
@@ -242,13 +238,22 @@ pub(crate) enum EventPushError<T> {
     Closed(T),
 }
 
+impl<T> EventPushError<T> {
+    fn link_close_reason(&self) -> LinkCloseReason {
+        match self {
+            Self::Full(_) => LinkCloseReason::CapacityReached,
+            Self::Closed(_) => LinkCloseReason::LocalClosed,
+        }
+    }
+}
+
 enum OutboundAdmissionError {
     Busy,
     InterfaceFailed,
 }
 
 impl OutboundAdmissionError {
-    fn link(self) -> LinkError {
+    fn into_link_error(self) -> LinkError {
         match self {
             Self::Busy => LinkError::InterfaceBusy,
             Self::InterfaceFailed => LinkError::InterfaceFailed,
@@ -256,23 +261,23 @@ impl OutboundAdmissionError {
     }
 }
 
-impl<T, E: Clone> Events<T, E> {
-    fn new(item_limit: usize, byte_limit: usize) -> Self {
+impl<T, E: Clone> ReceiveQueue<T, E> {
+    fn new(item_limit: usize, max_queued_bytes: usize) -> Self {
         Self {
             queued: VecDeque::new(),
             queued_bytes: 0,
-            waiting_receive: None,
-            terminal: None,
+            waiting_receiver_reply: None,
+            terminal_error: None,
             item_limit,
-            byte_limit,
+            max_queued_bytes,
         }
     }
 
     pub(crate) fn push(&mut self, mut item: T, bytes: usize) -> Result<(), EventPushError<T>> {
-        if self.terminal.is_some() {
+        if self.terminal_error.is_some() {
             return Err(EventPushError::Closed(item));
         }
-        if let Some(waiting) = self.waiting_receive.take() {
+        if let Some(waiting) = self.waiting_receiver_reply.take() {
             match waiting.send(Ok(item)) {
                 Ok(()) => return Ok(()),
                 Err(Ok(returned)) => item = returned,
@@ -280,7 +285,7 @@ impl<T, E: Clone> Events<T, E> {
             }
         }
         if self.queued.len() >= self.item_limit
-            || self.byte_limit != 0 && self.queued_bytes + bytes > self.byte_limit
+            || self.queued_bytes.saturating_add(bytes) > self.max_queued_bytes
         {
             return Err(EventPushError::Full(item));
         }
@@ -289,8 +294,8 @@ impl<T, E: Clone> Events<T, E> {
         Ok(())
     }
 
-    fn receive(&mut self, reply: oneshot::Sender<Result<T, E>>) -> bool {
-        if let Some(waiting) = self.waiting_receive.take()
+    fn receive(&mut self, reply: oneshot::Sender<Result<T, E>>) {
+        if let Some(waiting) = self.waiting_receiver_reply.take()
             && !waiting.is_canceled()
         {
             unreachable!("one receiver cannot have two live waits")
@@ -299,31 +304,30 @@ impl<T, E: Clone> Events<T, E> {
             match reply.send(Ok(item)) {
                 Ok(()) => {
                     self.queued_bytes -= bytes;
-                    return true;
+                    return;
                 }
                 Err(Ok(item)) => self.queued.push_front((item, bytes)),
                 Err(Err(_)) => unreachable!(),
             }
-            return false;
+            return;
         }
-        if let Some(reason) = &self.terminal {
+        if let Some(reason) = &self.terminal_error {
             let _ = reply.send(Err(reason.clone()));
         } else {
-            self.waiting_receive = Some(reply);
+            self.waiting_receiver_reply = Some(reply);
         }
-        false
     }
 
-    pub(crate) fn terminate(&mut self, reason: E) {
-        if self.terminal.is_some() {
+    pub(crate) fn close(&mut self, reason: E) {
+        if self.terminal_error.is_some() {
             return;
         }
         if self.queued.is_empty()
-            && let Some(waiting) = self.waiting_receive.take()
+            && let Some(waiting) = self.waiting_receiver_reply.take()
         {
             let _ = waiting.send(Err(reason.clone()));
         }
-        self.terminal = Some(reason);
+        self.terminal_error = Some(reason);
     }
 }
 
@@ -338,12 +342,12 @@ impl InterfaceSlot {
                 reading: false,
                 sending: false,
             },
-            next_apply: 0,
-            completed: BTreeMap::new(),
+            next_sequence: 0,
+            prepared_by_sequence: BTreeMap::new(),
         }
     }
 
-    pub(crate) fn admit(
+    pub(crate) fn enqueue_outbound(
         &mut self,
         priority: u8,
         packet: OutboundPacket,
@@ -365,39 +369,35 @@ impl InterfaceSlot {
         Ok(())
     }
 
-    pub(crate) fn admit_protocol(&mut self, priority: u8, packet: &crate::packet::Packet) -> bool {
-        self.accepting()
+    pub(crate) fn enqueue_protocol_packet(
+        &mut self,
+        priority: u8,
+        packet: &crate::packet::Packet,
+    ) -> bool {
+        self.accepts_outbound()
             && self
-                .admit(priority, OutboundPacket::new(packet.to_bytes()))
+                .enqueue_outbound(priority, OutboundPacket::new(packet.to_bytes()))
                 .is_ok()
     }
 
-    pub(crate) fn accepting(&self) -> bool {
+    pub(crate) fn accepts_outbound(&self) -> bool {
         matches!(self.phase, InterfacePhase::Active { .. })
     }
 
-    fn fail(&mut self) -> bool {
+    fn fail(&mut self) {
         if matches!(
             self.phase,
-            InterfacePhase::Failed | InterfacePhase::Closing { .. } | InterfacePhase::Closed
+            InterfacePhase::Failed | InterfacePhase::Closing { .. } | InterfacePhase::Closed { .. }
         ) {
-            return false;
+            return;
         }
         self.phase = InterfacePhase::Failed;
         self.outbound.clear();
         self.outbound_bytes = 0;
-        true
-    }
-
-    fn begin_close(&mut self) {
-        if let InterfacePhase::Active { sending, .. } = self.phase {
-            self.phase = InterfacePhase::Draining { sending };
-        }
     }
 }
 
-type SendOperation = BoxFuture<'static, (InterfaceId, Result<(), crate::InterfaceError>)>;
-type CloseOperation = BoxFuture<'static, (InterfaceId, Result<(), crate::InterfaceError>)>;
+type InterfaceOperation = BoxFuture<'static, (InterfaceId, Result<(), crate::InterfaceError>)>;
 type PipelineOperation = BoxFuture<'static, PipelineStopped>;
 
 enum PipelineStopped {
@@ -408,8 +408,8 @@ enum PipelineStopped {
 pub(crate) struct NodeOwner {
     config: NodeConfig,
     pub(crate) rng: ProtocolRng,
-    pub(crate) transport: bool,
-    pub(crate) transport_id: crate::packet::DestinationAddress,
+    pub(crate) relays_packets: bool,
+    pub(crate) relay_address: crate::packet::DestinationAddress,
     pub(crate) path_table: HashMap<crate::packet::DestinationAddress, crate::node::PathEntry>,
     pub(crate) pending_announces: Vec<crate::node::PendingAnnounce>,
     pub(crate) seen_packets: crate::packet_hashlist::PacketHashlist,
@@ -429,24 +429,23 @@ pub(crate) struct NodeOwner {
     pub(crate) discovery_path_requests: HashMap<crate::packet::DestinationAddress, usize>,
     pub(crate) pending_resource_requests: HashSet<([u8; 16], [u8; 32])>,
     commands: Option<async_channel::Receiver<Command>>,
-    command_handles: async_channel::WeakSender<Command>,
+    weak_command_sender: async_channel::WeakSender<Command>,
     lifecycle: Option<async_channel::Receiver<DroppedResource>>,
-    lifecycle_handles: async_channel::WeakSender<DroppedResource>,
+    weak_lifecycle_sender: async_channel::WeakSender<DroppedResource>,
     pub(crate) interfaces: Vec<InterfaceSlot>,
-    sends: FuturesUnordered<SendOperation>,
-    closes: FuturesUnordered<CloseOperation>,
-    pipelines: FuturesUnordered<PipelineOperation>,
-    work: async_channel::Sender<PreparePacket>,
-    prepared:
+    send_operations: FuturesUnordered<InterfaceOperation>,
+    close_operations: FuturesUnordered<InterfaceOperation>,
+    pipeline_tasks: FuturesUnordered<PipelineOperation>,
+    prepare_jobs: async_channel::Sender<PreparePacket>,
+    prepared_batches:
         async_channel::Receiver<Vec<Result<crate::work::PreparedPacket, crate::PacketWorkError>>>,
-    preparing: Arc<AtomicUsize>,
+    preparing_packets: Arc<AtomicUsize>,
     pub(crate) timers: TimerQueue,
     shutdown_tx: Option<oneshot::Sender<ShutdownReport>>,
     phase: NodePhase,
     pub(crate) services: Vec<Option<crate::node::ServiceState>>,
-    pending_requests: HashMap<[u8; 16], oneshot::Sender<Result<Bytes, LinkError>>>,
+    outbound_request_replies: HashMap<[u8; 16], oneshot::Sender<Result<Bytes, LinkError>>>,
     route_waits: HashMap<[u8; 16], Vec<PendingRoute>>,
-    interfaces_failed: usize,
 }
 
 pub(crate) struct PendingOpenLink {
@@ -465,12 +464,12 @@ enum PendingRoute {
 }
 
 pub(crate) struct RuntimeChannel {
-    pub(crate) protocol: crate::channel::ChannelState,
-    events: Events<ChannelReceive, ChannelReceiveError>,
-    waiting_sends: VecDeque<WaitingChannelOperation>,
+    pub(crate) protocol_state: crate::channel::ChannelState,
+    events: ReceiveQueue<ChannelReceive, ChannelReceiveError>,
+    blocked_channel_ops: VecDeque<WaitingChannelOperation>,
     outgoing_streams: HashSet<StreamId>,
     ended_incoming_streams: HashSet<StreamId>,
-    delivery_replies: HashMap<[u8; 32], oneshot::Sender<Result<(), ChannelError>>>,
+    pending_delivery_replies: HashMap<[u8; 32], oneshot::Sender<Result<(), ChannelError>>>,
 }
 
 enum WaitingChannelOperation {
@@ -478,10 +477,10 @@ enum WaitingChannelOperation {
         message: ChannelMessage,
         reply: oneshot::Sender<Result<(), ChannelError>>,
     },
-    Buffer {
+    BufferWrite {
         stream: StreamId,
         input: Bytes,
-        finish: bool,
+        finish_stream: bool,
         reply: oneshot::Sender<Result<BufferQueued, BufferError>>,
     },
 }
@@ -504,8 +503,8 @@ enum RuntimeEvent {
 async fn receive_packets(
     interface_id: InterfaceId,
     interface: AttachedInterface,
-    work: async_channel::Sender<PreparePacket>,
-    preparing: Arc<AtomicUsize>,
+    prepare_job_sender: async_channel::Sender<PreparePacket>,
+    preparations_in_flight: Arc<AtomicUsize>,
 ) -> PipelineStopped {
     let mut sequence = 0u64;
     loop {
@@ -518,23 +517,23 @@ async fn receive_packets(
             return PipelineStopped::Interface(interface_id);
         };
         sequence = next;
-        preparing.fetch_add(1, Ordering::AcqRel);
-        if work.send(job).await.is_err() {
-            preparing.fetch_sub(1, Ordering::AcqRel);
+        preparations_in_flight.fetch_add(1, Ordering::AcqRel);
+        if prepare_job_sender.send(job).await.is_err() {
+            preparations_in_flight.fetch_sub(1, Ordering::AcqRel);
             return PipelineStopped::Interface(interface_id);
         }
     }
 }
 
 async fn prepare_packets<W: PacketWork>(
-    work: async_channel::Receiver<PreparePacket>,
-    prepared: async_channel::Sender<
+    prepare_job_receiver: async_channel::Receiver<PreparePacket>,
+    prepared_batch_sender: async_channel::Sender<
         Vec<Result<crate::work::PreparedPacket, crate::PacketWorkError>>,
     >,
     packet_work: Arc<W>,
     concurrency: usize,
 ) -> PipelineStopped {
-    let results = work
+    let results = prepare_job_receiver
         .map(move |job| {
             let packet_work = packet_work.clone();
             async move { packet_work.prepare(job).await }
@@ -543,8 +542,8 @@ async fn prepare_packets<W: PacketWork>(
         .ready_chunks(concurrency);
     futures_util::pin_mut!(results);
     while let Some(results) = results.next().await {
-        let failed = results.iter().any(Result::is_err);
-        if prepared.send(results).await.is_err() || failed {
+        let batch_contains_error = results.iter().any(Result::is_err);
+        if prepared_batch_sender.send(results).await.is_err() || batch_contains_error {
             break;
         }
     }
@@ -558,7 +557,7 @@ async fn next_operation<T>(operations: &mut FuturesUnordered<BoxFuture<'static, 
     }
 }
 
-async fn receive_channel<T>(
+async fn receive_if_present<T>(
     receiver: Option<&async_channel::Receiver<T>>,
 ) -> Result<T, async_channel::RecvError> {
     match receiver {
@@ -582,12 +581,12 @@ where
             }
             let deadline = owner.timers.next_deadline();
             let event = {
-                let command = receive_channel(owner.commands.as_ref()).fuse();
-                let lifecycle = receive_channel(owner.lifecycle.as_ref()).fuse();
-                let send = next_operation(&mut owner.sends).fuse();
-                let close = next_operation(&mut owner.closes).fuse();
-                let pipeline = next_operation(&mut owner.pipelines).fuse();
-                let prepared = owner.prepared.recv().fuse();
+                let command = receive_if_present(owner.commands.as_ref()).fuse();
+                let lifecycle = receive_if_present(owner.lifecycle.as_ref()).fuse();
+                let send = next_operation(&mut owner.send_operations).fuse();
+                let close = next_operation(&mut owner.close_operations).fuse();
+                let pipeline = next_operation(&mut owner.pipeline_tasks).fuse();
+                let prepared = owner.prepared_batches.recv().fuse();
                 let timer = async {
                     match deadline {
                         Some(deadline) => clock.sleep_until(deadline).await,
@@ -615,25 +614,30 @@ where
                         owner.begin_shutdown(ShutdownReason::LastHandleDropped, now);
                     }
                 }
-                RuntimeEvent::Lifecycle(Ok(resource)) => owner.release(resource),
+                RuntimeEvent::Lifecycle(Ok(resource)) => owner.handle_dropped_resource(resource),
                 RuntimeEvent::Lifecycle(Err(_)) => owner.lifecycle = None,
-                RuntimeEvent::Sent(sent) => owner.sent(sent)?,
-                RuntimeEvent::Closed(closed) => owner.closed(closed)?,
+                RuntimeEvent::Sent(result) => owner.handle_send_completion(result)?,
+                RuntimeEvent::Closed(result) => owner.handle_close_completion(result)?,
                 RuntimeEvent::PipelineStopped(PipelineStopped::Interface(interface)) => {
                     let slot = owner
                         .interfaces
                         .get_mut(interface.0)
                         .ok_or(NodeRunError::ProtocolInvariant)?;
-                    owner.interfaces_failed += usize::from(slot.fail());
+                    slot.fail();
                 }
                 RuntimeEvent::PipelineStopped(PipelineStopped::Preparation) => {
                     return Err(NodeRunError::PacketWorkFailed);
                 }
-                RuntimeEvent::Prepared(Ok(prepared)) => {
-                    for prepared in prepared {
-                        owner.finished_preparing()?;
-                        match prepared {
-                            Ok(prepared) => owner.prepared(prepared, now)?,
+                RuntimeEvent::Prepared(Ok(batch)) => {
+                    for result in batch {
+                        owner
+                            .preparing_packets
+                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                                count.checked_sub(1)
+                            })
+                            .map_err(|_| NodeRunError::ProtocolInvariant)?;
+                        match result {
+                            Ok(packet) => owner.accept_prepared_packet(packet, now)?,
                             Err(_) => return Err(NodeRunError::PacketWorkFailed),
                         }
                     }
@@ -646,32 +650,30 @@ where
 }
 
 impl NodeOwner {
-    pub(crate) fn active_interfaces(
+    pub(crate) fn outbound_interfaces(
         interfaces: &[InterfaceSlot],
     ) -> impl Iterator<Item = usize> + '_ {
         interfaces
             .iter()
             .enumerate()
-            .filter_map(|(id, interface)| interface.accepting().then_some(id))
+            .filter_map(|(id, interface)| interface.accepts_outbound().then_some(id))
     }
 
-    fn release(&mut self, resource: DroppedResource) {
+    fn handle_dropped_resource(&mut self, resource: DroppedResource) {
         match resource {
             DroppedResource::Service(service) => {
                 for link in self.remove_service(service) {
-                    self.close_protocol_link(link, LinkCloseReason::LocalClosed);
+                    self.close_link(link, LinkCloseReason::LocalClosed);
                 }
             }
-            DroppedResource::Link(link) => {
-                self.close_protocol_link(link.0, LinkCloseReason::LocalClosed);
-            }
+            DroppedResource::Link(link) => self.close_link(link.0, LinkCloseReason::LocalClosed),
             DroppedResource::Channel(link) => {
-                self.close_runtime_channel(link.0, ChannelReceiveError::ChannelClosed);
+                self.close_link_channel(link.0, ChannelReceiveError::ChannelClosed)
             }
         }
     }
 
-    fn prepared(
+    fn accept_prepared_packet(
         &mut self,
         prepared: crate::work::PreparedPacket,
         now: MonoTime,
@@ -680,13 +682,17 @@ impl NodeOwner {
             .interfaces
             .get_mut(prepared.interface.0)
             .ok_or(NodeRunError::ProtocolInvariant)?;
-        if slot.completed.insert(prepared.sequence, prepared).is_some() {
+        if slot
+            .prepared_by_sequence
+            .insert(prepared.sequence, prepared)
+            .is_some()
+        {
             return Err(NodeRunError::ProtocolInvariant);
         }
         let mut ready = Vec::new();
-        while let Some(prepared) = slot.completed.remove(&slot.next_apply) {
-            slot.next_apply = slot
-                .next_apply
+        while let Some(prepared) = slot.prepared_by_sequence.remove(&slot.next_sequence) {
+            slot.next_sequence = slot
+                .next_sequence
                 .checked_add(1)
                 .ok_or(NodeRunError::ProtocolInvariant)?;
             if let Some(packet) = prepared.packet {
@@ -694,7 +700,7 @@ impl NodeOwner {
             }
         }
         if !ready.is_empty() {
-            self.process(now, ready);
+            self.handle_packets(now, ready);
         }
         Ok(())
     }
@@ -713,19 +719,16 @@ impl NodeOwner {
             *reading = true;
             let interface = slot.interface.clone();
             let id = InterfaceId(id);
-            self.pipelines.push(
-                receive_packets(id, interface, self.work.clone(), self.preparing.clone()).boxed(),
+            self.pipeline_tasks.push(
+                receive_packets(
+                    id,
+                    interface,
+                    self.prepare_jobs.clone(),
+                    self.preparing_packets.clone(),
+                )
+                .boxed(),
             );
         }
-    }
-
-    fn finished_preparing(&self) -> Result<(), NodeRunError> {
-        self.preparing
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                count.checked_sub(1)
-            })
-            .map(|_| ())
-            .map_err(|_| NodeRunError::ProtocolInvariant)
     }
 
     fn schedule_sends(&mut self) {
@@ -746,14 +749,14 @@ impl NodeOwner {
             *sending = true;
             let interface = slot.interface.clone();
             let id = InterfaceId(id);
-            self.sends
+            self.send_operations
                 .push(async move { (id, interface.send(packet).await) }.boxed());
         }
     }
 
-    fn sent(
+    fn handle_send_completion(
         &mut self,
-        (interface, sent): (InterfaceId, Result<(), crate::InterfaceError>),
+        (interface, send_result): (InterfaceId, Result<(), crate::InterfaceError>),
     ) -> Result<(), NodeRunError> {
         let slot = self
             .interfaces
@@ -766,8 +769,8 @@ impl NodeOwner {
             _ => return Ok(()),
         };
         *sending = false;
-        if sent.is_err() {
-            self.interfaces_failed += usize::from(slot.fail());
+        if send_result.is_err() {
+            slot.fail();
         }
         Ok(())
     }
@@ -782,14 +785,14 @@ impl NodeOwner {
             slot.phase = InterfacePhase::Closing { failed };
             let interface = slot.interface.clone();
             let id = InterfaceId(id);
-            self.closes
+            self.close_operations
                 .push(async move { (id, interface.close().await) }.boxed());
         }
     }
 
-    fn closed(
+    fn handle_close_completion(
         &mut self,
-        (interface, closed): (InterfaceId, Result<(), crate::InterfaceError>),
+        (interface, close_result): (InterfaceId, Result<(), crate::InterfaceError>),
     ) -> Result<(), NodeRunError> {
         let slot = self
             .interfaces
@@ -798,18 +801,17 @@ impl NodeOwner {
         let InterfacePhase::Closing { failed } = slot.phase else {
             return Ok(());
         };
-        if closed.is_err() && !failed {
-            self.interfaces_failed += 1;
-        }
-        slot.phase = InterfacePhase::Closed;
+        slot.phase = InterfacePhase::Closed {
+            failed: failed || close_result.is_err(),
+        };
         Ok(())
     }
 
     fn deliver_waiting_request(&mut self, link: [u8; 16]) {
-        let Some(commands) = self.command_handles.upgrade() else {
+        let Some(commands) = self.weak_command_sender.upgrade() else {
             return;
         };
-        let mut receiver_closed = false;
+        let mut event_queue_closed = false;
         let Some(events) = self
             .established_links
             .get_mut(&link)
@@ -821,7 +823,7 @@ impl NodeOwner {
             let Some(state) = events.inbound_requests.remove(&request) else {
                 continue;
             };
-            let InboundRequestPhase::AwaitingDelivery { path, body } = state.phase else {
+            let InboundRequestPhase::AwaitingDelivery { path, body } = state else {
                 events.inbound_requests.insert(request, state);
                 continue;
             };
@@ -834,40 +836,35 @@ impl NodeOwner {
             };
             match events.events.push(LinkEvent::Request(incoming), 0) {
                 Ok(()) => {
-                    events.inbound_requests.insert(
-                        request,
-                        InboundRequestState {
-                            phase: InboundRequestPhase::AwaitingResponse,
-                        },
-                    );
+                    events
+                        .inbound_requests
+                        .insert(request, InboundRequestPhase::AwaitingResponse);
                 }
                 Err(EventPushError::Full(LinkEvent::Request(incoming))) => {
                     events.inbound_requests.insert(
                         request,
-                        InboundRequestState {
-                            phase: InboundRequestPhase::AwaitingDelivery {
-                                path: incoming.path,
-                                body: incoming.body,
-                            },
+                        InboundRequestPhase::AwaitingDelivery {
+                            path: incoming.path,
+                            body: incoming.body,
                         },
                     );
                     events.requests_awaiting_delivery.push_front(request);
                     break;
                 }
                 Err(EventPushError::Closed(_)) => {
-                    receiver_closed = true;
+                    event_queue_closed = true;
                     break;
                 }
                 Err(EventPushError::Full(_)) => unreachable!(),
             }
         }
-        if receiver_closed {
-            self.close_protocol_link(link, LinkCloseReason::CapacityReached);
+        if event_queue_closed {
+            self.close_link(link, LinkCloseReason::LocalClosed);
         }
     }
 
     fn expire_timers(&mut self, now: MonoTime) {
-        for _ in 0..64 {
+        for _ in 0..self.config.limits.command_capacity {
             let Some(timer) = self.timers.pop_due(now) else {
                 break;
             };
@@ -881,11 +878,8 @@ impl NodeOwner {
                         .get_mut(&link)
                         .and_then(|link| link.events.as_mut())
                         .and_then(|events| events.inbound_requests.remove(&request));
-                    if matches!(
-                        state.map(|state| state.phase),
-                        Some(InboundRequestPhase::AwaitingDelivery { .. })
-                    ) {
-                        self.close_protocol_link(link, LinkCloseReason::CapacityReached);
+                    if matches!(state, Some(InboundRequestPhase::AwaitingDelivery { .. })) {
+                        self.close_link(link, LinkCloseReason::CapacityReached);
                     }
                 }
                 TimerEvent::Shutdown => {
@@ -933,7 +927,7 @@ impl NodeOwner {
                 }
                 let destination = identity.destination(&name);
                 let path_values: Vec<_> = paths.iter().map(|path| path.as_str()).collect();
-                let events = Events::new(self.config.limits.event_capacity, 0);
+                let events = ReceiveQueue::new(self.config.limits.event_capacity, usize::MAX);
                 let id = self.add_service(
                     name.as_str(),
                     &path_values,
@@ -942,11 +936,11 @@ impl NodeOwner {
                     events,
                 );
                 let commands = self
-                    .command_handles
+                    .weak_command_sender
                     .upgrade()
                     .expect("command sender disappeared while registering service");
                 let lifecycle = self
-                    .lifecycle_handles
+                    .weak_lifecycle_sender
                     .upgrade()
                     .expect("lifecycle sender disappeared while registering service");
                 let _ = reply.send(Ok(Service {
@@ -969,13 +963,15 @@ impl NodeOwner {
                 ratchet,
                 reply,
             } => {
-                let has_ratchet = matches!(ratchet, RatchetAction::Rotate)
+                let announcement_uses_ratchet = matches!(ratchet, RatchetAction::Rotate)
                     || self.services[service.0]
                         .as_ref()
                         .is_some_and(|service| !service.ratchets.is_empty());
-                if self.interfaces.iter().all(|slot| !slot.accepting()) {
+                if self.interfaces.iter().all(|slot| !slot.accepts_outbound()) {
                     let _ = reply.send(Err(AnnounceError::NoUsableInterface));
-                } else if has_ratchet && data.len() > 301 {
+                } else if announcement_uses_ratchet
+                    && data.len() > Service::MAX_RATCHET_ANNOUNCEMENT_BYTES
+                {
                     let _ = reply.send(Err(AnnounceError::ApplicationDataTooLarge));
                 } else if let Some(prepared) =
                     self.prepare_announcement(service, data.to_vec(), ratchet)
@@ -1002,7 +998,7 @@ impl NodeOwner {
                 let destination = destination.into_bytes();
                 if self.has_path(destination) {
                     self.send_destination(destination, body, reply);
-                } else if self.can_wait_for_route() {
+                } else if self.has_route_wait_capacity() {
                     self.route_waits
                         .entry(destination)
                         .or_default()
@@ -1016,7 +1012,7 @@ impl NodeOwner {
                 let destination = destination.into_bytes();
                 if self.has_path(destination) {
                     self.open_link(destination, reply, now);
-                } else if self.can_wait_for_route() {
+                } else if self.has_route_wait_capacity() {
                     self.route_waits
                         .entry(destination)
                         .or_default()
@@ -1036,11 +1032,11 @@ impl NodeOwner {
                         .expect("accepted link disappeared")
                         .events = Some(events);
                     let commands = self
-                        .command_handles
+                        .weak_command_sender
                         .upgrade()
                         .expect("command sender disappeared while accepting link");
                     let lifecycle = self
-                        .lifecycle_handles
+                        .weak_lifecycle_sender
                         .upgrade()
                         .expect("lifecycle sender disappeared while accepting link");
                     let _ = reply.send(Ok(Link {
@@ -1065,8 +1061,8 @@ impl NodeOwner {
                 let _ = reply.send(result);
             }
             Command::CloseLink { link, reply } => {
-                self.finish_link_close(link.0, LinkCloseReason::LocalClosed);
-                if let Some(requests) = self.close_link(link.0) {
+                self.terminate_link_handles(link.0, LinkCloseReason::LocalClosed);
+                if let Some(requests) = self.remove_link_state(link.0) {
                     self.fail_outbound_requests(requests, LinkError::LinkClosed);
                     let _ = reply.send(Ok(()));
                 } else {
@@ -1091,7 +1087,7 @@ impl NodeOwner {
                 let result = match self.prepare_link_datagram(link.0, &body) {
                     Ok(outbound) => match self.admit_outbound(&outbound) {
                         Ok(()) => Ok(()),
-                        Err(error) => Err(error.link()),
+                        Err(error) => Err(error.into_link_error()),
                     },
                     Err(error) => Err(error),
                 };
@@ -1106,10 +1102,10 @@ impl NodeOwner {
                 Ok(prepared) => match self.admit_outbound(&prepared.outbound) {
                     Ok(()) => {
                         let request = self.commit_request(prepared);
-                        self.pending_requests.insert(request.0, reply);
+                        self.outbound_request_replies.insert(request.0, reply);
                     }
                     Err(error) => {
-                        let _ = reply.send(Err(error.link()));
+                        let _ = reply.send(Err(error.into_link_error()));
                     }
                 },
                 Err(_) => {
@@ -1122,20 +1118,17 @@ impl NodeOwner {
                 response,
                 reply,
             } => {
-                let ready = self
+                let request_awaits_response = self
                     .established_links
                     .get(&link.0)
                     .and_then(|link| link.events.as_ref())
                     .is_some_and(|events| {
                         matches!(
-                            events
-                                .inbound_requests
-                                .get(&request.0)
-                                .map(|state| &state.phase),
+                            events.inbound_requests.get(&request.0),
                             Some(InboundRequestPhase::AwaitingResponse)
                         )
                     });
-                let result = if !ready {
+                let result = if !request_awaits_response {
                     Err(
                         if self
                             .established_links
@@ -1148,13 +1141,8 @@ impl NodeOwner {
                         },
                     )
                 } else {
-                    match self.prepare_response(
-                        link.0,
-                        crate::WireRequestId(request.0),
-                        &response,
-                        None,
-                        true,
-                    ) {
+                    match self.prepare_response(link.0, crate::WireRequestId(request.0), &response)
+                    {
                         Ok(prepared) => match self.admit_outbound(&prepared.outbound) {
                             Ok(()) => {
                                 self.commit_response(prepared);
@@ -1169,7 +1157,7 @@ impl NodeOwner {
                                 self.timers.cancel_inbound_request(link.0, request.0);
                                 Ok(())
                             }
-                            Err(error) => Err(error.link()),
+                            Err(error) => Err(error.into_link_error()),
                         },
                         Err(error) => Err(error),
                     }
@@ -1201,24 +1189,25 @@ impl NodeOwner {
             Command::OpenChannel { link, reply } => match self.open_channel(link.0) {
                 Ok(()) => {
                     let capacity = self.config.limits.channel_queue_capacity;
-                    let events = Events::new(capacity, capacity * crate::buffer::MAX_INPUT_BYTES);
+                    let events =
+                        ReceiveQueue::new(capacity, capacity * crate::buffer::MAX_INPUT_BYTES);
                     self.established_links
                         .get_mut(&link.0)
                         .expect("opened channel link disappeared")
                         .channel = Some(RuntimeChannel {
-                        protocol: crate::channel::ChannelState::new(),
+                        protocol_state: crate::channel::ChannelState::new(),
                         events,
-                        waiting_sends: VecDeque::new(),
+                        blocked_channel_ops: VecDeque::new(),
                         outgoing_streams: HashSet::new(),
                         ended_incoming_streams: HashSet::new(),
-                        delivery_replies: HashMap::new(),
+                        pending_delivery_replies: HashMap::new(),
                     });
                     let commands = self
-                        .command_handles
+                        .weak_command_sender
                         .upgrade()
                         .expect("command sender disappeared while opening channel");
                     let lifecycle = self
-                        .lifecycle_handles
+                        .weak_lifecycle_sender
                         .upgrade()
                         .expect("lifecycle sender disappeared while opening channel");
                     let _ = reply.send(Ok(Channel {
@@ -1255,11 +1244,11 @@ impl NodeOwner {
                         .get_mut(&link.0)
                         .and_then(|link| link.channel.as_mut())
                         .expect("sending channel disappeared")
-                        .delivery_replies
+                        .pending_delivery_replies
                         .insert(packet, reply);
                 }
                 Err(QueueChannelError::WindowFull) => {
-                    self.wait_for_reliable(
+                    self.enqueue_window_waiter(
                         link.0,
                         WaitingChannelOperation::Message { message, reply },
                     );
@@ -1294,7 +1283,7 @@ impl NodeOwner {
                 input,
                 reply,
             } => {
-                self.queue_buffer(link, stream, input, false, reply, now);
+                self.queue_buffer(link, stream, input, KEEP_STREAM_OPEN, reply, now);
             }
             Command::FinishBuffer {
                 link,
@@ -1302,13 +1291,13 @@ impl NodeOwner {
                 input,
                 reply,
             } => {
-                self.queue_buffer(link, stream, input, true, reply, now);
+                self.queue_buffer(link, stream, input, FINISH_STREAM, reply, now);
             }
             Command::Shutdown => self.begin_shutdown(ShutdownReason::Requested, now),
         }
     }
 
-    fn can_wait_for_route(&self) -> bool {
+    fn has_route_wait_capacity(&self) -> bool {
         self.route_waits.values().map(Vec::len).sum::<usize>() < self.config.limits.command_capacity
     }
 
@@ -1347,12 +1336,11 @@ impl NodeOwner {
         }
         if self.at_link_capacity() {
             let _ = reply.send(Err(LinkError::CapacityReached));
-        } else if self.interfaces.iter().all(|slot| !slot.accepting()) {
+        } else if self.interfaces.iter().all(|slot| !slot.accepts_outbound()) {
             let _ = reply.send(Err(LinkError::InterfaceFailed));
         } else {
             let events = LinkEvents::new(self.config.limits.event_capacity);
-            self.link(
-                None,
+            self.begin_outbound_link(
                 destination,
                 now,
                 LINK_HANDSHAKE_TIMEOUT,
@@ -1369,10 +1357,10 @@ impl NodeOwner {
             return Err(OutboundAdmissionError::InterfaceFailed);
         };
         let packet = OutboundPacket::new(outbound.packet.to_bytes());
-        if !slot.accepting() || packet.len() > slot.limits.maximum_packet_bytes {
+        if !slot.accepts_outbound() || packet.len() > slot.limits.maximum_packet_bytes {
             return Err(OutboundAdmissionError::InterfaceFailed);
         }
-        slot.admit(outbound.priority, packet)
+        slot.enqueue_outbound(outbound.priority, packet)
             .map_err(|_| OutboundAdmissionError::Busy)?;
         Ok(())
     }
@@ -1382,7 +1370,7 @@ impl NodeOwner {
         link: LinkId,
         stream: StreamId,
         input: bytes::Bytes,
-        finish: bool,
+        finish_stream: bool,
         reply: oneshot::Sender<Result<BufferQueued, BufferError>>,
         now: MonoTime,
     ) {
@@ -1395,11 +1383,11 @@ impl NodeOwner {
             let _ = reply.send(Err(BufferError::Channel(ChannelError::ChannelClosed)));
             return;
         }
-        let (raw, input_bytes) = crate::buffer::encode(stream, &input, finish);
-        let end_queued = finish && input_bytes == input.len();
-        match self.send_buffer_data(link.0, &raw, now) {
+        let (encoded, input_bytes) = crate::buffer::encode(stream, &input, finish_stream);
+        let stream_end_queued = finish_stream && input_bytes == input.len();
+        match self.send_buffer_data(link.0, &encoded, now) {
             Ok(_) => {
-                if end_queued {
+                if stream_end_queued {
                     self.established_links
                         .get_mut(&link.0)
                         .and_then(|link| link.channel.as_mut())
@@ -1409,16 +1397,16 @@ impl NodeOwner {
                 }
                 let _ = reply.send(Ok(BufferQueued {
                     input_bytes,
-                    end_queued,
+                    end_queued: stream_end_queued,
                 }));
             }
             Err(QueueChannelError::WindowFull) => {
-                self.wait_for_reliable(
+                self.enqueue_window_waiter(
                     link.0,
-                    WaitingChannelOperation::Buffer {
+                    WaitingChannelOperation::BufferWrite {
                         stream,
                         input,
-                        finish,
+                        finish_stream,
                         reply,
                     },
                 );
@@ -1430,7 +1418,7 @@ impl NodeOwner {
         }
     }
 
-    fn retry_reliable(&mut self, link: [u8; 16], now: MonoTime) {
+    fn retry_waiting_operations(&mut self, link: [u8; 16], now: MonoTime) {
         let Some(channel) = self
             .established_links
             .get_mut(&link)
@@ -1438,8 +1426,7 @@ impl NodeOwner {
         else {
             return;
         };
-        let count = channel.waiting_sends.len().min(32);
-        let waiting = channel.waiting_sends.drain(..count).collect::<Vec<_>>();
+        let waiting = std::mem::take(&mut channel.blocked_channel_ops);
         for operation in waiting {
             match operation {
                 WaitingChannelOperation::Message { message, reply } => self.handle_command(
@@ -1450,58 +1437,55 @@ impl NodeOwner {
                     },
                     now,
                 ),
-                WaitingChannelOperation::Buffer {
+                WaitingChannelOperation::BufferWrite {
                     stream,
                     input,
-                    finish,
+                    finish_stream,
                     reply,
-                } => self.queue_buffer(LinkId(link), stream, input, finish, reply, now),
+                } => self.queue_buffer(LinkId(link), stream, input, finish_stream, reply, now),
             }
         }
     }
 
-    pub(crate) fn complete_channel_send(
+    pub(crate) fn handle_channel_delivery(
         &mut self,
         link: [u8; 16],
-        packet: [u8; 32],
-        delivered: bool,
+        packet_id: [u8; 32],
+        delivery_confirmed: bool,
         now: MonoTime,
     ) {
         let reply = self
             .established_links
             .get_mut(&link)
             .and_then(|link| link.channel.as_mut())
-            .and_then(|channel| channel.delivery_replies.remove(&packet));
+            .and_then(|channel| channel.pending_delivery_replies.remove(&packet_id));
         if let Some(reply) = reply {
-            let _ = reply.send(if delivered {
+            let _ = reply.send(if delivery_confirmed {
                 Ok(())
             } else {
                 Err(ChannelError::RetryLimitReached)
             });
-            if delivered {
-                self.retry_reliable(link, now);
+            if delivery_confirmed {
+                self.retry_waiting_operations(link, now);
             }
         }
     }
 
-    pub(crate) fn deliver_link_datagram(&mut self, link: [u8; 16], data: Vec<u8>) {
-        let delivered = self
+    pub(crate) fn enqueue_link_datagram(&mut self, link: [u8; 16], data: Vec<u8>) {
+        let Some(events) = self
             .established_links
             .get_mut(&link)
             .and_then(|link| link.events.as_mut())
-            .is_some_and(|events| {
-                events
-                    .events
-                    .push(LinkEvent::Datagram(data.into()), 0)
-                    .is_ok()
-            });
-        if !delivered {
-            self.close_protocol_link(link, LinkCloseReason::CapacityReached);
+        else {
+            return;
+        };
+        if let Err(error) = events.events.push(LinkEvent::Datagram(data.into()), 0) {
+            self.close_link(link, error.link_close_reason());
         }
     }
 
-    pub(crate) fn deliver_incoming_link(&mut self, service: ServiceId, link: [u8; 16]) {
-        let Some(commands) = self.command_handles.upgrade() else {
+    pub(crate) fn enqueue_incoming_link(&mut self, service: ServiceId, link: [u8; 16]) {
+        let Some(commands) = self.weak_command_sender.upgrade() else {
             self.reject_incoming_link(link);
             return;
         };
@@ -1509,7 +1493,7 @@ impl NodeOwner {
             offer: LinkOfferId(link),
             commands,
         };
-        let delivered = self
+        let queued = self
             .services
             .get_mut(service.0)
             .and_then(Option::as_mut)
@@ -1519,12 +1503,12 @@ impl NodeOwner {
                     .push(ServiceEvent::IncomingLink(incoming), 0)
                     .is_ok()
             });
-        if !delivered {
+        if !queued {
             self.reject_incoming_link(link);
         }
     }
 
-    pub(crate) fn finish_link_establishment(
+    pub(crate) fn complete_link_open(
         &mut self,
         link: [u8; 16],
         pending: PendingOpenLink,
@@ -1538,9 +1522,9 @@ impl NodeOwner {
             .get_mut(&link)
             .expect("established link disappeared")
             .events = Some(pending.events);
-        if let Some(commands) = self.command_handles.upgrade() {
+        if let Some(commands) = self.weak_command_sender.upgrade() {
             let lifecycle = self
-                .lifecycle_handles
+                .weak_lifecycle_sender
                 .upgrade()
                 .expect("lifecycle sender disappeared while opening link");
             let _ = pending.reply.send(Ok(Link {
@@ -1551,30 +1535,31 @@ impl NodeOwner {
                 _drop_notice: DropNotice::new(lifecycle, DroppedResource::Link(LinkId(link))),
             }));
         } else {
-            self.close_protocol_link(link, LinkCloseReason::LocalClosed);
+            self.close_link(link, LinkCloseReason::LocalClosed);
         }
     }
 
-    pub(crate) fn finish_request(
+    pub(crate) fn complete_request(
         &mut self,
         request: crate::RequestId,
-        result: Result<(Vec<u8>, Option<Vec<u8>>), LinkError>,
+        result: Result<Vec<u8>, LinkError>,
     ) {
-        if let Some(reply) = self.pending_requests.remove(&request.0) {
-            let result = result.map(|(data, _)| data.into());
+        if let Some(reply) = self.outbound_request_replies.remove(&request.0) {
+            let result = result.map(Into::into);
             let _ = reply.send(result);
         }
     }
 
-    pub(crate) fn receive_request(
+    pub(crate) fn handle_incoming_request(
         &mut self,
         link: [u8; 16],
         request: crate::RequestId,
         path: String,
-        data: Vec<u8>,
+        body: Vec<u8>,
         now: MonoTime,
     ) {
         let Ok(path) = RequestPath::new(path) else {
+            self.close_link(link, LinkCloseReason::ProtocolViolation);
             return;
         };
         let Some(events) = self
@@ -1587,7 +1572,7 @@ impl NodeOwner {
         if events.inbound_requests.len() >= self.config.limits.event_capacity
             || events.inbound_requests.contains_key(&request.0)
         {
-            self.close_protocol_link(link, LinkCloseReason::CapacityReached);
+            self.close_link(link, LinkCloseReason::CapacityReached);
             return;
         }
         let deadline = now
@@ -1595,11 +1580,9 @@ impl NodeOwner {
             .expect("inbound request deadline overflow");
         events.inbound_requests.insert(
             request.0,
-            InboundRequestState {
-                phase: InboundRequestPhase::AwaitingDelivery {
-                    path,
-                    body: data.into(),
-                },
+            InboundRequestPhase::AwaitingDelivery {
+                path,
+                body: body.into(),
             },
         );
         events.requests_awaiting_delivery.push_back(request.0);
@@ -1608,48 +1591,52 @@ impl NodeOwner {
         self.deliver_waiting_request(link);
     }
 
-    pub(crate) fn finish_link_identification(
+    pub(crate) fn complete_identification(
         &mut self,
         link: [u8; 16],
-        identity: Result<[u8; 16], LinkCloseReason>,
+        result: Result<[u8; 16], LinkCloseReason>,
     ) {
-        let identity = match identity {
+        let identity = match result {
             Ok(identity) => identity,
             Err(reason) => {
-                self.close_protocol_link(link, reason);
+                self.close_link(link, reason);
                 return;
             }
         };
-        let delivered = self
+        let result = self
             .established_links
             .get_mut(&link)
             .and_then(|link| link.events.as_mut())
-            .is_some_and(|events| {
+            .map(|events| {
                 events
                     .events
                     .push(LinkEvent::Identified(IdentityHash::from_bytes(identity)), 0)
-                    .is_ok()
             });
-        if delivered {
-            self.commit_remote_identity(link, identity);
-        } else {
-            self.close_protocol_link(link, LinkCloseReason::CapacityReached);
+        match result {
+            Some(Ok(())) => self.commit_remote_identity(link, identity),
+            Some(Err(error)) => self.close_link(link, error.link_close_reason()),
+            None => {}
         }
     }
 
-    pub(crate) fn resolve_route(&mut self, destination: [u8; 16], found: bool, now: MonoTime) {
+    pub(crate) fn resolve_route(
+        &mut self,
+        destination: [u8; 16],
+        route_found: bool,
+        now: MonoTime,
+    ) {
         if let Some(waiters) = self.route_waits.remove(&destination) {
             for waiter in waiters {
                 match waiter {
                     PendingRoute::Send { body, reply } => {
-                        if found {
+                        if route_found {
                             self.send_destination(destination, body, reply);
                         } else {
                             let _ = reply.send(Err(SendError::NoRoute));
                         }
                     }
                     PendingRoute::OpenLink { reply } => {
-                        if found {
+                        if route_found {
                             self.open_link(destination, reply, now);
                         } else {
                             let _ = reply.send(Err(LinkError::NoRoute));
@@ -1660,41 +1647,41 @@ impl NodeOwner {
         }
     }
 
-    fn wait_for_reliable(&mut self, link: [u8; 16], operation: WaitingChannelOperation) {
+    fn enqueue_window_waiter(&mut self, link: [u8; 16], operation: WaitingChannelOperation) {
         let Some(channel) = self
             .established_links
             .get_mut(&link)
             .and_then(|link| link.channel.as_mut())
         else {
-            Self::fail_waiting(operation, ChannelError::ChannelClosed);
+            Self::reply_to_failed_waiter(operation, ChannelError::ChannelClosed);
             return;
         };
-        if channel.waiting_sends.len() < self.config.limits.channel_queue_capacity {
-            channel.waiting_sends.push_back(operation);
+        if channel.blocked_channel_ops.len() < self.config.limits.channel_queue_capacity {
+            channel.blocked_channel_ops.push_back(operation);
             return;
         }
-        Self::fail_waiting(operation, ChannelError::CapacityReached);
+        Self::reply_to_failed_waiter(operation, ChannelError::CapacityReached);
     }
 
-    fn fail_waiting(operation: WaitingChannelOperation, error: ChannelError) {
+    fn reply_to_failed_waiter(operation: WaitingChannelOperation, error: ChannelError) {
         match operation {
             WaitingChannelOperation::Message { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
-            WaitingChannelOperation::Buffer { reply, .. } => {
+            WaitingChannelOperation::BufferWrite { reply, .. } => {
                 let _ = reply.send(Err(BufferError::Channel(error)));
             }
         }
     }
 
-    pub(crate) fn close_protocol_link(&mut self, link: [u8; 16], reason: LinkCloseReason) {
-        self.finish_link_close(link, reason);
-        if let Some(requests) = self.close_link(link) {
+    pub(crate) fn close_link(&mut self, link: [u8; 16], reason: LinkCloseReason) {
+        self.terminate_link_handles(link, reason);
+        if let Some(requests) = self.remove_link_state(link) {
             self.fail_outbound_requests(requests, LinkError::LinkClosed);
         }
     }
 
-    pub(crate) fn finish_link_close(&mut self, link: [u8; 16], reason: LinkCloseReason) {
+    pub(crate) fn terminate_link_handles(&mut self, link: [u8; 16], reason: LinkCloseReason) {
         if let Some(mut events) = self
             .established_links
             .get_mut(&link)
@@ -1703,11 +1690,9 @@ impl NodeOwner {
             for request in events.inbound_requests.keys() {
                 self.timers.cancel_inbound_request(link, *request);
             }
-            events
-                .events
-                .terminate(LinkReceiveError::LinkClosed(reason));
+            events.events.close(LinkReceiveError::LinkClosed(reason));
         }
-        self.close_runtime_channel(link, ChannelReceiveError::LinkClosed);
+        self.close_link_channel(link, ChannelReceiveError::LinkClosed);
     }
 
     fn fail_outbound_requests(
@@ -1716,59 +1701,61 @@ impl NodeOwner {
         error: LinkError,
     ) {
         for request in requests {
-            if let Some(reply) = self.pending_requests.remove(&request.0) {
+            if let Some(reply) = self.outbound_request_replies.remove(&request.0) {
                 let _ = reply.send(Err(error));
             }
         }
     }
 
-    pub(crate) fn close_runtime_channel(&mut self, link: [u8; 16], reason: ChannelReceiveError) {
+    pub(crate) fn close_link_channel(&mut self, link: [u8; 16], reason: ChannelReceiveError) {
         if let Some(mut channel) = self
             .established_links
             .get_mut(&link)
             .and_then(|link| link.channel.take())
         {
-            channel.events.terminate(reason);
-            while let Some(operation) = channel.waiting_sends.pop_front() {
-                Self::fail_waiting(operation, ChannelError::ChannelClosed);
+            channel.events.close(reason);
+            while let Some(operation) = channel.blocked_channel_ops.pop_front() {
+                Self::reply_to_failed_waiter(operation, ChannelError::ChannelClosed);
             }
-            for (_, reply) in channel.delivery_replies.drain() {
+            for (_, reply) in channel.pending_delivery_replies.drain() {
                 let _ = reply.send(Err(ChannelError::ChannelClosed));
             }
         }
     }
 
-    pub(crate) fn deliver_channel_receive(&mut self, link: [u8; 16], item: ChannelReceive) {
-        if let ChannelReceive::Buffer { stream, chunk } = &item {
+    pub(crate) fn enqueue_channel_event(&mut self, link: [u8; 16], event: ChannelReceive) {
+        if let ChannelReceive::Buffer { stream, chunk } = &event {
             let Some(channel) = self
                 .established_links
                 .get_mut(&link)
                 .and_then(|link| link.channel.as_mut())
             else {
-                self.close_protocol_link(link, LinkCloseReason::ProtocolViolation);
+                self.close_link(link, LinkCloseReason::ProtocolViolation);
                 return;
             };
             if channel.ended_incoming_streams.contains(stream) {
-                self.close_protocol_link(link, LinkCloseReason::ProtocolViolation);
+                self.close_link(link, LinkCloseReason::ProtocolViolation);
                 return;
             }
             if matches!(chunk, BufferChunk::End(_)) {
                 channel.ended_incoming_streams.insert(*stream);
             }
         }
-        let bytes = match &item {
+        let bytes = match &event {
             ChannelReceive::Message(message) => message.body().len(),
             ChannelReceive::Buffer { chunk, .. } => match chunk {
                 BufferChunk::Data(data) | BufferChunk::End(data) => data.len(),
             },
         };
-        if !self
+        let result = self
             .established_links
             .get_mut(&link)
             .and_then(|link| link.channel.as_mut())
-            .is_some_and(|channel| channel.events.push(item, bytes).is_ok())
-        {
-            self.close_protocol_link(link, LinkCloseReason::ProtocolViolation);
+            .map(|channel| channel.events.push(event, bytes));
+        match result {
+            Some(Ok(())) => {}
+            Some(Err(error)) => self.close_link(link, error.link_close_reason()),
+            None => self.close_link(link, LinkCloseReason::ProtocolViolation),
         }
     }
 
@@ -1778,10 +1765,9 @@ impl NodeOwner {
         }
         if let Some(commands) = self.commands.take() {
             commands.close();
-            while commands.try_recv().is_ok() {}
         }
         for service in self.services.iter_mut().flatten() {
-            service.events.terminate(ServiceReceiveError::ServiceClosed);
+            service.events.close(ServiceReceiveError::ServiceClosed);
         }
         let links = self
             .established_links
@@ -1789,13 +1775,15 @@ impl NodeOwner {
             .filter_map(|(id, link)| link.events.is_some().then_some(*id))
             .collect::<Vec<_>>();
         for link in &links {
-            self.finish_link_close(*link, LinkCloseReason::LocalClosed);
-            if let Some(requests) = self.close_link(*link) {
+            self.terminate_link_handles(*link, LinkCloseReason::LocalClosed);
+            if let Some(requests) = self.remove_link_state(*link) {
                 self.fail_outbound_requests(requests, LinkError::NodeStopping);
             }
         }
         for slot in &mut self.interfaces {
-            slot.begin_close();
+            if let InterfacePhase::Active { sending, .. } = slot.phase {
+                slot.phase = InterfacePhase::Draining { sending };
+            }
         }
         let deadline = now
             .checked_add(SHUTDOWN_GRACE)
@@ -1803,7 +1791,7 @@ impl NodeOwner {
         self.timers.schedule_shutdown(deadline);
         self.phase = NodePhase::Closing {
             reason,
-            links: links.len(),
+            links_closed: links.len(),
             deadline_expired: false,
         };
     }
@@ -1811,31 +1799,46 @@ impl NodeOwner {
     fn shutdown_if_complete(&mut self) -> Option<ShutdownReport> {
         let NodePhase::Closing {
             reason,
-            links,
+            links_closed,
             deadline_expired,
         } = self.phase
         else {
             return None;
         };
-        let complete = self.preparing.load(Ordering::Acquire) == 0
+        let drained = self.preparing_packets.load(Ordering::Acquire) == 0
             && self
                 .interfaces
                 .iter()
-                .all(|slot| matches!(slot.phase, InterfacePhase::Closed));
-        if !complete && !deadline_expired {
+                .all(|slot| matches!(slot.phase, InterfacePhase::Closed { .. }));
+        if !drained && !deadline_expired {
             return None;
         }
-        let reason = if complete {
+        let reason = if drained {
             reason
         } else {
             ShutdownReason::DeadlineExpired
         };
         let report = ShutdownReport {
             reason,
-            links_closed: if complete { links } else { 0 },
-            links_abandoned: if complete { 0 } else { links },
-            interfaces_closed: self.interfaces.len() - self.interfaces_failed,
-            interfaces_failed: self.interfaces_failed,
+            links_closed,
+            links_abandoned: 0,
+            interfaces_closed: self
+                .interfaces
+                .iter()
+                .filter(|slot| matches!(slot.phase, InterfacePhase::Closed { failed: false }))
+                .count(),
+            interfaces_failed: self
+                .interfaces
+                .iter()
+                .filter(|slot| {
+                    matches!(
+                        slot.phase,
+                        InterfacePhase::Failed
+                            | InterfacePhase::Closing { failed: true }
+                            | InterfacePhase::Closed { failed: true }
+                    )
+                })
+                .count(),
         };
         if let Some(shutdown) = self.shutdown_tx.take() {
             let _ = shutdown.send(report.clone());

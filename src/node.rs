@@ -9,7 +9,7 @@ use crate::announce::{AnnounceBuilder, AnnounceData};
 use crate::api::ServiceId;
 use crate::channel::{ChannelMessage, QueueChannelError};
 use crate::crypto::{EphemeralKeyPair, sha256};
-use crate::runtime::{Events, NodeOwner};
+use crate::runtime::{NodeOwner, ReceiveQueue};
 use crate::{LinkError, MonoTime, SendError, TimeSpan};
 use crate::{ServiceEvent, ServiceReceiveError};
 
@@ -55,7 +55,7 @@ pub(crate) struct ServiceState {
     signing_key: SigningKey,
     registered_paths: HashMap<PathHash, String>,
     pub(crate) ratchets: Vec<StaticSecret>,
-    pub(crate) events: Events<ServiceEvent, ServiceReceiveError>,
+    pub(crate) events: ReceiveQueue<ServiceEvent, ServiceReceiveError>,
 }
 
 impl ServiceState {
@@ -262,7 +262,7 @@ impl NodeOwner {
             .established_links
             .get(&link)
             .and_then(|link| link.channel.as_ref())
-            .and_then(|channel| channel.protocol.next_retry(rtt))
+            .and_then(|channel| channel.protocol_state.next_retry(rtt))
         {
             self.schedule_timer(retry_at, ProtocolTimer::ChannelRetry(link));
         }
@@ -307,7 +307,7 @@ impl NodeOwner {
         log::trace!("[SEND] interface={interface} {}", packet.log_format());
         self.interfaces
             .get_mut(interface)
-            .is_some_and(|slot| slot.admit_protocol(priority, &packet))
+            .is_some_and(|slot| slot.enqueue_protocol_packet(priority, &packet))
     }
 
     pub(crate) fn remove_service(&mut self, service: ServiceId) -> Vec<LinkId> {
@@ -317,7 +317,7 @@ impl NodeOwner {
         let Some(mut removed) = entry.take() else {
             return Vec::new();
         };
-        removed.events.terminate(ServiceReceiveError::ServiceClosed);
+        removed.events.close(ServiceReceiveError::ServiceClosed);
         self.pending_inbound_links
             .retain(|_, pending| pending.service != service);
         self.established_links
@@ -428,8 +428,6 @@ impl NodeOwner {
         link_id: LinkId,
         wire_request_id: WireRequestId,
         data: &[u8],
-        metadata: Option<&[u8]>,
-        compress: bool,
     ) -> Result<PreparedResponse, LinkError> {
         use crate::packet::RoutedDestination;
 
@@ -438,7 +436,7 @@ impl NodeOwner {
             .get(&link_id)
             .ok_or(LinkError::LinkClosed)?;
         let target_interface = link.receiving_interface;
-        if data.len() <= LINK_MDU && metadata.is_none() {
+        if data.len() <= LINK_MDU {
             let resp = Response::new(wire_request_id, data.to_vec());
             let ciphertext = link.encrypt(&mut self.rng, &resp.encode());
 
@@ -479,8 +477,8 @@ impl NodeOwner {
                 &mut self.rng,
                 link,
                 segment_data,
-                metadata.map(|m| m.to_vec()),
-                compress,
+                None,
+                true,
                 Some(wire_request_id.0.to_vec()),
                 crate::resource::ResourceSegment::First {
                     total_data_size: needs_segmentation.then_some(total_size),
@@ -497,7 +495,7 @@ impl NodeOwner {
                     original_hash,
                     OutboundMultiSegment {
                         full_data: packed_response,
-                        compress,
+                        compress: true,
                         request_id: Some(wire_request_id.0.to_vec()),
                         current_segment: 1,
                     },
@@ -566,7 +564,7 @@ impl NodeOwner {
         paths: &[&str],
         identity: &crate::identity::PrivateIdentity,
         restart_ratchet: Option<crate::RatchetSecret>,
-        events: Events<ServiceEvent, ServiceReceiveError>,
+        events: ReceiveQueue<ServiceEvent, ServiceReceiveError>,
     ) -> ServiceId {
         let name_hash: [u8; 10] = sha256(name.as_bytes())[..10].try_into().unwrap();
 
@@ -706,7 +704,7 @@ impl NodeOwner {
             None,
         );
         Some(PreparedAnnouncement {
-            outbounds: Self::active_interfaces(&self.interfaces)
+            outbounds: Self::outbound_interfaces(&self.interfaces)
                 .map(|interface| ProtocolOutbound {
                     interface,
                     packet: packet.clone(),
@@ -740,7 +738,7 @@ impl NodeOwner {
         log::info!(
             "Sending path request for <{}> on {} interface(s)",
             hex::encode(destination),
-            Self::active_interfaces(&self.interfaces).count()
+            Self::outbound_interfaces(&self.interfaces).count()
         );
         self.pending_path_requests.insert(destination, now);
         self.schedule_timer(
@@ -760,7 +758,7 @@ impl NodeOwner {
         };
 
         for interface in 0..self.interfaces.len() {
-            if !self.interfaces[interface].accepting() {
+            if !self.interfaces[interface].accepts_outbound() {
                 continue;
             }
             log::info!("Sending path request on interface {}", interface);
@@ -868,7 +866,7 @@ impl NodeOwner {
             .channel
             .as_mut()
             .ok_or(QueueChannelError::LinkNotActive)?
-            .protocol
+            .protocol_state
             .prepare(message_type, data)?;
         let packet = self.make_encrypted_link_packet(link_id, LinkContext::Channel, &raw)?;
         let target_interface = self.established_links[&link_id].receiving_interface;
@@ -880,7 +878,7 @@ impl NodeOwner {
             .channel
             .as_mut()
             .expect("channel disappeared")
-            .protocol
+            .protocol_state
             .track(packet, now);
         self.schedule_channel_retry(link_id);
         Ok(hash)
@@ -900,7 +898,7 @@ impl NodeOwner {
         Ok(())
     }
 
-    pub fn close_link(&mut self, link: LinkId) -> Option<Vec<RequestId>> {
+    pub fn remove_link_state(&mut self, link: LinkId) -> Option<Vec<RequestId>> {
         let existed = self.established_links.contains_key(&link)
             || self.pending_outbound_links.contains_key(&link);
         if let Some(established) = self.established_links.get(&link) {
@@ -1118,9 +1116,8 @@ impl NodeOwner {
         None
     }
 
-    pub(crate) fn link(
+    pub(crate) fn begin_outbound_link(
         &mut self,
-        service: Option<ServiceId>,
         destination: DestinationAddress,
         now: MonoTime,
         handshake_timeout: TimeSpan,
@@ -1169,7 +1166,7 @@ impl NodeOwner {
                 initiator_signing_key: signing_key,
                 responder_signing_key: path_entry.announce.signing_key,
                 destination,
-                local_service: service,
+                local_service: None,
                 request_time: now,
                 open: Some(open),
             },
@@ -1240,7 +1237,7 @@ impl NodeOwner {
         if !matches!(packet, Packet::Announce { .. })
             && packet
                 .transport_id()
-                .is_some_and(|tid| tid != self.transport_id)
+                .is_some_and(|tid| tid != self.relay_address)
         {
             log::warn!(
                 "Ignored packet <{}> - not for us",
@@ -1393,7 +1390,7 @@ impl NodeOwner {
                     false,
                     true, // is_path_response
                     announce_data.to_bytes(),
-                    Some(self.transport_id),
+                    Some(self.relay_address),
                 );
 
                 // Send only to the requesting interface
@@ -1412,14 +1409,14 @@ impl NodeOwner {
                     path_entry.announce.ratchet.is_some(),
                     true, // is_path_response
                     path_entry.announce.to_bytes(),
-                    Some(self.transport_id),
+                    Some(self.relay_address),
                 );
 
                 // Send only to the requesting interface
                 self.queue_packet(interface_index, response_packet, 0);
-            } else if self.transport {
+            } else if self.relays_packets {
                 // Unknown path, but we're a transport node - record and forward
-                let other_interfaces = Self::active_interfaces(&self.interfaces)
+                let other_interfaces = Self::outbound_interfaces(&self.interfaces)
                     .count()
                     .saturating_sub(1);
                 log::debug!(
@@ -1437,13 +1434,14 @@ impl NodeOwner {
                 let new_packet = Packet::PathRequest {
                     hops: 0,
                     query_destination: query_dest,
-                    requesting_transport: Some(self.transport_id),
+                    requesting_transport: Some(self.relay_address),
                     tag: request_tag,
                 };
 
                 // Forward path request on all other interfaces
                 for interface in 0..self.interfaces.len() {
-                    if interface != interface_index && self.interfaces[interface].accepting() {
+                    if interface != interface_index && self.interfaces[interface].accepts_outbound()
+                    {
                         self.queue_packet(interface, new_packet.clone(), 0);
                     }
                 }
@@ -1453,13 +1451,13 @@ impl NodeOwner {
         // General transport handling. Takes care of directing packets according
         // to transport tables and recording entries in reverse and link tables.
         let mut relayed_via_link_table = false;
-        if self.transport || for_local_service || for_local_link {
+        if self.relays_packets || for_local_service || for_local_link {
             // TODO missing cache request handling
 
             // If the packet is in transport (has transport_id), check whether we
             // are the designated next hop, and process it accordingly if we are.
             if let Some(transport_id) = packet.transport_id()
-                && transport_id == self.transport_id
+                && transport_id == self.relay_address
                 && !matches!(packet, Packet::Announce { .. })
             {
                 let dest = packet.destination_hash();
@@ -1518,7 +1516,7 @@ impl NodeOwner {
                     if self
                         .interfaces
                         .get_mut(outbound_interface)
-                        .is_some_and(|slot| slot.admit_protocol(0, &new_packet))
+                        .is_some_and(|slot| slot.enqueue_protocol_packet(0, &new_packet))
                     {
                         path_entry.timestamp = now;
                         self.timers.schedule(ScheduledTimer {
@@ -1580,7 +1578,7 @@ impl NodeOwner {
                     if self
                         .interfaces
                         .get_mut(out_iface)
-                        .is_some_and(|slot| slot.admit_protocol(0, &packet))
+                        .is_some_and(|slot| slot.enqueue_protocol_packet(0, &packet))
                     {
                         link_entry.timestamp = now;
                         relayed_via_link_table = true;
@@ -1650,7 +1648,7 @@ impl NodeOwner {
                     // Check if this is a next retransmission from another node.
                     // If it is, we may remove the announce from our pending table.
                     // Only applies when transport_id is present (Type2 header).
-                    if self.transport
+                    if self.relays_packets
                         && packet.transport_id().is_some()
                         && let Some(pending) = self
                             .pending_announces
@@ -1747,7 +1745,7 @@ impl NodeOwner {
                         // Schedule for rebroadcast with random delay
                         // PATH_RESPONSE announces are not rebroadcast (they're one-shot responses)
                         // Only schedule if we are a transport node (relay enabled)
-                        if !is_path_response && self.transport {
+                        if !is_path_response && self.relays_packets {
                             let delay_ms = self.rng.gen_range(0..=PATHFINDER_RW_MS);
                             let retry_at = now
                                 .checked_add(TimeSpan::from_millis(delay_ms))
@@ -1806,7 +1804,7 @@ impl NodeOwner {
                                 has_ratchet,
                                 true, // is_path_response
                                 data.clone(),
-                                Some(self.transport_id),
+                                Some(self.relay_address),
                             );
 
                             self.queue_packet(requesting_interface, response_packet, 0);
@@ -1817,7 +1815,7 @@ impl NodeOwner {
             Packet::LinkRequest { data, .. } => {
                 let is_for_us = packet
                     .transport_id()
-                    .is_none_or(|tid| tid == self.transport_id);
+                    .is_none_or(|tid| tid == self.relay_address);
                 log::debug!(
                     "Received LinkRequest for <{}> is_for_us={} for_local_service={}",
                     hex::encode(destination_hash),
@@ -1856,7 +1854,7 @@ impl NodeOwner {
                             interface: interface_index,
                         },
                     );
-                    self.deliver_incoming_link(service, new_link_id);
+                    self.enqueue_incoming_link(service, new_link_id);
                 }
             }
             Packet::LinkData { context, data, .. } => {
@@ -1937,7 +1935,7 @@ impl NodeOwner {
                                 );
                                 let requests =
                                     link.pending_requests.values().copied().collect::<Vec<_>>();
-                                self.finish_link_close(
+                                self.terminate_link_handles(
                                     link_id,
                                     crate::LinkCloseReason::RemoteClosed,
                                 );
@@ -1987,7 +1985,7 @@ impl NodeOwner {
                                         hex::encode(local_request_id.0),
                                         resp.data.len()
                                     );
-                                    request_results.push((local_request_id, Ok((resp.data, None))));
+                                    request_results.push((local_request_id, Ok(resp.data)));
                                 } else {
                                     log::warn!(
                                         "Response wire_request_id={} did not match any pending request",
@@ -2057,15 +2055,12 @@ impl NodeOwner {
                             let _ = self
                                 .interfaces
                                 .get_mut(target_interface)
-                                .map(|slot| slot.admit_protocol(0, &proof));
+                                .map(|slot| slot.enqueue_protocol_packet(0, &proof));
                             let Some(channel) = link.channel.as_mut() else {
-                                self.close_protocol_link(
-                                    link_id,
-                                    crate::LinkCloseReason::ProtocolViolation,
-                                );
+                                self.close_link(link_id, crate::LinkCloseReason::ProtocolViolation);
                                 return;
                             };
-                            let messages = channel.protocol.receive(&plaintext);
+                            let messages = channel.protocol_state.receive(&plaintext);
                             for (message_type, data) in messages {
                                 if message_type == crate::buffer::STREAM_MESSAGE_TYPE {
                                     if let Some((stream, chunk)) = crate::buffer::decode(&data) {
@@ -2213,7 +2208,7 @@ impl NodeOwner {
                     self.established_links.insert(destination_hash, link);
                     self.destination_links.insert(dest, destination_hash);
                     self.schedule_link_maintenance(destination_hash);
-                    self.finish_link_establishment(destination_hash, open, Ok(()));
+                    self.complete_link_open(destination_hash, open, Ok(()));
 
                     // Send LRRTT packet to inform responder of the measured RTT
                     if let Some(rtt) = rtt_secs {
@@ -2315,7 +2310,7 @@ impl NodeOwner {
                                 .and_then(|link| link.channel.as_ref())
                                 .is_some_and(|channel| {
                                     channel
-                                        .protocol
+                                        .protocol_state
                                         .pending_hashes()
                                         .any(|hash| hash == proof_hash)
                                 });
@@ -2331,7 +2326,7 @@ impl NodeOwner {
                                     .established_links
                                     .get_mut(&destination_hash)
                                     .and_then(|link| link.channel.as_mut())
-                                && channel.protocol.delivered(&proof_hash)
+                                && channel.protocol_state.delivered(&proof_hash)
                             {
                                 delivered_packets.push(proof_hash);
                             }
@@ -2368,19 +2363,19 @@ impl NodeOwner {
         }
 
         for (link, data) in link_datagrams {
-            self.deliver_link_datagram(link, data);
+            self.enqueue_link_datagram(link, data);
         }
         for (link, delivery) in channel_deliveries {
-            self.deliver_channel_receive(link, delivery);
+            self.enqueue_channel_event(link, delivery);
         }
         for packet in delivered_packets {
-            self.complete_channel_send(destination_hash, packet, true, now);
+            self.handle_channel_delivery(destination_hash, packet, true, now);
         }
         for (request, result) in request_results {
-            self.finish_request(request, result);
+            self.complete_request(request, result);
         }
         for (link, request, path, data) in inbound_requests {
-            self.receive_request(link, request, path, data, now);
+            self.handle_incoming_request(link, request, path, data, now);
         }
 
         self.schedule_channel_retry(destination_hash);
@@ -2549,7 +2544,7 @@ impl NodeOwner {
         let mut first = true;
 
         for interface in 0..self.interfaces.len() {
-            if !self.interfaces[interface].accepting() {
+            if !self.interfaces[interface].accepts_outbound() {
                 continue;
             }
             // If packet has an attached interface, skip that one (don't echo back)
@@ -2575,7 +2570,7 @@ impl NodeOwner {
         }
     }
 
-    pub(crate) fn process(&mut self, now: MonoTime, received: Vec<PreparedInbound>) {
+    pub(crate) fn handle_packets(&mut self, now: MonoTime, received: Vec<PreparedInbound>) {
         for received in received {
             let PreparedInbound {
                 packet,
@@ -2631,7 +2626,7 @@ impl NodeOwner {
                     has_ratchet,
                     false,
                     data,
-                    Some(self.transport_id),
+                    Some(self.relay_address),
                 );
                 if let Some(retry_at) = next_retry {
                     self.schedule_timer(retry_at, ProtocolTimer::AnnounceRetry(destination));
@@ -2675,16 +2670,16 @@ impl NodeOwner {
                 else {
                     return;
                 };
-                if channel.protocol.next_retry(rtt) != Some(at) {
+                if channel.protocol_state.next_retry(rtt) != Some(at) {
                     return;
                 }
-                let (packets, failed) = channel.protocol.retries(now, rtt);
+                let (packets, failed) = channel.protocol_state.retries(now, rtt);
                 if failed {
-                    let failed_packets: Vec<_> = channel.protocol.pending_hashes().collect();
+                    let failed_packets: Vec<_> = channel.protocol_state.pending_hashes().collect();
                     for packet in failed_packets {
-                        self.complete_channel_send(link, packet, false, now);
+                        self.handle_channel_delivery(link, packet, false, now);
                     }
-                    self.close_runtime_channel(link, crate::ChannelReceiveError::ChannelClosed);
+                    self.close_link_channel(link, crate::ChannelReceiveError::ChannelClosed);
                 } else {
                     if let Some(interface) = self
                         .established_links
@@ -2707,7 +2702,7 @@ impl NodeOwner {
                     .open
                     .take()
                     .expect("pending link open state disappeared");
-                self.finish_link_establishment(link, open, Err(crate::LinkError::TimedOut));
+                self.complete_link_open(link, open, Err(crate::LinkError::TimedOut));
             }
             ProtocolTimer::PathRequestTimeout(destination) => {
                 if self
@@ -2732,7 +2727,7 @@ impl NodeOwner {
                     removed |= link.pending_requests.len() != before;
                 }
                 if removed {
-                    self.finish_request(request, Err(LinkError::TimedOut));
+                    self.complete_request(request, Err(LinkError::TimedOut));
                 }
             }
             ProtocolTimer::LinkMaintenance(link_id) => {
@@ -2765,7 +2760,7 @@ impl NodeOwner {
                     };
                     self.queue_packet(interface, packet, 0);
                     self.destination_links.remove(&destination);
-                    self.finish_link_close(link_id, crate::LinkCloseReason::IdleTimeout);
+                    self.terminate_link_handles(link_id, crate::LinkCloseReason::IdleTimeout);
                     let requests = self
                         .established_links
                         .remove(&link_id)
@@ -2773,7 +2768,7 @@ impl NodeOwner {
                         .flat_map(|link| link.pending_requests.into_values())
                         .collect::<Vec<_>>();
                     for request_id in requests {
-                        self.finish_request(request_id, Err(LinkError::LinkClosed));
+                        self.complete_request(request_id, Err(LinkError::LinkClosed));
                     }
                 } else {
                     if keepalive {
@@ -2860,7 +2855,7 @@ impl NodeOwner {
                 hex::encode(link_id),
                 plaintext.len()
             );
-            self.finish_link_identification(
+            self.complete_identification(
                 link_id,
                 Err(crate::LinkCloseReason::AuthenticationFailed),
             );
@@ -2872,7 +2867,7 @@ impl NodeOwner {
                 "LinkIdentify verification failed on link {}",
                 hex::encode(link_id)
             );
-            self.finish_link_identification(
+            self.complete_identification(
                 link_id,
                 Err(crate::LinkCloseReason::AuthenticationFailed),
             );
@@ -2890,7 +2885,7 @@ impl NodeOwner {
             match link.remote_identity {
                 Some(current) if current == identity_hash => return,
                 Some(_) => {
-                    self.finish_link_identification(
+                    self.complete_identification(
                         link_id,
                         Err(crate::LinkCloseReason::AuthenticationFailed),
                     );
@@ -2899,7 +2894,7 @@ impl NodeOwner {
                 None => {}
             }
         }
-        self.finish_link_identification(link_id, Ok(identity_hash));
+        self.complete_identification(link_id, Ok(identity_hash));
     }
 
     pub(crate) fn commit_remote_identity(&mut self, link: LinkId, identity: [u8; 16]) {
@@ -3338,7 +3333,7 @@ impl NodeOwner {
         }
 
         // Either single-segment or the last segment of multi-segment
-        let (final_data, metadata, local_request_id) = if is_multi_segment {
+        let (final_data, _metadata, local_request_id) = if is_multi_segment {
             // Last segment of multi-segment transfer
             let mut transfer = match self.multi_segment_transfers.remove(&original_hash) {
                 Some(t) => t,
@@ -3399,7 +3394,7 @@ impl NodeOwner {
             .map(|(_, response_data)| response_data.into_vec())
             .unwrap_or(final_data);
 
-        self.finish_request(local_request_id, Ok((data, metadata)));
+        self.complete_request(local_request_id, Ok(data));
     }
 
     fn send_resource_request(&mut self, link_id: LinkId, hash: [u8; 32], now: MonoTime) {
