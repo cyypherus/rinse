@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use rand::RngCore;
@@ -213,23 +213,31 @@ pub(crate) struct PendingLink {
     pub request_time: Instant,
 }
 
+pub(crate) struct LinkResponder<'a> {
+    pub(crate) destination: DestinationAddress,
+    pub(crate) service: ServiceId,
+    pub(crate) encryption_secret: &'a StaticSecret,
+    pub(crate) signing_key: SigningKey,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LinkState {
-    Handshake,
-    Active,
-    Stale,
+enum LinkState {
+    ResponderHandshake { local_service: ServiceId },
+    Active { rtt: Duration, role: ActiveLinkRole },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveLinkRole {
+    Initiator { local_service: Option<ServiceId> },
+    Responder { local_service: ServiceId },
 }
 
 pub(crate) struct EstablishedLink {
     pub destination: DestinationAddress,
-    pub local_service: Option<ServiceId>,
-    pub is_initiator: bool,
-    pub state: LinkState,
-    pub activated_at: Option<Instant>,
+    state: LinkState,
     pub last_inbound: Instant,
     pub last_outbound: Instant,
     pub last_keepalive_sent: Option<Instant>,
-    pub rtt_ms: Option<u64>,
     pub remote_identity: Option<DestinationAddress>,
     pub receiving_interface: usize,
     pub signing_key: SigningKey,
@@ -258,14 +266,15 @@ impl EstablishedLink {
         let rtt_ms = now.duration_since(pending.request_time).as_millis() as u64;
         Self {
             destination: pending.destination,
-            local_service: pending.local_service,
-            is_initiator: true,
-            state: LinkState::Active,
-            activated_at: Some(now),
+            state: LinkState::Active {
+                rtt: Duration::from_millis(rtt_ms),
+                role: ActiveLinkRole::Initiator {
+                    local_service: pending.local_service,
+                },
+            },
             last_inbound: now,
             last_outbound: now,
             last_keepalive_sent: None,
-            rtt_ms: Some(rtt_ms),
             remote_identity: None,
             receiving_interface,
             signing_key: pending.initiator_signing_key,
@@ -275,32 +284,30 @@ impl EstablishedLink {
         }
     }
 
-    pub fn from_responder(
+    pub(crate) fn from_responder(
         link_id: LinkId,
-        responder_secret: &StaticSecret,
+        responder: LinkResponder<'_>,
         initiator_public: &X25519Public,
-        destination: DestinationAddress,
-        local_service: ServiceId,
-        responder_signing_key: SigningKey,
         initiator_signing_key: VerifyingKey,
         receiving_interface: usize,
         now: Instant,
     ) -> Self {
-        let shared_key = responder_secret.diffie_hellman(initiator_public).to_bytes();
+        let shared_key = responder
+            .encryption_secret
+            .diffie_hellman(initiator_public)
+            .to_bytes();
         let keys = LinkEncryption::derive_keys(&shared_key, &link_id);
         Self {
-            destination,
-            local_service: Some(local_service),
-            is_initiator: false,
-            state: LinkState::Handshake,
-            activated_at: None,
+            destination: responder.destination,
+            state: LinkState::ResponderHandshake {
+                local_service: responder.service,
+            },
             last_inbound: now,
             last_outbound: now,
             last_keepalive_sent: None,
-            rtt_ms: None,
             remote_identity: None,
             receiving_interface,
-            signing_key: responder_signing_key,
+            signing_key: responder.signing_key,
             peer_signing_key: initiator_signing_key,
             keys,
             pending_requests: std::collections::HashMap::new(),
@@ -317,25 +324,70 @@ impl EstablishedLink {
 
     pub(crate) fn touch_inbound(&mut self, now: Instant) {
         self.last_inbound = now;
-        if self.state == LinkState::Stale {
-            self.state = LinkState::Active;
-        }
     }
 
     pub(crate) fn touch_outbound(&mut self, now: Instant) {
         self.last_outbound = now;
     }
 
-    pub(crate) fn set_rtt(&mut self, rtt_ms: u64) {
-        self.rtt_ms = Some(rtt_ms);
+    pub(crate) fn activate(&mut self, rtt_ms: u64) {
+        let role = match self.state {
+            LinkState::ResponderHandshake { local_service } => {
+                ActiveLinkRole::Responder { local_service }
+            }
+            LinkState::Active { role, .. } => role,
+        };
+        self.state = LinkState::Active {
+            rtt: Duration::from_millis(rtt_ms),
+            role,
+        };
     }
 
-    pub(crate) fn rtt_seconds(&self) -> Option<f64> {
-        self.rtt_ms.map(|ms| ms as f64 / 1000.0)
+    pub(crate) fn rtt(&self) -> Option<Duration> {
+        match self.state {
+            LinkState::ResponderHandshake { .. } => None,
+            LinkState::Active { rtt, .. } => Some(rtt),
+        }
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        matches!(self.state, LinkState::Active { .. })
+    }
+
+    pub(crate) fn is_initiator(&self) -> bool {
+        matches!(
+            self.state,
+            LinkState::Active {
+                role: ActiveLinkRole::Initiator { .. },
+                ..
+            }
+        )
+    }
+
+    pub(crate) fn local_service(&self) -> Option<ServiceId> {
+        match self.state {
+            LinkState::ResponderHandshake { local_service }
+            | LinkState::Active {
+                role: ActiveLinkRole::Responder { local_service },
+                ..
+            } => Some(local_service),
+            LinkState::Active {
+                role: ActiveLinkRole::Initiator { local_service },
+                ..
+            } => local_service,
+        }
+    }
+
+    pub(crate) fn status(&self) -> crate::LinkStatus {
+        match self.state {
+            LinkState::ResponderHandshake { .. } => crate::LinkStatus::Pending,
+            LinkState::Active { .. } => crate::LinkStatus::Active,
+        }
     }
 
     pub(crate) fn keepalive_interval_secs(&self) -> u64 {
-        if let Some(rtt_ms) = self.rtt_ms {
+        if let Some(rtt) = self.rtt() {
+            let rtt_ms = rtt.as_millis() as u64;
             // rtt * (KEEPALIVE_MAX / KEEPALIVE_MAX_RTT) where KEEPALIVE_MAX_RTT = 1.75s = 1750ms
             // = rtt_ms * 360 / 1750
             let scaled = (rtt_ms * KEEPALIVE_MAX_SECS) / 1750;
@@ -445,11 +497,13 @@ mod tests {
             EstablishedLink::from_initiator(pending, &responder_keypair.public, 0, now);
         let responder_link = EstablishedLink::from_responder(
             link_id,
-            &responder_keypair.secret,
+            LinkResponder {
+                destination: dest,
+                service: ServiceId(0),
+                encryption_secret: &responder_keypair.secret,
+                signing_key: responder_signing_key,
+            },
             &initiator_keypair.public,
-            dest,
-            ServiceId(0),
-            responder_signing_key,
             initiator_link.signing_key.verifying_key(),
             0,
             now,
@@ -470,7 +524,7 @@ mod tests {
 
     #[test]
     fn full_link_establishment_flow() {
-        use crate::packet::{LinkRequestDestination, Packet};
+        use crate::packet::{Packet, RoutedDestination};
 
         let mut rng = test_rng();
         let now = Instant::now();
@@ -486,7 +540,7 @@ mod tests {
         let request_data = request.to_bytes();
         let packet = Packet::LinkRequest {
             hops: 0,
-            destination: LinkRequestDestination::Direct(dest),
+            destination: RoutedDestination::direct(dest),
             data: request_data.clone(),
         };
         let link_id = LinkRequest::link_id_from_packet(&packet.hashable_part(), request_data.len());
@@ -511,11 +565,13 @@ mod tests {
 
         let responder_link = EstablishedLink::from_responder(
             link_id,
-            &responder_enc.secret,
+            LinkResponder {
+                destination: dest,
+                service: ServiceId(0),
+                encryption_secret: &responder_enc.secret,
+                signing_key: responder_sig,
+            },
             &initiator_enc.public,
-            dest,
-            ServiceId(0),
-            responder_sig,
             initiator_link.signing_key.verifying_key(),
             0,
             now,
@@ -579,8 +635,8 @@ mod tests {
         let link =
             EstablishedLink::from_initiator(pending, &responder_keypair.public, 0, proof_time);
 
-        assert!(link.rtt_ms.is_some());
-        assert!(link.rtt_ms.unwrap() >= 10);
+        assert!(link.rtt().is_some());
+        assert!(link.rtt().unwrap() >= Duration::from_millis(10));
     }
 
     #[test]
@@ -607,15 +663,15 @@ mod tests {
         let mut link = EstablishedLink::from_initiator(pending, &responder_keypair.public, 0, now);
 
         // With no/zero RTT, should use max keepalive
-        link.rtt_ms = Some(0);
+        link.activate(0);
         assert_eq!(link.keepalive_interval_secs(), KEEPALIVE_MIN_SECS);
 
         // With 1750ms RTT (KEEPALIVE_MAX_RTT), should use max keepalive
-        link.rtt_ms = Some(1750);
+        link.activate(1750);
         assert_eq!(link.keepalive_interval_secs(), KEEPALIVE_MAX_SECS);
 
         // With 875ms RTT (half of max), should use ~180s (half of max)
-        link.rtt_ms = Some(875);
+        link.activate(875);
         assert_eq!(link.keepalive_interval_secs(), 180);
 
         // Stale time is 2x keepalive

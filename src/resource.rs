@@ -25,6 +25,17 @@ const SDU: usize = 470;
 
 pub(crate) const MAX_EFFICIENT_SIZE: usize = 1024 * 1024 - 1;
 
+pub(crate) enum ResourceSegment {
+    First {
+        total_data_size: Option<usize>,
+    },
+    Continuation {
+        previous_segments: std::num::NonZeroUsize,
+        original_hash: [u8; 32],
+        total_data_size: usize,
+    },
+}
+
 pub(crate) struct OutboundResource {
     pub hash: [u8; 32],
     pub random_hash: [u8; 4],
@@ -32,7 +43,6 @@ pub(crate) struct OutboundResource {
     expected_proof: [u8; 32],
     has_metadata: bool,
     pub compressed: bool,
-    pub is_response: bool,
     pub segment_index: usize,
     pub total_segments: usize,
     pub request_id: Option<Vec<u8>>,
@@ -48,12 +58,21 @@ impl OutboundResource {
         data: Vec<u8>,
         metadata: Option<Vec<u8>>,
         compress: bool,
-        is_response: bool,
         request_id: Option<Vec<u8>>,
-        segment_index: usize,
-        original_hash: Option<[u8; 32]>,
-        total_data_size: Option<usize>,
+        segment: ResourceSegment,
     ) -> Self {
+        let (segment_index, original_hash, total_data_size) = match segment {
+            ResourceSegment::First { total_data_size } => (1, None, total_data_size),
+            ResourceSegment::Continuation {
+                previous_segments,
+                original_hash,
+                total_data_size,
+            } => (
+                previous_segments.get() + 1,
+                Some(original_hash),
+                Some(total_data_size),
+            ),
+        };
         let metadata_size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
         let has_metadata = metadata.is_some();
         let total_size = total_data_size.unwrap_or(data.len()) + metadata_size;
@@ -125,7 +144,6 @@ impl OutboundResource {
             expected_proof,
             has_metadata,
             compressed,
-            is_response,
             segment_index,
             total_segments,
             request_id,
@@ -167,9 +185,6 @@ impl OutboundResource {
             total_segments: self.total_segments,
             hashmap: hashmap_chunk,
             compressed: self.compressed,
-            split: self.total_segments > 1,
-            is_request: false,
-            is_response: self.is_response,
             has_metadata: self.has_metadata,
             request_id: self.request_id.clone(),
         }
@@ -200,12 +215,10 @@ pub(crate) struct InboundResource {
     pub random_hash: [u8; 4],
     pub original_hash: [u8; 32],
     pub compressed: bool,
-    pub is_response: bool,
     pub has_metadata: bool,
     pub segment_index: usize,
     pub total_segments: usize,
     pub request_id: Option<Vec<u8>>,
-    num_parts: usize,
     hashmap: Vec<Option<[u8; MAPHASH_LEN]>>,
     hashmap_height: usize,
     parts: Vec<Option<Vec<u8>>>,
@@ -217,8 +230,7 @@ pub(crate) struct InboundResource {
     pub(crate) window: usize,
     pub(crate) window_max: usize,
     pub(crate) window_min: usize,
-    waiting_for_hmu: bool,
-    consecutive_completed_height: i32,
+    completed_prefix: usize,
     bytes_received: usize,
     #[cfg(test)]
     total_bytes: usize,
@@ -250,12 +262,10 @@ impl InboundResource {
             random_hash: adv.random_hash,
             original_hash: adv.original_hash,
             compressed: adv.compressed,
-            is_response: adv.is_response,
             has_metadata: adv.has_metadata,
             segment_index: adv.segment_index,
             total_segments: adv.total_segments,
             request_id: adv.request_id.clone(),
-            num_parts: adv.num_parts,
             hashmap,
             hashmap_height,
             parts: vec![None; adv.num_parts],
@@ -267,8 +277,7 @@ impl InboundResource {
             window: WINDOW_DEFAULT,
             window_max: WINDOW_MAX_SLOW,
             window_min: WINDOW_MIN,
-            waiting_for_hmu: false,
-            consecutive_completed_height: -1,
+            completed_prefix: 0,
             bytes_received: 0,
             #[cfg(test)]
             total_bytes: adv.transfer_size,
@@ -279,40 +288,26 @@ impl InboundResource {
         }
     }
 
-    fn get_map_hash(&self, data: &[u8]) -> [u8; MAPHASH_LEN] {
+    pub fn receive_part(&mut self, data: Vec<u8>) -> bool {
         let mut hasher_input = data.to_vec();
         hasher_input.extend(&self.random_hash);
         let h = sha256(&hasher_input);
-        [h[0], h[1], h[2], h[3]]
-    }
+        let part_hash = [h[0], h[1], h[2], h[3]];
 
-    pub fn receive_part(&mut self, data: Vec<u8>) -> bool {
-        let part_hash = self.get_map_hash(&data);
-
-        // Must align with needed_hashes() which uses cch+1 as start
-        let search_start = (self.consecutive_completed_height + 1) as usize;
+        let search_start = self.completed_prefix;
         let search_end = (search_start + self.window).min(self.hashmap_height);
 
         for i in search_start..search_end {
-            if i < self.hashmap.len()
-                && self.hashmap[i] == Some(part_hash)
-                && self.parts[i].is_none()
-            {
+            if self.hashmap[i] == Some(part_hash) && self.parts[i].is_none() {
                 self.bytes_received += data.len();
                 self.parts[i] = Some(data);
                 self.received_count += 1;
                 self.outstanding_parts = self.outstanding_parts.saturating_sub(1);
 
-                // Update consecutive completed height
-                if i as i32 == self.consecutive_completed_height + 1 {
-                    self.consecutive_completed_height = i as i32;
-                }
-
-                // Advance consecutive height past any already-received parts
-                let mut cp = (self.consecutive_completed_height + 1) as usize;
-                while cp < self.parts.len() && self.parts[cp].is_some() {
-                    self.consecutive_completed_height = cp as i32;
-                    cp += 1;
+                while self.completed_prefix < self.parts.len()
+                    && self.parts[self.completed_prefix].is_some()
+                {
+                    self.completed_prefix += 1;
                 }
 
                 return true;
@@ -350,15 +345,13 @@ impl InboundResource {
         {
             self.hashmap_height += 1;
         }
-
-        self.waiting_for_hmu = false;
     }
 
     pub fn needed_hashes(&mut self) -> (Vec<[u8; MAPHASH_LEN]>, bool) {
         let mut needed = Vec::new();
         let mut hashmap_exhausted = false;
 
-        let search_start = (self.consecutive_completed_height + 1) as usize;
+        let search_start = self.completed_prefix;
         let search_end = (search_start + self.window).min(self.parts.len());
 
         for i in search_start..search_end {
@@ -382,10 +375,6 @@ impl InboundResource {
             }
         }
 
-        if hashmap_exhausted {
-            self.waiting_for_hmu = true;
-        }
-
         (needed, hashmap_exhausted)
     }
 
@@ -398,7 +387,7 @@ impl InboundResource {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.received_count == self.num_parts
+        self.received_count == self.parts.len()
     }
 
     pub fn outstanding_parts(&self) -> usize {
@@ -415,7 +404,7 @@ impl InboundResource {
     }
 
     pub fn num_parts(&self) -> usize {
-        self.num_parts
+        self.parts.len()
     }
 
     #[cfg(test)]
@@ -593,9 +582,6 @@ pub struct ResourceAdvertisement {
     pub total_segments: usize,
     pub hashmap: Vec<u8>,
     pub compressed: bool,
-    pub split: bool,
-    pub is_request: bool,
-    pub is_response: bool,
     pub has_metadata: bool,
     pub request_id: Option<Vec<u8>>,
 }
@@ -606,9 +592,8 @@ impl ResourceAdvertisement {
 
         let flags: u8 = (1 << 0)  // encrypted (always)
             | if self.compressed { 1 << 1 } else { 0 }
-            | if self.split { 1 << 2 } else { 0 }
-            | if self.is_request { 1 << 3 } else { 0 }
-            | if self.is_response { 1 << 4 } else { 0 }
+            | if self.total_segments > 1 { 1 << 2 } else { 0 }
+            | if self.request_id.is_some() { 1 << 4 } else { 0 }
             | if self.has_metadata { 1 << 5 } else { 0 };
 
         let pairs = vec![
@@ -676,37 +661,22 @@ impl ResourceAdvertisement {
             total_segments: 1,
             hashmap: Vec::new(),
             compressed: false,
-            split: false,
-            is_request: false,
-            is_response: false,
             has_metadata: false,
             request_id: None,
         };
 
+        let mut response_flag = false;
         for (key, val) in map {
             let key_str = key.as_str()?;
             match key_str {
                 "t" => adv.transfer_size = val.as_u64()? as usize,
                 "d" => adv.data_size = val.as_u64()? as usize,
                 "n" => adv.num_parts = val.as_u64()? as usize,
-                "h" => {
-                    let bytes = val.as_slice()?;
-                    if bytes.len() >= 32 {
-                        adv.hash.copy_from_slice(&bytes[..32]);
-                    }
-                }
-                "r" => {
-                    let bytes = val.as_slice()?;
-                    if bytes.len() >= 4 {
-                        adv.random_hash.copy_from_slice(&bytes[..4]);
-                    }
-                }
-                "o" => {
-                    let bytes = val.as_slice()?;
-                    if bytes.len() >= 32 {
-                        adv.original_hash.copy_from_slice(&bytes[..32]);
-                    }
-                }
+                "h" => adv.hash.copy_from_slice(val.as_slice()?.get(..32)?),
+                "r" => adv.random_hash.copy_from_slice(val.as_slice()?.get(..4)?),
+                "o" => adv
+                    .original_hash
+                    .copy_from_slice(val.as_slice()?.get(..32)?),
                 "i" => adv.segment_index = val.as_u64()? as usize,
                 "l" => adv.total_segments = val.as_u64()? as usize,
                 "q" => {
@@ -717,9 +687,7 @@ impl ResourceAdvertisement {
                 "f" => {
                     let flags = val.as_u64()? as u8;
                     adv.compressed = (flags & (1 << 1)) != 0;
-                    adv.split = (flags & (1 << 2)) != 0;
-                    adv.is_request = (flags & (1 << 3)) != 0;
-                    adv.is_response = (flags & (1 << 4)) != 0;
+                    response_flag = (flags & (1 << 4)) != 0;
                     adv.has_metadata = (flags & (1 << 5)) != 0;
                 }
                 "m" => {
@@ -729,6 +697,18 @@ impl ResourceAdvertisement {
             }
         }
 
+        if response_flag != adv.request_id.is_some() {
+            log::warn!("ResourceAdv response flag and request ID disagree");
+            return None;
+        }
+        if adv.num_parts == 0
+            || adv.segment_index == 0
+            || adv.segment_index > adv.total_segments
+            || adv.hashmap.len() > adv.num_parts * MAPHASH_LEN
+            || !adv.hashmap.len().is_multiple_of(MAPHASH_LEN)
+        {
+            return None;
+        }
         Some(adv)
     }
 }
@@ -775,9 +755,6 @@ mod tests {
             total_segments: 1,
             hashmap: vec![0, 1, 2, 3, 4, 5, 6, 7],
             compressed: true,
-            split: false,
-            is_request: false,
-            is_response: true,
             has_metadata: false,
             request_id: Some(vec![0xaa; 16]),
         };
@@ -795,9 +772,6 @@ mod tests {
         assert_eq!(decoded.total_segments, adv.total_segments);
         assert_eq!(decoded.hashmap, adv.hashmap);
         assert_eq!(decoded.compressed, adv.compressed);
-        assert_eq!(decoded.split, adv.split);
-        assert_eq!(decoded.is_request, adv.is_request);
-        assert_eq!(decoded.is_response, adv.is_response);
         assert_eq!(decoded.has_metadata, adv.has_metadata);
         assert_eq!(decoded.request_id, adv.request_id);
     }
@@ -815,9 +789,6 @@ mod tests {
             total_segments: 1,
             hashmap: vec![0xAA; HASHMAP_MAX_LEN * MAPHASH_LEN], // segment 0
             compressed: false,
-            split: false,
-            is_request: false,
-            is_response: false,
             has_metadata: false,
             request_id: None,
         };
@@ -871,9 +842,6 @@ mod tests {
             total_segments: 1,
             hashmap: vec![0; 12],
             compressed: false,
-            split: false,
-            is_request: false,
-            is_response: true,
             has_metadata: false,
             request_id: Some(vec![0xaa; 16]),
         };
@@ -897,9 +865,6 @@ mod tests {
             total_segments: 3,
             hashmap: vec![0; 12],
             compressed: false,
-            split: true,
-            is_request: false,
-            is_response: true,
             has_metadata: true,
             request_id: Some(vec![0xaa; 16]),
         };
@@ -924,9 +889,6 @@ mod tests {
             total_segments: 3,
             hashmap: vec![0; 12],
             compressed: false,
-            split: true,
-            is_request: false,
-            is_response: true,
             has_metadata: false,
             request_id: Some(vec![0xaa; 16]),
         };
@@ -950,9 +912,6 @@ mod tests {
             total_segments: 3,
             hashmap: vec![0; 12],
             compressed: false,
-            split: true,
-            is_request: false,
-            is_response: true,
             has_metadata: false,
             request_id: Some(vec![0xaa; 16]),
         };
@@ -976,9 +935,6 @@ mod tests {
             total_segments: 5,
             hashmap: vec![0; 40],
             compressed: true,
-            split: true,
-            is_request: false,
-            is_response: true,
             has_metadata: true,
             request_id: Some(vec![0xbb; 16]),
         };
@@ -990,7 +946,6 @@ mod tests {
         assert_eq!(resource.segment_index, 2);
         assert_eq!(resource.total_segments, 5);
         assert!(resource.compressed);
-        assert!(resource.is_response);
         assert!(resource.has_metadata);
     }
 
@@ -1007,9 +962,6 @@ mod tests {
             total_segments: 5,
             hashmap: vec![0xDD; 40],
             compressed: true,
-            split: true,
-            is_request: false,
-            is_response: true,
             has_metadata: true,
             request_id: Some(vec![0xEE; 16]),
         };
@@ -1020,7 +972,6 @@ mod tests {
         assert_eq!(decoded.segment_index, 3);
         assert_eq!(decoded.total_segments, 5);
         assert_eq!(decoded.original_hash, [0xCCu8; 32]);
-        assert!(decoded.split);
         assert!(decoded.has_metadata);
     }
 }

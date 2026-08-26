@@ -1,6 +1,3 @@
-#![allow(clippy::type_complexity)]
-#![allow(clippy::too_many_arguments)]
-
 mod announce;
 mod aspect;
 mod buffer;

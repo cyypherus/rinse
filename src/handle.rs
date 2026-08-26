@@ -192,7 +192,7 @@ pub(crate) enum ServiceEvent {
     },
     RequestResult {
         request_id: RequestId,
-        result: Result<(DestinationAddress, Vec<u8>, Option<Vec<u8>>), RequestError>,
+        result: Result<(Vec<u8>, Option<Vec<u8>>), RequestError>,
     },
     RespondResult {
         request_id: RequestId,

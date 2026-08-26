@@ -264,17 +264,19 @@ impl<T: Transport> Interface<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet::AnnounceDestination;
+    use crate::packet::RoutedDestination;
     use std::sync::{Arc, Mutex};
     use std::task::Waker;
 
+    type SentFrames = Arc<Mutex<Vec<Vec<u8>>>>;
+
     struct MockTransport {
-        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        sent: SentFrames,
         bandwidth: bool,
     }
 
     impl MockTransport {
-        fn new(bandwidth: bool) -> (Self, Arc<Mutex<Vec<Vec<u8>>>>) {
+        fn new(bandwidth: bool) -> (Self, SentFrames) {
             let sent = Arc::new(Mutex::new(Vec::new()));
             (
                 Self {
@@ -304,7 +306,7 @@ mod tests {
     fn make_packet(dest: [u8; 16], hops: u8) -> Packet {
         Packet::Announce {
             hops,
-            destination: AnnounceDestination::Single(dest),
+            destination: RoutedDestination::direct(dest),
             has_ratchet: false,
             is_path_response: false,
             data: vec![],
@@ -399,7 +401,7 @@ mod tests {
         assert_eq!(iface.queue.len(), 1);
     }
 
-    fn make_ifac_interface() -> (Interface<MockTransport>, Arc<Mutex<Vec<Vec<u8>>>>) {
+    fn make_ifac_interface() -> (Interface<MockTransport>, SentFrames) {
         use rand::RngCore;
         use rand::SeedableRng;
         use rand::rngs::StdRng;

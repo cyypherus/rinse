@@ -27,8 +27,8 @@ use crate::handle::{
 
 const LINK_MDU: usize = 431;
 const SINGLE_MDU: usize = 383;
-use crate::link::{EstablishedLink, LinkId, LinkProof, LinkRequest, LinkState, PendingLink};
-use crate::packet::{DestinationAddress, LinkContext, Packet, SingleDestination};
+use crate::link::{EstablishedLink, LinkId, LinkProof, LinkRequest, LinkResponder, PendingLink};
+use crate::packet::{DestinationAddress, LinkContext, Packet, RoutedDestination};
 use crate::packet_hashlist::PacketHashlist;
 use crate::request::{PathHash, Request, RequestId, Response, WireRequestId};
 use crate::{Interface, Transport};
@@ -44,57 +44,57 @@ const ESTABLISHMENT_TIMEOUT_BASE_SECS: u64 = 60;
 const PATH_REQUEST_TIMEOUT_SECS: u64 = 60;
 const PATH_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const REVERSE_TIMEOUT: Duration = Duration::from_secs(8 * 60);
+const RETAINED_RATCHETS: usize = 512;
 
-enum Notification {
-    Request {
-        service: ServiceId,
-        link_id: LinkId,
-        request_id: RequestId,
-        wire_request_id: WireRequestId,
-        path: String,
-        data: Vec<u8>,
-    },
-    RequestResult {
-        request_id: RequestId,
-        result: Result<(DestinationAddress, Vec<u8>, Option<Vec<u8>>), RequestError>,
-    },
-    RespondResult {
-        request_id: RequestId,
-        result: Result<(), RespondError>,
-    },
-    Raw {
-        service: ServiceId,
-        link: Option<crate::LinkHandle>,
-        data: Vec<u8>,
-    },
-    Channel {
-        service: ServiceId,
-        link: crate::LinkHandle,
-        message: ChannelMessage,
-    },
-    Buffer {
-        service: ServiceId,
-        link: crate::LinkHandle,
-        chunk: crate::LinkBufferStreamChunk,
-    },
-    DestinationsChanged,
-    PathRequestResult {
-        destination: DestinationAddress,
-        found: bool,
-    },
+fn split_metadata(mut data: Vec<u8>, has_metadata: bool) -> (Vec<u8>, Option<Vec<u8>>) {
+    if !has_metadata || data.len() < 3 {
+        return (data, None);
+    }
+    let metadata_size = u32::from_be_bytes([0, data[0], data[1], data[2]]) as usize;
+    if data.len() < metadata_size + 3 {
+        log::warn!("Metadata size exceeds data length");
+        return (data, None);
+    }
+    log::debug!(
+        "Extracting {} byte metadata, {} byte data",
+        metadata_size,
+        data.len() - metadata_size - 3
+    );
+    let content = data.split_off(metadata_size + 3);
+    let metadata = data.split_off(3);
+    (content, Some(metadata))
 }
 
 struct ServiceEntry {
     address: DestinationAddress,
     name_hash: [u8; 10],
     encryption_secret: StaticSecret,
-    encryption_public: X25519Public,
     signing_key: SigningKey,
     registered_paths: HashMap<PathHash, String>,
     ratchets: Vec<StaticSecret>,
-    ratchet_interval: Option<std::time::Duration>,
-    last_ratchet_time: Option<Instant>,
-    retained_ratchets: usize,
+    ratchet_rotation: Option<RatchetRotation>,
+}
+
+struct RatchetRotation {
+    interval: Duration,
+    last: Instant,
+}
+
+impl ServiceEntry {
+    fn decrypt(&self, ephemeral: &X25519Public, ciphertext: &[u8]) -> Option<Vec<u8>> {
+        self.ratchets
+            .iter()
+            .find_map(|ratchet| {
+                crate::crypto::SingleDestEncryption::decrypt(ratchet, ephemeral, ciphertext)
+            })
+            .or_else(|| {
+                crate::crypto::SingleDestEncryption::decrypt(
+                    &self.encryption_secret,
+                    ephemeral,
+                    ciphertext,
+                )
+            })
+    }
 }
 
 struct Receipt {
@@ -103,17 +103,21 @@ struct Receipt {
 }
 
 #[derive(Clone)]
-pub(crate) struct PathEntry {
+struct PathEntry {
     timestamp: Instant,
     next_hop: DestinationAddress,
     hops: u8,
     receiving_interface: usize,
-    encryption_key: X25519Public,
-    signing_key: VerifyingKey,
-    ratchet_key: Option<X25519Public>,
-    app_data: Option<Vec<u8>>,
-    name_hash: [u8; 10],
-    announce_data: Vec<u8>,
+    announce: AnnounceData,
+}
+
+impl PathEntry {
+    fn encryption_key(&self) -> X25519Public {
+        self.announce
+            .ratchet
+            .map(X25519Public::from)
+            .unwrap_or(self.announce.encryption_key)
+    }
 }
 
 #[derive(Debug)]
@@ -151,14 +155,10 @@ struct MultiSegmentTransfer {
 }
 
 struct OutboundMultiSegment {
-    destination: DestinationAddress,
-    service_idx: Option<ServiceId>,
     local_request_id: Option<RequestId>,
     full_data: Vec<u8>,
     compress: bool,
-    is_response: bool,
     request_id: Option<Vec<u8>>,
-    total_segments: usize,
     current_segment: usize,
 }
 
@@ -214,6 +214,7 @@ impl PreparedInbound {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn into_parts(self) -> (Packet, [u8; 32], usize, usize) {
         (self.packet, self.packet_hash, self.wire_len, self.source)
     }
@@ -221,38 +222,25 @@ impl PreparedInbound {
 
 pub(crate) struct Protocol<T, R = ThreadRng> {
     transport: bool,
-    max_hops: u8,
-    retries: u8,
-    retry_delay_ms: u64,
     rng: R,
     transport_id: DestinationAddress,
-    pub(crate) path_table: HashMap<DestinationAddress, PathEntry>,
+    path_table: HashMap<DestinationAddress, PathEntry>,
     pending_announces: Vec<PendingAnnounce>,
     seen_packets: PacketHashlist,
     reverse_table: HashMap<DestinationAddress, ReverseTableEntry>,
     receipts: Vec<Receipt>,
     services: Vec<ServiceEntry>,
-    pub(crate) interfaces: Vec<Interface<T>>,
+    interfaces: Vec<Interface<T>>,
     pending_outbound_links: HashMap<LinkId, PendingLink>,
-    pub(crate) established_links: HashMap<LinkId, EstablishedLink>,
+    established_links: HashMap<LinkId, EstablishedLink>,
     link_table: HashMap<LinkId, LinkTableEntry>,
-    outbound_resources: HashMap<
-        [u8; 32],
-        (
-            LinkId,
-            DestinationAddress,
-            Option<ServiceId>,
-            Option<RequestId>,
-            crate::resource::OutboundResource,
-        ),
-    >,
+    outbound_resources:
+        HashMap<[u8; 32], (LinkId, Option<RequestId>, crate::resource::OutboundResource)>,
     inbound_resources: HashMap<[u8; 32], (LinkId, crate::resource::InboundResource)>,
     multi_segment_transfers: HashMap<[u8; 32], MultiSegmentTransfer>,
     outbound_multi_segments: HashMap<[u8; 32], OutboundMultiSegment>,
-    inbound_request_links: HashMap<RequestId, (WireRequestId, LinkId, ServiceId)>,
-    pub(crate) destination_links: HashMap<DestinationAddress, LinkId>,
-    pending_outbound_requests:
-        HashMap<DestinationAddress, Vec<(ServiceId, RequestId, String, Vec<u8>)>>,
+    inbound_request_links: HashMap<RequestId, (WireRequestId, LinkId)>,
+    destination_links: HashMap<DestinationAddress, LinkId>,
     pending_path_requests: HashMap<DestinationAddress, Instant>,
     discovery_path_requests: HashMap<DestinationAddress, usize>,
     stats: Stats,
@@ -274,9 +262,6 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         );
         Self {
             transport,
-            max_hops: DEFAULT_MAX_HOPS,
-            retries: DEFAULT_RETRIES,
-            retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
             rng,
             transport_id,
             path_table: HashMap::new(),
@@ -295,7 +280,6 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             outbound_multi_segments: HashMap::new(),
             inbound_request_links: HashMap::new(),
             destination_links: HashMap::new(),
-            pending_outbound_requests: HashMap::new(),
             pending_path_requests: HashMap::new(),
             discovery_path_requests: HashMap::new(),
             stats: Stats::new(),
@@ -348,8 +332,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         let rtt = self
             .established_links
             .get(&link)
-            .and_then(|link| link.rtt_ms)
-            .map(Duration::from_millis)
+            .and_then(EstablishedLink::rtt)
             .unwrap_or(Duration::from_millis(25));
         if let Some(retry_at) = self
             .channels
@@ -373,7 +356,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             .pending_requests
             .is_empty()
             .then(|| link.last_inbound + Duration::from_secs(link.stale_time_secs()));
-        let keepalive_at = (link.is_initiator && link.state == LinkState::Active).then(|| {
+        let keepalive_at = (link.is_initiator() && link.is_active()).then(|| {
             let keepalive = Duration::from_secs(link.keepalive_interval_secs());
             (link.last_inbound + keepalive).max(
                 link.last_keepalive_sent
@@ -399,9 +382,10 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             .iter()
             .map(|(addr, entry)| KnownDestination {
                 address: *addr,
-                announcement_data: entry.app_data.clone(),
+                announcement_data: (!entry.announce.app_data.is_empty())
+                    .then(|| entry.announce.app_data.clone()),
                 hop_count: entry.hops,
-                service_name_hash: ServiceNameHash::from_bytes(entry.name_hash),
+                service_name_hash: ServiceNameHash::from_bytes(entry.announce.name_hash),
                 route_refreshed_at: entry.timestamp,
             })
             .collect()
@@ -409,38 +393,6 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
 
     pub fn service_address(&self, service: ServiceId) -> Option<DestinationAddress> {
         self.services.get(service.0).map(|s| s.address)
-    }
-
-    fn send_single_data(&mut self, destination: DestinationAddress, data: &[u8]) {
-        use crate::crypto::SingleDestEncryption;
-
-        if let Some(entry) = self.path_table.get(&destination) {
-            let target_key = entry.ratchet_key.as_ref().unwrap_or(&entry.encryption_key);
-            let (ephemeral_pub, ciphertext) =
-                SingleDestEncryption::encrypt(&mut self.rng, target_key, data);
-            let mut payload = ephemeral_pub.as_bytes().to_vec();
-            payload.extend(ciphertext);
-
-            let dest = if entry.hops > 1 {
-                SingleDestination::Transport {
-                    transport_id: entry.next_hop,
-                    destination,
-                }
-            } else {
-                SingleDestination::Direct(destination)
-            };
-            let packet = Packet::SingleData {
-                hops: 0,
-                destination: dest,
-                ciphertext: payload,
-            };
-            let target = entry.receiving_interface;
-            if let Some(iface) = self.interfaces.get_mut(target) {
-                self.stats.packets_sent += 1;
-                self.stats.bytes_sent += packet.to_bytes().len() as u64;
-                iface.send(packet, 0);
-            }
-        }
     }
 
     pub(crate) fn request_over_link(
@@ -452,7 +404,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         let service = self
             .established_links
             .get(&link.0)
-            .and_then(|link| link.local_service)
+            .and_then(|link| link.local_service())
             .ok_or(RequestError::LinkClosed)?;
         self.request_checked(service, link, path, data)
     }
@@ -464,14 +416,12 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         path: &str,
         data: &[u8],
     ) -> Result<RequestId, RequestError> {
-        use crate::packet::LinkDataDestination;
-
         let link_id = link.0;
-        let Some(established) = self.established_links.get_mut(&link_id) else {
+        let Some(established) = self.established_links.get(&link_id) else {
             log::warn!("Request on non-existent link {}", hex::encode(link_id));
             return Err(RequestError::LinkNotFound);
         };
-        if established.state != LinkState::Active {
+        if !established.is_active() {
             return Err(RequestError::LinkClosed);
         }
 
@@ -487,27 +437,40 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             hex::encode(path_hash),
             data.len()
         );
-
+        let link = self
+            .established_links
+            .get_mut(&link_id)
+            .ok_or(RequestError::LinkNotFound)?;
         let req = Request::new(path, data.to_vec());
         let encoded = req.encode();
-        let ciphertext = established.encrypt(&mut self.rng, &encoded);
-        let target_interface = established.receiving_interface;
+        log::debug!(
+            "Request plaintext {} bytes: {}",
+            encoded.len(),
+            hex::encode(&encoded[..encoded.len().min(64)])
+        );
+        let ciphertext = link.encrypt(&mut self.rng, &encoded);
+        let target_interface = link.receiving_interface;
+        log::debug!(
+            "Request ciphertext {} bytes: {}",
+            ciphertext.len(),
+            hex::encode(&ciphertext[..ciphertext.len().min(64)])
+        );
 
         let packet = Packet::LinkData {
             hops: 0,
-            destination: LinkDataDestination::Direct(link_id),
+            destination: RoutedDestination::direct(link_id),
             context: LinkContext::Request,
             data: ciphertext,
         };
         let wire_request_id = WireRequestId(packet.packet_hash()[..16].try_into().unwrap());
-        established
-            .pending_requests
+        link.pending_requests
             .insert(wire_request_id, (service, local_request_id));
 
         log::info!(
-            "Sending request over link {} wire_request_id={}",
+            "Sending request over link {} wire_request_id={} packet_hash={}",
             hex::encode(link_id),
             hex::encode(wire_request_id.0),
+            hex::encode(packet.packet_hash())
         );
         if let Some(iface) = self.interfaces.get_mut(target_interface) {
             self.stats.packets_sent += 1;
@@ -536,9 +499,9 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         metadata: Option<&[u8]>,
         compress: bool,
     ) -> Result<(), RespondError> {
-        use crate::packet::LinkDataDestination;
+        use crate::packet::RoutedDestination;
 
-        let (wire_request_id, link_id, service_idx) = self
+        let (wire_request_id, link_id) = self
             .inbound_request_links
             .remove(&request_id)
             .ok_or(RespondError::RequestNotFound)?;
@@ -553,17 +516,17 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
 
             let packet = Packet::LinkData {
                 hops: 0,
-                destination: LinkDataDestination::Direct(link_id),
+                destination: RoutedDestination::direct(link_id),
                 context: LinkContext::Response,
                 data: ciphertext,
             };
             if let Some(iface) = self.interfaces.get_mut(target_interface) {
                 iface.send(packet, 0);
             }
-            self.dispatch_notifications(vec![Notification::RespondResult {
+            self.pending_events.push(ServiceEvent::RespondResult {
                 request_id,
                 result: Ok(()),
-            }]);
+            });
         } else {
             use crate::resource::MAX_EFFICIENT_SIZE;
             use serde_bytes::ByteBuf;
@@ -589,14 +552,9 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                 segment_data,
                 metadata.map(|m| m.to_vec()),
                 compress,
-                true,
                 Some(wire_request_id.0.to_vec()),
-                1,
-                None,
-                if needs_segmentation {
-                    Some(total_size)
-                } else {
-                    None
+                crate::resource::ResourceSegment::First {
+                    total_data_size: needs_segmentation.then_some(total_size),
                 },
             );
 
@@ -609,14 +567,10 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                 self.outbound_multi_segments.insert(
                     original_hash,
                     OutboundMultiSegment {
-                        destination: link.destination,
-                        service_idx: Some(service_idx),
                         local_request_id: Some(request_id),
                         full_data: packed_response,
                         compress,
-                        is_response: true,
                         request_id: Some(wire_request_id.0.to_vec()),
-                        total_segments: resource.total_segments,
                         current_segment: 1,
                     },
                 );
@@ -630,21 +584,13 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             let ciphertext = link.encrypt(&mut self.rng, &adv_data);
             let packet = Packet::LinkData {
                 hops: 0,
-                destination: LinkDataDestination::Direct(link_id),
+                destination: RoutedDestination::direct(link_id),
                 context: LinkContext::ResourceAdv,
                 data: ciphertext,
             };
 
-            self.outbound_resources.insert(
-                hash,
-                (
-                    link_id,
-                    link.destination,
-                    Some(service_idx),
-                    Some(request_id),
-                    resource,
-                ),
-            );
+            self.outbound_resources
+                .insert(hash, (link_id, Some(request_id), resource));
 
             if let Some(iface) = self.interfaces.get_mut(target_interface) {
                 iface.send(packet, 0);
@@ -664,167 +610,6 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         let _ = self.respond_checked(request_id, data, metadata, compress);
     }
 
-    fn send_request_inner(
-        &mut self,
-        service: ServiceId,
-        destination: DestinationAddress,
-        local_request_id: RequestId,
-        path: &str,
-        data: Vec<u8>,
-        now: Instant,
-    ) {
-        use crate::packet::LinkDataDestination;
-
-        let path_hash = crate::request::path_hash(path);
-        log::info!(
-            "Request to <{}> path={} hash={} ({} bytes)",
-            hex::encode(destination),
-            path,
-            hex::encode(path_hash),
-            data.len()
-        );
-
-        let link_id = self.destination_links.get(&destination).copied();
-
-        if let Some(link_id) = link_id {
-            log::info!(
-                "Have existing link {} to <{}>",
-                hex::encode(link_id),
-                hex::encode(destination)
-            );
-            if let Some(link) = self.established_links.get_mut(&link_id) {
-                let req = Request::new(path, data);
-                let encoded = req.encode();
-                log::debug!(
-                    "Request plaintext {} bytes: {}",
-                    encoded.len(),
-                    hex::encode(&encoded[..encoded.len().min(64)])
-                );
-                let ciphertext = link.encrypt(&mut self.rng, &encoded);
-                let target_interface = link.receiving_interface;
-                log::debug!(
-                    "Request ciphertext {} bytes: {}",
-                    ciphertext.len(),
-                    hex::encode(&ciphertext[..ciphertext.len().min(64)])
-                );
-
-                let packet = Packet::LinkData {
-                    hops: 0,
-                    destination: LinkDataDestination::Direct(link_id),
-                    context: LinkContext::Request,
-                    data: ciphertext,
-                };
-                let wire_request_id = WireRequestId(packet.packet_hash()[..16].try_into().unwrap());
-                link.pending_requests
-                    .insert(wire_request_id, (service, local_request_id));
-
-                log::info!(
-                    "Sending request over link {} wire_request_id={} packet_hash={}",
-                    hex::encode(link_id),
-                    hex::encode(wire_request_id.0),
-                    hex::encode(packet.packet_hash())
-                );
-                if let Some(iface) = self.interfaces.get_mut(target_interface) {
-                    self.stats.packets_sent += 1;
-                    self.stats.bytes_sent += packet.to_bytes().len() as u64;
-                    iface.send(packet, 0);
-                }
-            } else {
-                log::warn!(
-                    "Link {} in destination_links but not in established_links!",
-                    hex::encode(link_id)
-                );
-            }
-        } else {
-            log::info!("No link to <{}>, queuing request", hex::encode(destination));
-            self.pending_outbound_requests
-                .entry(destination)
-                .or_default()
-                .push((service, local_request_id, path.to_string(), data));
-
-            if self.link(Some(service), destination, now).is_none() {
-                log::info!(
-                    "No existing link, sending path request for <{}>",
-                    hex::encode(destination)
-                );
-                self.request_path(destination, now);
-            }
-        }
-    }
-
-    fn dispatch_notifications(&mut self, notifications: Vec<Notification>) {
-        for notification in notifications {
-            match notification {
-                Notification::Request {
-                    service,
-                    link_id,
-                    request_id,
-                    wire_request_id,
-                    path,
-                    data,
-                } => {
-                    self.inbound_request_links
-                        .insert(request_id, (wire_request_id, link_id, service));
-                    let remote_identity = self
-                        .established_links
-                        .get(&link_id)
-                        .and_then(|l| l.remote_identity);
-                    self.pending_events.push(ServiceEvent::Request {
-                        service,
-                        request_id,
-                        path,
-                        data,
-                        remote_identity,
-                    });
-                }
-                Notification::RequestResult { request_id, result } => {
-                    self.pending_events
-                        .push(ServiceEvent::RequestResult { request_id, result });
-                }
-                Notification::RespondResult { request_id, result } => {
-                    self.pending_events
-                        .push(ServiceEvent::RespondResult { request_id, result });
-                }
-                Notification::Raw {
-                    service,
-                    link,
-                    data,
-                } => {
-                    self.pending_events.push(ServiceEvent::Raw {
-                        service,
-                        link,
-                        data,
-                    });
-                }
-                Notification::Channel {
-                    service,
-                    link,
-                    message,
-                } => self.pending_events.push(ServiceEvent::Channel {
-                    service,
-                    link,
-                    message,
-                }),
-                Notification::Buffer {
-                    service,
-                    link,
-                    chunk,
-                } => self.pending_events.push(ServiceEvent::Buffer {
-                    service,
-                    link,
-                    chunk,
-                }),
-                Notification::DestinationsChanged => {
-                    self.pending_events.push(ServiceEvent::DestinationsChanged);
-                }
-                Notification::PathRequestResult { destination, found } => {
-                    self.pending_events
-                        .push(ServiceEvent::PathRequestResult { destination, found });
-                }
-            }
-        }
-    }
-
     pub fn add_service(
         &mut self,
         name: &str,
@@ -834,7 +619,6 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         let name_hash: [u8; 10] = sha256(name.as_bytes())[..10].try_into().unwrap();
 
         let encryption_secret = StaticSecret::from(*identity.encryption_secret.as_bytes());
-        let encryption_public = X25519Public::from(&identity.encryption_secret);
         let signing_key = SigningKey::from_bytes(identity.signing_key.as_bytes());
 
         let identity_hash = identity.hash();
@@ -867,13 +651,10 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             address,
             name_hash,
             encryption_secret,
-            encryption_public,
             signing_key,
             registered_paths,
             ratchets: Vec::new(),
-            ratchet_interval: None,
-            last_ratchet_time: None,
-            retained_ratchets: 512,
+            ratchet_rotation: None,
         });
 
         service_id
@@ -893,8 +674,10 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             .services
             .get_mut(service.0)
             .ok_or(RatchetConfigurationError::ServiceNotFound)?;
-        entry.ratchet_interval = Some(interval);
-        entry.last_ratchet_time = Some(now);
+        entry.ratchet_rotation = Some(RatchetRotation {
+            interval,
+            last: now,
+        });
 
         if let Some(RatchetKeysForRestart(ratchets)) = restored_keys {
             entry.ratchets = ratchets.into_iter().map(StaticSecret::from).collect();
@@ -955,14 +738,13 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         };
 
         // Rotate ratchet if interval has passed
-        if let (Some(interval), Some(last_time)) = (entry.ratchet_interval, entry.last_ratchet_time)
-        {
+        if let Some(rotation) = &mut entry.ratchet_rotation {
             let now = Instant::now();
-            if now.duration_since(last_time) >= interval {
+            if now.duration_since(rotation.last) >= rotation.interval {
                 let ratchet = StaticSecret::random_from_rng(&mut self.rng);
                 entry.ratchets.insert(0, ratchet);
-                entry.last_ratchet_time = Some(now);
-                while entry.ratchets.len() > entry.retained_ratchets {
+                rotation.last = now;
+                while entry.ratchets.len() > RETAINED_RATCHETS {
                     entry.ratchets.pop();
                 }
             }
@@ -979,7 +761,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         self.rng.fill_bytes(&mut random_hash);
 
         let mut builder = AnnounceBuilder::new(
-            *entry.encryption_public.as_bytes(),
+            *X25519Public::from(&entry.encryption_secret).as_bytes(),
             entry.signing_key.clone(),
             entry.name_hash,
             random_hash,
@@ -1058,7 +840,27 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         if !self.path_table.contains_key(&destination) {
             return Err(crate::handle::SendDestinationDatagramError::DestinationUnknown);
         }
-        self.send_single_data(destination, data);
+        use crate::crypto::SingleDestEncryption;
+        let entry = &self.path_table[&destination];
+        let target_key = entry.encryption_key();
+        let (ephemeral_pub, ciphertext) =
+            SingleDestEncryption::encrypt(&mut self.rng, &target_key, data);
+        let mut payload = ephemeral_pub.as_bytes().to_vec();
+        payload.extend(ciphertext);
+        let packet = Packet::SingleData {
+            hops: 0,
+            destination: if entry.hops > 1 {
+                RoutedDestination::via(entry.next_hop, destination)
+            } else {
+                RoutedDestination::direct(destination)
+            },
+            ciphertext: payload,
+        };
+        if let Some(iface) = self.interfaces.get_mut(entry.receiving_interface) {
+            self.stats.packets_sent += 1;
+            self.stats.bytes_sent += packet.to_bytes().len() as u64;
+            iface.send(packet, 0);
+        }
         Ok(())
     }
 
@@ -1086,7 +888,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             .established_links
             .get(&link.0)
             .ok_or(crate::SendLinkDatagramError::LinkNotFound)?;
-        if established.state != LinkState::Active {
+        if !established.is_active() {
             return Err(crate::SendLinkDatagramError::LinkNotActive);
         }
         self.send_link_packet(link.0, LinkContext::None, data);
@@ -1130,7 +932,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             .established_links
             .get(&link_id)
             .ok_or(QueueChannelError::LinkNotFound)?;
-        if link.state != LinkState::Active {
+        if !link.is_active() {
             return Err(QueueChannelError::LinkNotActive);
         }
         let raw = self
@@ -1139,15 +941,11 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             .or_insert_with(ChannelState::new)
             .prepare(message_type, data)?;
         let packet = self.make_encrypted_link_packet(link_id, LinkContext::Channel, &raw)?;
-        let packet_hash = packet.packet_hash();
         let target_interface = self.established_links[&link_id].receiving_interface;
         if let Some(interface) = self.interfaces.get_mut(target_interface) {
             interface.send(packet.clone(), 0);
         }
-        self.channels
-            .get_mut(&link_id)
-            .unwrap()
-            .track(packet, packet_hash, now);
+        self.channels.get_mut(&link_id).unwrap().track(packet, now);
         self.schedule_channel_retry(link_id);
         Ok(())
     }
@@ -1159,11 +957,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         now: Instant,
     ) -> Option<crate::LinkHandle> {
         if let Some(&link_id) = self.destination_links.get(&destination) {
-            let is_usable = self
-                .established_links
-                .get(&link_id)
-                .map(|l| matches!(l.state, LinkState::Handshake | LinkState::Active))
-                .unwrap_or(false)
+            let is_usable = self.established_links.contains_key(&link_id)
                 || self.pending_outbound_links.contains_key(&link_id);
 
             if is_usable {
@@ -1186,24 +980,20 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         if self.pending_outbound_links.contains_key(&link.0) {
             return Some(crate::LinkStatus::Pending);
         }
-        self.established_links.get(&link.0).map(|l| match l.state {
-            LinkState::Handshake => crate::LinkStatus::Pending,
-            LinkState::Active => crate::LinkStatus::Active,
-            LinkState::Stale => crate::LinkStatus::Stale,
-        })
+        self.established_links
+            .get(&link.0)
+            .map(EstablishedLink::status)
     }
 
     pub fn link_rtt(&self, link: crate::LinkHandle) -> Result<Duration, LinkRttError> {
         if self.pending_outbound_links.contains_key(&link.0) {
             return Err(LinkRttError::NotMeasured);
         }
-        let milliseconds = self
-            .established_links
+        self.established_links
             .get(&link.0)
             .ok_or(LinkRttError::LinkNotFound)?
-            .rtt_ms
-            .ok_or(LinkRttError::NotMeasured)?;
-        Ok(Duration::from_millis(milliseconds))
+            .rtt()
+            .ok_or(LinkRttError::NotMeasured)
     }
 
     pub fn close_link(&mut self, link: crate::LinkHandle) -> bool {
@@ -1230,16 +1020,16 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             return Err(crate::LinkPeerAuthenticationError::LinkNotFound);
         };
 
-        if established.state != LinkState::Active {
+        if !established.is_active() {
             log::warn!(
                 "self_identify: link {} not active (state={:?})",
                 hex::encode(link.0),
-                established.state
+                established.status()
             );
             return Err(crate::LinkPeerAuthenticationError::LinkNotActive);
         }
 
-        if !established.is_initiator {
+        if !established.is_initiator() {
             log::warn!(
                 "self_identify: link {} is not initiator",
                 hex::encode(link.0)
@@ -1270,10 +1060,10 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         data: &[u8],
         now: Instant,
     ) -> Option<RequestId> {
-        use crate::packet::LinkDataDestination;
+        use crate::packet::RoutedDestination;
 
         let link_entry = self.established_links.get_mut(&link.0)?;
-        if link_entry.state != LinkState::Active {
+        if !link_entry.is_active() {
             return None;
         }
 
@@ -1284,7 +1074,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
 
         let packet = Packet::LinkData {
             hops: 0,
-            destination: LinkDataDestination::Direct(link.0),
+            destination: RoutedDestination::direct(link.0),
             context: LinkContext::Request,
             data: ciphertext,
         };
@@ -1325,10 +1115,10 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         metadata: Option<Vec<u8>>,
         compress: bool,
     ) -> Option<crate::link_handle::ResourceHandle> {
-        use crate::packet::LinkDataDestination;
+        use crate::packet::RoutedDestination;
 
         let established = self.established_links.get(&link.0)?;
-        if established.state != LinkState::Active {
+        if !established.is_active() {
             return None;
         }
         let target_interface = established.receiving_interface;
@@ -1339,11 +1129,10 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             data,
             metadata,
             compress,
-            false,
             None,
-            1,
-            None,
-            None,
+            crate::resource::ResourceSegment::First {
+                total_data_size: None,
+            },
         );
 
         let adv = resource.advertisement(91);
@@ -1353,15 +1142,13 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         let ciphertext = established.encrypt(&mut self.rng, &adv_data);
         let packet = Packet::LinkData {
             hops: 0,
-            destination: LinkDataDestination::Direct(link.0),
+            destination: RoutedDestination::direct(link.0),
             context: LinkContext::ResourceAdv,
             data: ciphertext,
         };
 
-        self.outbound_resources.insert(
-            hash,
-            (link.0, established.destination, None, None, resource),
-        );
+        self.outbound_resources
+            .insert(hash, (link.0, None, resource));
 
         if let Some(iface) = self.interfaces.get_mut(target_interface) {
             self.stats.packets_sent += 1;
@@ -1374,7 +1161,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
 
     #[cfg(test)]
     fn resource_progress(&self, resource: crate::link_handle::ResourceHandle) -> Option<f32> {
-        if let Some((_, _, _, _, outbound)) = self.outbound_resources.get(&resource.0) {
+        if let Some((_, _, outbound)) = self.outbound_resources.get(&resource.0) {
             let total = outbound.transfer_size();
             if total == 0 {
                 return Some(1.0);
@@ -1403,9 +1190,9 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             .path_table
             .get(&destination)
             .ok_or(EncryptForLaterDeliveryError::DestinationUnknown)?;
-        let target_key = entry.ratchet_key.as_ref().unwrap_or(&entry.encryption_key);
+        let target_key = entry.encryption_key();
         let (ephemeral_pub, ciphertext) =
-            SingleDestEncryption::encrypt(&mut self.rng, target_key, data);
+            SingleDestEncryption::encrypt(&mut self.rng, &target_key, data);
 
         let mut result = ephemeral_pub.as_bytes().to_vec();
         result.extend(ciphertext);
@@ -1417,8 +1204,6 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         service: ServiceId,
         data: &[u8],
     ) -> Result<Vec<u8>, DecryptLaterDeliveredPayloadError> {
-        use crate::crypto::SingleDestEncryption;
-
         let service_entry = self
             .services
             .get(service.0)
@@ -1428,17 +1213,8 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             .ok_or(DecryptLaterDeliveredPayloadError::InvalidCiphertext)?;
         let ephemeral_pub = X25519Public::from(*ephemeral_key);
 
-        // Try ratchet keys first (newest to oldest)
-        for ratchet in &service_entry.ratchets {
-            if let Some(plaintext) =
-                SingleDestEncryption::decrypt(ratchet, &ephemeral_pub, ciphertext)
-            {
-                return Ok(plaintext);
-            }
-        }
-
-        // Fall back to static key
-        SingleDestEncryption::decrypt(&service_entry.encryption_secret, &ephemeral_pub, ciphertext)
+        service_entry
+            .decrypt(&ephemeral_pub, ciphertext)
             .ok_or(DecryptLaterDeliveredPayloadError::InvalidCiphertext)
     }
 
@@ -1494,7 +1270,14 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
 
         let transport_id = if hops > 1 { next_hop } else { None };
         let request_data = request.to_bytes();
-        let packet = self.make_link_request_packet(destination, transport_id, request_data.clone());
+        let packet = Packet::LinkRequest {
+            hops: 0,
+            destination: transport_id.map_or_else(
+                || RoutedDestination::direct(destination),
+                |transport| RoutedDestination::via(transport, destination),
+            ),
+            data: request_data.clone(),
+        };
         let link_id = LinkRequest::link_id_from_packet(&packet.hashable_part(), request_data.len());
 
         // Store pending link
@@ -1504,7 +1287,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                 link_id,
                 initiator_encryption_secret: ephemeral.secret,
                 initiator_signing_key: signing_key,
-                responder_signing_key: path_entry.signing_key,
+                responder_signing_key: path_entry.announce.signing_key,
                 destination,
                 local_service: service,
                 request_time: now,
@@ -1597,12 +1380,12 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         wire_len: usize,
         interface_index: usize,
         now: Instant,
-    ) -> Option<(Packet, bool, bool)> {
-        let mut notifications: Vec<Notification> = Vec::new();
+    ) {
+        let mut notifications = Vec::new();
         let mut pending_next_segments: Vec<(LinkId, [u8; 32])> = Vec::new();
 
         if !self.accept_packet(&packet, &packet_hash) {
-            return None;
+            return;
         }
 
         packet.increment_hops();
@@ -1666,7 +1449,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                 self.rng.fill_bytes(&mut random_hash);
 
                 let builder = AnnounceBuilder::new(
-                    *entry.encryption_public.as_bytes(),
+                    *X25519Public::from(&entry.encryption_secret).as_bytes(),
                     entry.signing_key.clone(),
                     entry.name_hash,
                     random_hash,
@@ -1697,9 +1480,9 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                 let response_packet = self.make_announce_packet(
                     query_dest,
                     path_entry.hops,
-                    path_entry.ratchet_key.is_some(),
+                    path_entry.announce.ratchet.is_some(),
                     true, // is_path_response
-                    path_entry.announce_data.clone(),
+                    path_entry.announce.to_bytes(),
                     Some(self.transport_id),
                 );
 
@@ -1874,7 +1657,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
 
         // Skip local processing for packets that were relayed via link_table
         if relayed_via_link_table && !for_local_link {
-            return Some((packet, for_local_service, for_local_link));
+            return;
         }
 
         match packet.clone() {
@@ -1886,11 +1669,11 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             } => {
                 let announce = match AnnounceData::parse(&data, has_ratchet) {
                     Ok(a) => a,
-                    Err(_) => return None,
+                    Err(_) => return,
                 };
 
                 if announce.verify(&destination_hash).is_err() {
-                    return None;
+                    return;
                 }
 
                 self.stats.announces_received += 1;
@@ -1977,12 +1760,12 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                     let mut is_new_destination = false;
                     let hops = packet.hops();
 
-                    if hops > self.max_hops {
+                    if hops > DEFAULT_MAX_HOPS {
                         log::debug!(
                             "Announce for <{}> exceeded max hops ({} >= {})",
                             hex::encode(destination_hash),
                             hops,
-                            self.max_hops + 1
+                            DEFAULT_MAX_HOPS + 1
                         );
                     } else if let Some(existing) = self.path_table.get(&destination_hash) {
                         if hops <= existing.hops {
@@ -2001,17 +1784,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                     }
 
                     if should_add {
-                        let signing_key = match announce.signing_public_key() {
-                            Ok(k) => k,
-                            Err(_) => return None,
-                        };
-
                         // Update path table
-                        let app_data = if announce.app_data.is_empty() {
-                            None
-                        } else {
-                            Some(announce.app_data.clone())
-                        };
                         self.path_table.insert(
                             destination_hash,
                             PathEntry {
@@ -2019,12 +1792,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                                 next_hop: received_from,
                                 hops,
                                 receiving_interface: interface_index,
-                                encryption_key: announce.encryption_public_key(),
-                                signing_key,
-                                ratchet_key: announce.ratchet.map(X25519Public::from),
-                                app_data,
-                                name_hash: announce.name_hash,
-                                announce_data: data.clone(),
+                                announce,
                             },
                         );
                         self.schedule_path_expiry(destination_hash);
@@ -2043,7 +1811,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                                 hops,
                                 has_ratchet,
                                 data: data.clone(),
-                                retries_remaining: self.retries,
+                                retries_remaining: DEFAULT_RETRIES,
                                 retry_at,
                                 local_rebroadcasts: 0,
                             });
@@ -2061,7 +1829,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                         );
 
                         if is_new_destination {
-                            notifications.push(Notification::DestinationsChanged);
+                            notifications.push(ServiceEvent::DestinationsChanged);
                         }
 
                         if self
@@ -2073,7 +1841,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                                 "Received announce for <{}> which we had a pending path request for",
                                 hex::encode(destination_hash)
                             );
-                            notifications.push(Notification::PathRequestResult {
+                            notifications.push(ServiceEvent::PathRequestResult {
                                 destination: destination_hash,
                                 found: true,
                             });
@@ -2103,16 +1871,6 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                                 iface.send(response_packet, 0);
                             }
                         }
-
-                        if let Some(pending) = self.pending_outbound_requests.get(&destination_hash)
-                        {
-                            let service = pending.first().map(|(s, _, _, _)| *s);
-                            log::info!(
-                                "Have pending requests for <{}>, initiating link",
-                                hex::encode(destination_hash)
-                            );
-                            self.link(service, destination_hash, now);
-                        }
                     }
                 }
             }
@@ -2128,12 +1886,17 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                 );
 
                 if is_for_us && for_local_service {
-                    let request = LinkRequest::parse(&data)?;
+                    let Some(request) = LinkRequest::parse(&data) else {
+                        return;
+                    };
                     // Find the service
-                    let service_idx = self
+                    let Some(service_idx) = self
                         .services
                         .iter()
-                        .position(|s| s.address == destination_hash)?;
+                        .position(|s| s.address == destination_hash)
+                    else {
+                        return;
+                    };
                     let service = &self.services[service_idx];
 
                     // Create responder's ephemeral key pair
@@ -2142,14 +1905,21 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                     // Derive link keys
                     let new_link_id =
                         LinkRequest::link_id_from_packet(&packet.hashable_part(), data.len());
+                    let Some(peer_signing_key) =
+                        VerifyingKey::from_bytes(&request.signing_public).ok()
+                    else {
+                        return;
+                    };
                     let link = EstablishedLink::from_responder(
                         new_link_id,
-                        &responder_keypair.secret,
+                        LinkResponder {
+                            destination: destination_hash,
+                            service: ServiceId(service_idx),
+                            encryption_secret: &responder_keypair.secret,
+                            signing_key: self.services[service_idx].signing_key.clone(),
+                        },
                         &request.encryption_public,
-                        destination_hash,
-                        ServiceId(service_idx),
-                        self.services[service_idx].signing_key.clone(),
-                        VerifyingKey::from_bytes(&request.signing_public).ok()?,
+                        peer_signing_key,
                         interface_index,
                         now,
                     );
@@ -2160,7 +1930,11 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                         &responder_keypair.public,
                         &service.signing_key,
                     );
-                    let proof_packet = self.make_link_proof_packet(new_link_id, proof.to_bytes());
+                    let proof_packet = Packet::LinkProof {
+                        hops: 0,
+                        destination: RoutedDestination::direct(new_link_id),
+                        data: proof.to_bytes(),
+                    };
 
                     self.established_links.insert(new_link_id, link);
                     self.destination_links.insert(destination_hash, new_link_id);
@@ -2198,7 +1972,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                                 .map(hex::encode)
                                 .collect::<Vec<_>>()
                         );
-                        return None;
+                        return;
                     }
                 };
                 link.touch_inbound(now);
@@ -2212,7 +1986,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                                 hex::encode(link_id),
                                 context,
                                 data.len(),
-                                link.is_initiator,
+                                link.is_initiator(),
                                 hex::encode(link.destination)
                             );
                             None
@@ -2303,10 +2077,9 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                                         hex::encode(local_request_id.0),
                                         resp.data.len()
                                     );
-                                    let from = link.destination;
-                                    notifications.push(Notification::RequestResult {
+                                    notifications.push(ServiceEvent::RequestResult {
                                         request_id: local_request_id,
-                                        result: Ok((from, resp.data, None)),
+                                        result: Ok((resp.data, None)),
                                     });
                                 } else {
                                     log::warn!(
@@ -2322,7 +2095,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
 
                     LinkContext::Request => {
                         if let Some(plaintext) = decrypt(link, &data) {
-                            if let Some(service) = link.local_service {
+                            if let Some(service) = link.local_service() {
                                 if let Some(req) = Request::decode(&plaintext) {
                                     let wire_request_id = WireRequestId(
                                         packet.packet_hash()[..16].try_into().unwrap(),
@@ -2340,13 +2113,14 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                                         path,
                                         self.services[service.0].registered_paths.len()
                                     );
-                                    notifications.push(Notification::Request {
+                                    self.inbound_request_links
+                                        .insert(request_id, (wire_request_id, link_id));
+                                    notifications.push(ServiceEvent::Request {
                                         service,
-                                        link_id,
                                         request_id,
-                                        wire_request_id,
                                         path: path.unwrap_or_default(),
                                         data: req.data.unwrap_or_default(),
+                                        remote_identity: link.remote_identity,
                                     });
                                 } else {
                                     log::warn!(
@@ -2377,7 +2151,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                                 data: proof_data,
                             };
                             let target_interface = link.receiving_interface;
-                            let service = link.local_service;
+                            let service = link.local_service();
                             if let Some(interface) = self.interfaces.get_mut(target_interface) {
                                 interface.send(proof, 0);
                             }
@@ -2390,7 +2164,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                                 for (message_type, data) in messages {
                                     if message_type == crate::buffer::STREAM_MESSAGE_TYPE {
                                         if let Some(chunk) = crate::buffer::decode(&data) {
-                                            notifications.push(Notification::Buffer {
+                                            notifications.push(ServiceEvent::Buffer {
                                                 service,
                                                 link: crate::LinkHandle(link_id),
                                                 chunk,
@@ -2401,7 +2175,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                                         && let Ok(message) =
                                             crate::ChannelMessage::new(message_type, data)
                                     {
-                                        notifications.push(Notification::Channel {
+                                        notifications.push(ServiceEvent::Channel {
                                             service,
                                             link: crate::LinkHandle(link_id),
                                             message,
@@ -2414,8 +2188,8 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
 
                     LinkContext::None | LinkContext::Command | LinkContext::CommandStatus => {
                         if let Some(plaintext) = decrypt(link, &data) {
-                            if let Some(service) = link.local_service {
-                                notifications.push(Notification::Raw {
+                            if let Some(service) = link.local_service() {
+                                notifications.push(ServiceEvent::Raw {
                                     service,
                                     link: Some(crate::LinkHandle(link_id)),
                                     data: plaintext,
@@ -2444,32 +2218,8 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
 
                     let ephemeral_public =
                         X25519Public::from(<[u8; 32]>::try_from(&ciphertext[..32]).unwrap());
-                    let encrypted = &ciphertext[32..];
-
-                    // Try ratchet keys first (newest to oldest)
-                    let mut plaintext = None;
-                    for ratchet in &service.ratchets {
-                        if let Some(pt) = crate::crypto::SingleDestEncryption::decrypt(
-                            ratchet,
-                            &ephemeral_public,
-                            encrypted,
-                        ) {
-                            plaintext = Some(pt);
-                            break;
-                        }
-                    }
-
-                    // Fall back to static key if no ratchet worked
-                    if plaintext.is_none() {
-                        plaintext = crate::crypto::SingleDestEncryption::decrypt(
-                            &service.encryption_secret,
-                            &ephemeral_public,
-                            encrypted,
-                        );
-                    }
-
-                    if let Some(data) = plaintext {
-                        notifications.push(Notification::Raw {
+                    if let Some(data) = service.decrypt(&ephemeral_public, &ciphertext[32..]) {
+                        notifications.push(ServiceEvent::Raw {
                             service: ServiceId(service_idx),
                             link: None,
                             data,
@@ -2523,13 +2273,13 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                         None => {
                             self.pending_outbound_links
                                 .insert(destination_hash, pending);
-                            return None;
+                            return;
                         }
                     };
 
                     // Get the destination's signing key from path_table
                     let signing_key = match self.path_table.get(&pending.destination) {
-                        Some(entry) => entry.signing_key,
+                        Some(entry) => entry.announce.signing_key,
                         None => {
                             log::debug!(
                                 "No path found for destination <{}>",
@@ -2537,7 +2287,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                             );
                             self.pending_outbound_links
                                 .insert(destination_hash, pending);
-                            return None;
+                            return;
                         }
                     };
 
@@ -2549,7 +2299,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                         );
                         self.pending_outbound_links
                             .insert(destination_hash, pending);
-                        return None;
+                        return;
                     }
 
                     // Establish the link using the responder's public key from the proof
@@ -2560,7 +2310,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                         interface_index,
                         now,
                     );
-                    let rtt_secs = link.rtt_seconds();
+                    let rtt_secs = link.rtt().map(|rtt| rtt.as_secs_f64());
 
                     self.established_links.insert(destination_hash, link);
                     self.destination_links.insert(dest, destination_hash);
@@ -2569,35 +2319,19 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                     // Send LRRTT packet to inform responder of the measured RTT
                     if let Some(rtt) = rtt_secs {
                         let rtt_data = crate::link::encode_rtt(rtt);
-                        self.send_link_packet_with_activity(
-                            destination_hash,
-                            LinkContext::LinkRtt,
-                            &rtt_data,
-                            now,
-                        );
+                        if let Some(link) = self.established_links.get_mut(&destination_hash) {
+                            link.touch_outbound(now);
+                        }
+                        self.send_link_packet(destination_hash, LinkContext::LinkRtt, &rtt_data);
                     }
 
                     let link = self.established_links.get(&destination_hash).unwrap();
                     log::debug!(
                         "Link <{}> established as initiator, RTT: {:?}ms, keepalive_interval: {}s",
                         hex::encode(destination_hash),
-                        link.rtt_ms,
+                        link.rtt().map(|rtt| rtt.as_millis()),
                         link.keepalive_interval_secs()
                     );
-
-                    // Send any pending requests that were waiting for this link
-                    if let Some(pending_requests) = self.pending_outbound_requests.remove(&dest) {
-                        for (service_addr, local_request_id, path, data) in pending_requests {
-                            self.send_request_inner(
-                                service_addr,
-                                dest,
-                                local_request_id,
-                                &path,
-                                data,
-                                now,
-                            );
-                        }
-                    }
                 }
             }
             Packet::Proof { data, context, .. } => {
@@ -2611,7 +2345,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                         let proof: &[u8] = &data[32..64];
 
                         // Find matching outbound resource and validate proof
-                        if let Some((link_id, _, service_idx, local_request_id, outbound)) =
+                        if let Some((link_id, local_request_id, outbound)) =
                             self.outbound_resources.get(&resource_hash)
                         {
                             if outbound.verify_proof(proof) {
@@ -2625,7 +2359,6 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                                 let link_id = *link_id;
                                 let original_hash = outbound.original_hash;
                                 let is_last_segment = outbound.is_last_segment();
-                                let service_idx = *service_idx;
                                 let local_request_id = *local_request_id;
 
                                 self.outbound_resources.remove(&resource_hash);
@@ -2634,10 +2367,8 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                                     // Last segment - clean up and notify
                                     self.outbound_multi_segments.remove(&original_hash);
 
-                                    if let (Some(_service), Some(request_id)) =
-                                        (service_idx, local_request_id)
-                                    {
-                                        notifications.push(Notification::RespondResult {
+                                    if let Some(request_id) = local_request_id {
+                                        notifications.push(ServiceEvent::RespondResult {
                                             request_id,
                                             result: Ok(()),
                                         });
@@ -2703,7 +2434,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
 
                             // Get destination's signing key to verify
                             let signing_key = match self.path_table.get(&receipt.destination) {
-                                Some(entry) => &entry.signing_key,
+                                Some(entry) => &entry.announce.signing_key,
                                 None => return true, // Keep - can't verify without key
                             };
 
@@ -2724,7 +2455,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             }
         }
 
-        self.dispatch_notifications(notifications);
+        self.pending_events.extend(notifications);
 
         self.schedule_channel_retry(destination_hash);
         self.schedule_link_maintenance(link_id);
@@ -2732,12 +2463,10 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         for (link_id, original_hash) in pending_next_segments {
             self.send_next_segment(link_id, original_hash);
         }
-
-        Some((packet, for_local_service, for_local_link))
     }
 
     fn send_next_segment(&mut self, link_id: LinkId, original_hash: [u8; 32]) {
-        use crate::packet::LinkDataDestination;
+        use crate::packet::RoutedDestination;
         use crate::resource::MAX_EFFICIENT_SIZE;
 
         let Some(multi) = self.outbound_multi_segments.get_mut(&original_hash) else {
@@ -2748,11 +2477,12 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             return;
         };
 
+        let total_segments = multi.full_data.len().div_ceil(MAX_EFFICIENT_SIZE);
         let next_segment = multi.current_segment + 1;
-        if next_segment > multi.total_segments {
+        if next_segment > total_segments {
             log::warn!(
                 "send_next_segment: already sent all {} segments for {}",
-                multi.total_segments,
+                total_segments,
                 hex::encode(original_hash)
             );
             return;
@@ -2774,11 +2504,12 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             segment_data,
             None,
             multi.compress,
-            multi.is_response,
             multi.request_id.clone(),
-            next_segment,
-            Some(original_hash),
-            Some(multi.full_data.len()),
+            crate::resource::ResourceSegment::Continuation {
+                previous_segments: std::num::NonZeroUsize::new(multi.current_segment).unwrap(),
+                original_hash,
+                total_data_size: multi.full_data.len(),
+            },
         );
 
         let adv = resource.advertisement(91);
@@ -2788,33 +2519,23 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         log::debug!(
             "Sending segment {}/{} for multi-segment transfer {}",
             next_segment,
-            multi.total_segments,
+            total_segments,
             hex::encode(original_hash)
         );
 
         let ciphertext = link.encrypt(&mut self.rng, &adv_data);
         let packet = Packet::LinkData {
             hops: 0,
-            destination: LinkDataDestination::Direct(link_id),
+            destination: RoutedDestination::direct(link_id),
             context: LinkContext::ResourceAdv,
             data: ciphertext,
         };
 
-        let service_idx = multi.service_idx;
         let local_request_id = multi.local_request_id;
-        let destination = multi.destination;
         multi.current_segment = next_segment;
 
-        self.outbound_resources.insert(
-            hash,
-            (
-                link_id,
-                destination,
-                service_idx,
-                local_request_id,
-                resource,
-            ),
-        );
+        self.outbound_resources
+            .insert(hash, (link_id, local_request_id, resource));
 
         if let Some(iface) = self.interfaces.get_mut(target_interface) {
             iface.send(packet, 0);
@@ -2838,7 +2559,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         context: LinkContext,
         plaintext: &[u8],
     ) -> Result<Packet, QueueChannelError> {
-        use crate::packet::LinkDataDestination;
+        use crate::packet::RoutedDestination;
 
         let link = self
             .established_links
@@ -2847,31 +2568,13 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         let data = link.encrypt(&mut self.rng, plaintext);
         Ok(Packet::LinkData {
             hops: 0,
-            destination: LinkDataDestination::Direct(link_id),
+            destination: RoutedDestination::direct(link_id),
             context,
             data,
         })
     }
 
-    fn send_link_packet_with_activity(
-        &mut self,
-        link_id: LinkId,
-        context: LinkContext,
-        plaintext: &[u8],
-        now: Instant,
-    ) {
-        if let Some(link) = self.established_links.get_mut(&link_id) {
-            link.touch_outbound(now);
-        }
-        self.send_link_packet(link_id, context, plaintext);
-    }
-
-    fn outbound(
-        &mut self,
-        mut packet: Packet,
-        attached_interface: Option<usize>,
-        now: Instant,
-    ) -> bool {
+    fn outbound(&mut self, mut packet: Packet, attached_interface: Option<usize>, now: Instant) {
         let destination_hash = packet.destination_hash();
         let hops = packet.hops();
 
@@ -2921,52 +2624,34 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             }
             self.schedule_path_expiry(destination_hash);
 
-            return true;
+            return;
         }
 
         // No known path - broadcast on all interfaces (with filtering)
-        let mut sent = false;
-        let mut stored_hash = false;
+        let mut first = true;
 
         for (i, iface) in self.interfaces.iter_mut().enumerate() {
-            let mut should_transmit = true;
-
             // If packet has an attached interface, skip that one (don't echo back)
-            if let Some(attached) = attached_interface
-                && i == attached
-            {
-                should_transmit = false;
-            }
-
-            // For link packets, check if link is on this interface
-            if let Packet::LinkData { .. } | Packet::LinkProof { .. } = &packet {
-                // Link packets should only go on their attached interface
-                // This is handled by attached_interface above
+            if attached_interface == Some(i) {
+                continue;
             }
 
             // Announce rate limiting is handled by interface.send()
             // which queues announces based on hop count priority
 
-            if should_transmit {
-                if !stored_hash {
-                    self.seen_packets.insert(packet.packet_hash());
-                    stored_hash = true;
-                }
-
-                // Generate receipt on first send
-                if !sent && generate_receipt {
+            if first {
+                self.seen_packets.insert(packet.packet_hash());
+                if generate_receipt {
                     self.receipts.push(Receipt {
                         destination: destination_hash,
                         packet_hash: packet.packet_hash(),
                     });
                 }
-
-                iface.send(packet.clone(), hops);
-                sent = true;
+                first = false;
             }
-        }
 
-        sent
+            iface.send(packet.clone(), hops);
+        }
     }
 
     pub(crate) fn poll_received(&mut self, cx: &mut Context<'_>) -> Poll<Vec<(Vec<u8>, usize)>> {
@@ -3000,7 +2685,12 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         received: Vec<PreparedInbound>,
     ) -> Vec<ServiceEvent> {
         for received in received {
-            let (packet, packet_hash, wire_len, source) = received.into_parts();
+            let PreparedInbound {
+                packet,
+                packet_hash,
+                wire_len,
+                source,
+            } = received;
             self.inbound(packet, packet_hash, wire_len, source, now);
         }
 
@@ -3060,7 +2750,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                     let pending = &mut self.pending_announces[index];
                     pending.retries_remaining -= 1;
                     let next_retry = if pending.retries_remaining > 0 {
-                        pending.retry_at = now + Duration::from_millis(self.retry_delay_ms);
+                        pending.retry_at = now + Duration::from_millis(DEFAULT_RETRY_DELAY_MS);
                         Some(pending.retry_at)
                     } else {
                         None
@@ -3112,8 +2802,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                 let rtt = self
                     .established_links
                     .get(&link)
-                    .and_then(|link| link.rtt_ms)
-                    .map(Duration::from_millis)
+                    .and_then(EstablishedLink::rtt)
                     .unwrap_or(Duration::from_millis(25));
                 let Some(channel) = self.channels.get_mut(&link) else {
                     return Vec::new();
@@ -3145,18 +2834,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                 if pending.request_time != request_time {
                     return Vec::new();
                 }
-                let destination = pending.destination;
                 self.pending_outbound_links.remove(&link);
-                let mut notifications = Vec::new();
-                if let Some(queued) = self.pending_outbound_requests.remove(&destination) {
-                    for (_, request_id, _, _) in queued {
-                        notifications.push(Notification::RequestResult {
-                            request_id,
-                            result: Err(crate::handle::RequestError::LinkClosed),
-                        });
-                    }
-                }
-                self.dispatch_notifications(notifications);
             }
             ProtocolTimer::PathRequestTimeout(destination) => {
                 if self
@@ -3169,19 +2847,10 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                     return Vec::new();
                 }
                 self.pending_path_requests.remove(&destination);
-                let mut notifications = vec![Notification::PathRequestResult {
+                self.pending_events.push(ServiceEvent::PathRequestResult {
                     destination,
                     found: false,
-                }];
-                if let Some(queued) = self.pending_outbound_requests.remove(&destination) {
-                    for (_, request_id, _, _) in queued {
-                        notifications.push(Notification::RequestResult {
-                            request_id,
-                            result: Err(crate::handle::RequestError::Timeout),
-                        });
-                    }
-                }
-                self.dispatch_notifications(notifications);
+                });
             }
             ProtocolTimer::LinkMaintenance(link_id) => {
                 let Some(link) = self.established_links.get(&link_id) else {
@@ -3193,21 +2862,21 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                 let stale = now.saturating_duration_since(link.last_inbound)
                     >= Duration::from_secs(link.stale_time_secs())
                     && link.pending_requests.is_empty();
-                let keepalive = link.is_initiator
-                    && link.state == LinkState::Active
+                let keepalive = link.is_initiator()
+                    && link.is_active()
                     && now.saturating_duration_since(link.last_inbound)
                         >= Duration::from_secs(link.keepalive_interval_secs())
                     && link.last_keepalive_sent.is_none_or(|sent| {
                         now.saturating_duration_since(sent)
                             >= Duration::from_secs(link.keepalive_interval_secs())
                     });
-                if stale || link.state == LinkState::Stale {
+                if stale {
                     let destination = link.destination;
                     let interface = link.receiving_interface;
                     let data = link.encrypt(&mut self.rng, &link_id);
                     let packet = Packet::LinkData {
                         hops: 0,
-                        destination: crate::packet::LinkDataDestination::Direct(link_id),
+                        destination: crate::packet::RoutedDestination::direct(link_id),
                         context: LinkContext::LinkClose,
                         data,
                     };
@@ -3222,7 +2891,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                         let interface = link.receiving_interface;
                         let packet = Packet::LinkData {
                             hops: 0,
-                            destination: crate::packet::LinkDataDestination::Direct(link_id),
+                            destination: crate::packet::RoutedDestination::direct(link_id),
                             context: LinkContext::Keepalive,
                             data: vec![crate::link::KEEPALIVE_REQUEST],
                         };
@@ -3243,7 +2912,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
 
     fn handle_keepalive(&mut self, link_id: LinkId, data: &[u8]) {
         use crate::link::{KEEPALIVE_REQUEST, KEEPALIVE_RESPONSE};
-        use crate::packet::LinkDataDestination;
+        use crate::packet::RoutedDestination;
 
         if data.is_empty() {
             return;
@@ -3253,7 +2922,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             return;
         };
 
-        let is_initiator = link.is_initiator;
+        let is_initiator = link.is_initiator();
         let target_interface = link.receiving_interface;
 
         if data[0] == KEEPALIVE_REQUEST && !is_initiator {
@@ -3263,7 +2932,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             );
             let packet = Packet::LinkData {
                 hops: 0,
-                destination: LinkDataDestination::Direct(link_id),
+                destination: RoutedDestination::direct(link_id),
                 context: LinkContext::Keepalive,
                 data: vec![KEEPALIVE_RESPONSE],
             };
@@ -3291,12 +2960,10 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         // LRRTT packet from initiator telling responder the measured RTT
         if let Some(rtt_secs) = decode_rtt(plaintext)
             && let Some(link) = self.established_links.get_mut(&link_id)
-            && !link.is_initiator
+            && !link.is_initiator()
         {
             let rtt_ms = (rtt_secs * 1000.0) as u64;
-            link.set_rtt(rtt_ms);
-            link.state = LinkState::Active;
-            link.activated_at = Some(std::time::Instant::now());
+            link.activate(rtt_ms);
         }
     }
 
@@ -3353,18 +3020,16 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                         adv.num_parts,
                         adv.transfer_size,
                         adv.compressed,
-                        adv.is_response,
+                        adv.request_id.is_some(),
                         adv.request_id.as_ref().map(hex::encode),
                         adv.segment_index,
                         adv.total_segments,
-                        adv.split
+                        adv.total_segments > 1
                     );
 
                     // Auto-accept if this is a response to a pending request or a continuation
-                    if !adv.is_response {
+                    if adv.request_id.is_none() {
                         log::debug!("ResourceAdv not a response, ignoring");
-                    } else if adv.request_id.is_none() {
-                        log::warn!("ResourceAdv is_response=true but no request_id");
                     } else {
                         let original_hash = adv.original_hash;
                         let is_continuation = adv.segment_index > 1
@@ -3430,7 +3095,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                 }
             }
             LinkContext::ResourceReq => {
-                use crate::packet::LinkDataDestination;
+                use crate::packet::RoutedDestination;
 
                 if plaintext.len() < 33 {
                     return;
@@ -3450,14 +3115,14 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                     .established_links
                     .get(&link_id)
                     .map(|l| l.receiving_interface);
-                if let Some((_, _, _, _, resource)) = self.outbound_resources.get_mut(&hash) {
+                if let Some((_, _, resource)) = self.outbound_resources.get_mut(&hash) {
                     for part_hash in requested_hashes {
                         if let Some(part_data) = resource.get_part(&part_hash) {
                             // Resource parts are already encrypted at the stream level,
                             // so we send them as raw data (no Token encryption)
                             let packet = Packet::LinkData {
                                 hops: 0,
-                                destination: LinkDataDestination::Direct(link_id),
+                                destination: RoutedDestination::direct(link_id),
                                 context: LinkContext::Resource,
                                 data: part_data.to_vec(),
                             };
@@ -3483,7 +3148,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                         let ciphertext = link.encrypt(&mut self.rng, &payload);
                         let packet = Packet::LinkData {
                             hops: 0,
-                            destination: LinkDataDestination::Direct(link_id),
+                            destination: RoutedDestination::direct(link_id),
                             context: LinkContext::ResourceHmu,
                             data: ciphertext,
                         };
@@ -3518,8 +3183,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
                         if accepted {
                             // Emit progress event if this is a response with a request_id
                             #[cfg(test)]
-                            if resource.is_response
-                                && let Some(ref req_id_bytes) = resource.request_id
+                            if let Some(ref req_id_bytes) = resource.request_id
                                 && let Some(wire_req_id) = req_id_bytes
                                     .get(..16)
                                     .and_then(|b| <[u8; 16]>::try_from(b).ok())
@@ -3687,7 +3351,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             resource.segment_index,
             resource.total_segments,
             segment_data.len(),
-            resource.is_response
+            resource.request_id.is_some()
         );
 
         // Send proof
@@ -3704,21 +3368,13 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             iface.send(packet, 0);
         }
 
-        if !resource.is_response {
+        let Some(req_id_bytes) = resource.request_id.as_ref() else {
             log::debug!(
                 "Dropping unsolicited resource {} with {} bytes",
                 hex::encode(hash),
                 segment_data.len()
             );
             return;
-        }
-
-        let req_id_bytes = match resource.request_id {
-            Some(ref r) => r,
-            None => {
-                log::warn!("complete_resource: is_response=true but no request_id");
-                return;
-            }
         };
 
         let wire_req_id: Option<WireRequestId> = req_id_bytes
@@ -3802,53 +3458,12 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             );
 
             // Extract metadata from accumulated data if present
-            let (data, metadata) = if transfer.has_metadata && transfer.accumulated_data.len() >= 3
-            {
-                let metadata_size = ((transfer.accumulated_data[0] as usize) << 16)
-                    | ((transfer.accumulated_data[1] as usize) << 8)
-                    | (transfer.accumulated_data[2] as usize);
-                let data_start = 3 + metadata_size;
-                if transfer.accumulated_data.len() >= data_start {
-                    log::debug!(
-                        "Extracting {} byte metadata, {} byte data",
-                        metadata_size,
-                        transfer.accumulated_data.len() - data_start
-                    );
-                    let metadata = transfer.accumulated_data[3..data_start].to_vec();
-                    let data = transfer.accumulated_data[data_start..].to_vec();
-                    (data, Some(metadata))
-                } else {
-                    log::warn!("Metadata size exceeds data length");
-                    (transfer.accumulated_data, None)
-                }
-            } else {
-                (transfer.accumulated_data, None)
-            };
+            let (data, metadata) = split_metadata(transfer.accumulated_data, transfer.has_metadata);
 
             (data, metadata, transfer.service, transfer.local_request_id)
         } else {
             // Single-segment - extract metadata and get request info
-            let (data, metadata) = if resource.has_metadata && segment_data.len() >= 3 {
-                let metadata_size = ((segment_data[0] as usize) << 16)
-                    | ((segment_data[1] as usize) << 8)
-                    | (segment_data[2] as usize);
-                let data_start = 3 + metadata_size;
-                if segment_data.len() >= data_start {
-                    log::debug!(
-                        "Extracting {} byte metadata, {} byte data",
-                        metadata_size,
-                        segment_data.len() - data_start
-                    );
-                    let metadata = segment_data[3..data_start].to_vec();
-                    let data = segment_data[data_start..].to_vec();
-                    (data, Some(metadata))
-                } else {
-                    log::warn!("Metadata size exceeds data length");
-                    (segment_data, None)
-                }
-            } else {
-                (segment_data, None)
-            };
+            let (data, metadata) = split_metadata(segment_data, resource.has_metadata);
 
             let (service, local_request_id) = match self
                 .established_links
@@ -3868,12 +3483,6 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             (data, metadata, service, local_request_id)
         };
 
-        let from = self
-            .established_links
-            .get(&link_id)
-            .map(|l| l.destination)
-            .unwrap_or([0u8; 16]);
-
         log::info!(
             "Delivering resource response: {} bytes to service {:?} (request_id={})",
             final_data.len(),
@@ -3887,15 +3496,14 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             .map(|(_, response_data)| response_data.into_vec())
             .unwrap_or(final_data);
 
-        let notification = Notification::RequestResult {
+        self.pending_events.push(ServiceEvent::RequestResult {
             request_id: local_request_id,
-            result: Ok((from, data, metadata)),
-        };
-        self.dispatch_notifications(vec![notification]);
+            result: Ok((data, metadata)),
+        });
     }
 
     fn send_resource_request(&mut self, link_id: LinkId, hash: [u8; 32], now: Instant) {
-        use crate::packet::LinkDataDestination;
+        use crate::packet::RoutedDestination;
         use crate::resource::{HASHMAP_IS_EXHAUSTED, HASHMAP_IS_NOT_EXHAUSTED};
 
         // First pass: get needed hashes and build payload
@@ -3954,7 +3562,7 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
             let target_interface = link.receiving_interface;
             let packet = Packet::LinkData {
                 hops: 0,
-                destination: LinkDataDestination::Direct(link_id),
+                destination: RoutedDestination::direct(link_id),
                 context: LinkContext::ResourceReq,
                 data: ciphertext,
             };
@@ -3978,49 +3586,15 @@ impl<T: Transport, R: RngCore + rand::CryptoRng> Protocol<T, R> {
         data: Vec<u8>,
         transport_id: Option<DestinationAddress>,
     ) -> Packet {
-        use crate::packet::AnnounceDestination;
-        let destination = match transport_id {
-            Some(tid) => AnnounceDestination::Transport {
-                transport_id: tid,
-                destination: dest,
-            },
-            None => AnnounceDestination::Single(dest),
-        };
+        let destination = transport_id.map_or_else(
+            || RoutedDestination::direct(dest),
+            |transport| RoutedDestination::via(transport, dest),
+        );
         Packet::Announce {
             hops,
             destination,
             has_ratchet,
             is_path_response,
-            data,
-        }
-    }
-
-    fn make_link_request_packet(
-        &self,
-        dest: DestinationAddress,
-        transport_id: Option<DestinationAddress>,
-        data: Vec<u8>,
-    ) -> Packet {
-        use crate::packet::LinkRequestDestination;
-        let destination = match transport_id {
-            Some(tid) => LinkRequestDestination::Transport {
-                transport_id: tid,
-                destination: dest,
-            },
-            None => LinkRequestDestination::Direct(dest),
-        };
-        Packet::LinkRequest {
-            hops: 0,
-            destination,
-            data,
-        }
-    }
-
-    fn make_link_proof_packet(&self, link_id: LinkId, data: Vec<u8>) -> Packet {
-        use crate::packet::LinkProofDestination;
-        Packet::LinkProof {
-            hops: 0,
-            destination: LinkProofDestination::Direct(link_id),
             data,
         }
     }
@@ -4222,7 +3796,7 @@ mod tests {
 
         transfer(&mut b, 0, &mut a, 0);
         a.poll(now);
-        assert!(a.channels[&link_id].outbound.is_empty());
+        assert!(a.channels[&link_id].is_idle());
     }
 
     #[test]
@@ -4465,7 +4039,7 @@ mod tests {
         // A should have received the response via ServiceEvent::RequestResult
         let response = events_a.iter().find_map(|e| match e {
             ServiceEvent::RequestResult {
-                result: Ok((_, data, _)),
+                result: Ok((data, _)),
                 ..
             } => Some(data.clone()),
             _ => None,
@@ -4553,7 +4127,7 @@ mod tests {
         // A should have received the response via ServiceEvent::RequestResult
         let response = events_a.iter().find_map(|e| match e {
             ServiceEvent::RequestResult {
-                result: Ok((_, data, _)),
+                result: Ok((data, _)),
                 ..
             } => Some(data.clone()),
             _ => None,
@@ -4642,7 +4216,7 @@ mod tests {
         // A should have received the large response via ServiceEvent::RequestResult
         let response = events_a.iter().find_map(|e| match e {
             ServiceEvent::RequestResult {
-                result: Ok((_, data, _)),
+                result: Ok((data, _)),
                 ..
             } => Some(data.clone()),
             _ => None,
@@ -4707,7 +4281,7 @@ mod tests {
             b.poll(now);
             if let Some(data) = events_a.iter().find_map(|e| match e {
                 ServiceEvent::RequestResult {
-                    result: Ok((_, data, _)),
+                    result: Ok((data, _)),
                     ..
                 } => Some(data.clone()),
                 _ => None,
@@ -4893,7 +4467,7 @@ mod tests {
             c.poll(later);
             if let Some(data) = events_a.iter().find_map(|e| match e {
                 ServiceEvent::RequestResult {
-                    result: Ok((_, data, _)),
+                    result: Ok((data, _)),
                     ..
                 } => Some(data.clone()),
                 _ => None,
@@ -4931,8 +4505,8 @@ mod tests {
 
         // After link establishment, initiator (a) should have RTT measured
         let a_link = a.established_links.get(&link_id).unwrap();
-        assert!(a_link.rtt_ms.is_some(), "initiator should have RTT");
-        assert!(a_link.is_initiator);
+        assert!(a_link.rtt().is_some(), "initiator should have RTT");
+        assert!(a_link.is_initiator());
 
         // LRRTT packet should have been sent, transfer it
         transfer(&mut a, 0, &mut b, 0);
@@ -4941,11 +4515,11 @@ mod tests {
         // Now responder (b) should also have RTT from LRRTT packet
         let b_link = b.established_links.get(&link_id).unwrap();
         assert!(
-            b_link.rtt_ms.is_some(),
+            b_link.rtt().is_some(),
             "responder should have RTT from LRRTT"
         );
-        assert!(!b_link.is_initiator);
-        assert_eq!(b_link.state, LinkState::Active);
+        assert!(!b_link.is_initiator());
+        assert!(b_link.is_active());
     }
 
     #[test]
@@ -5015,7 +4589,7 @@ mod tests {
         // Start with last_inbound 6s in past: triggers keepalive (>= 5s) but not stale (< 10s)
         let test_start = now + Duration::from_secs(6);
         if let Some(link) = a.established_links.get_mut(&link_id) {
-            link.set_rtt(0);
+            link.activate(0);
             link.last_inbound = now; // 6s ago at test_start
             link.last_keepalive_sent = None;
         }
@@ -5031,7 +4605,7 @@ mod tests {
         // Over 60 seconds, expect 0 keepalives
         let now2 = now + Duration::from_secs(100);
         if let Some(link) = a.established_links.get_mut(&link_id) {
-            link.set_rtt(1750);
+            link.activate(1750);
             link.last_outbound = now2;
             link.last_inbound = now2;
             link.last_keepalive_sent = None;
@@ -5181,7 +4755,7 @@ mod tests {
         // Response should be received
         let response = events_a.iter().find_map(|e| match e {
             ServiceEvent::RequestResult {
-                result: Ok((_, data, _)),
+                result: Ok((data, _)),
                 ..
             } => Some(data.clone()),
             _ => None,
@@ -5222,9 +4796,15 @@ mod tests {
 
         // Set a known RTT value that we'll expect to change after keepalive
         if let Some(link) = a.established_links.get_mut(&link_id) {
-            link.set_rtt(9999);
+            link.activate(9999);
         }
-        let rtt_before = a.established_links.get(&link_id).unwrap().rtt_ms.unwrap();
+        let rtt_before = a
+            .established_links
+            .get(&link_id)
+            .unwrap()
+            .rtt()
+            .unwrap()
+            .as_millis();
         assert_eq!(rtt_before, 9999);
 
         // Set up to trigger keepalive: inbound old enough to trigger keepalive but not stale
@@ -5529,7 +5109,7 @@ mod tests {
         let result = events_a.iter().find_map(|e| match e {
             ServiceEvent::RequestResult {
                 request_id,
-                result: Ok((_, data, _)),
+                result: Ok((data, _)),
                 ..
             } => Some((*request_id, data.clone())),
             _ => None,
@@ -5624,7 +5204,7 @@ mod tests {
         let resp1 = events_a1.iter().find_map(|e| match e {
             ServiceEvent::RequestResult {
                 request_id,
-                result: Ok((_, data, _)),
+                result: Ok((data, _)),
                 ..
             } => Some((*request_id, data.clone())),
             _ => None,
@@ -5656,7 +5236,7 @@ mod tests {
         let resp2 = events_a2.iter().find_map(|e| match e {
             ServiceEvent::RequestResult {
                 request_id,
-                result: Ok((_, data, _)),
+                result: Ok((data, _)),
                 ..
             } => Some((*request_id, data.clone())),
             _ => None,
@@ -5725,7 +5305,7 @@ mod tests {
 
             let response = events_a.iter().find_map(|e| match e {
                 ServiceEvent::RequestResult {
-                    result: Ok((_, data, _)),
+                    result: Ok((data, _)),
                     ..
                 } => Some(data.clone()),
                 _ => None,
@@ -6747,7 +6327,7 @@ mod tests {
 
             for event in &events {
                 if let ServiceEvent::RequestResult {
-                    result: Ok((_, data, _)),
+                    result: Ok((data, _)),
                     ..
                 } = event
                 {
@@ -6822,9 +6402,6 @@ mod tests {
             total_segments: 4,
             hashmap: vec![0; 40],
             compressed: false,
-            split: true,
-            is_request: false,
-            is_response: true,
             has_metadata: false,
             request_id: Some(vec![0xaa; 16]),
         };
@@ -6849,18 +6426,13 @@ mod tests {
     #[test]
     fn outbound_multi_segment_struct_fields() {
         let multi = OutboundMultiSegment {
-            destination: [0x11; 16],
-            service_idx: Some(ServiceId(1)),
             local_request_id: Some(RequestId([0x22; 16])),
             full_data: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
             compress: true,
-            is_response: true,
             request_id: Some(vec![0xAA; 16]),
-            total_segments: 3,
             current_segment: 1,
         };
 
-        assert_eq!(multi.total_segments, 3);
         assert_eq!(multi.current_segment, 1);
         assert_eq!(multi.full_data.len(), 10);
     }
@@ -6885,11 +6457,13 @@ mod tests {
 
         EstablishedLink::from_responder(
             link_id,
-            &responder_keypair.secret,
+            LinkResponder {
+                destination: dest,
+                service: ServiceId(0),
+                encryption_secret: &responder_keypair.secret,
+                signing_key: responder_signing_key,
+            },
             &initiator_keypair.public,
-            dest,
-            ServiceId(0),
-            responder_signing_key,
             initiator_signing_key.verifying_key(),
             0,
             now,
@@ -6898,7 +6472,7 @@ mod tests {
 
     #[test]
     fn outbound_resource_segment_fields() {
-        use crate::resource::OutboundResource;
+        use crate::resource::{OutboundResource, ResourceSegment};
 
         let link = make_test_link();
         let data = vec![1, 2, 3, 4, 5];
@@ -6910,11 +6484,12 @@ mod tests {
             data,
             None,
             false,
-            true,
             None,
-            2,
-            Some([0xAA; 32]),
-            Some(5000),
+            ResourceSegment::Continuation {
+                previous_segments: std::num::NonZeroUsize::new(1).unwrap(),
+                original_hash: [0xAA; 32],
+                total_data_size: 5000,
+            },
         );
 
         assert_eq!(resource.segment_index, 2);
@@ -6930,7 +6505,7 @@ mod tests {
 
     #[test]
     fn outbound_resource_is_last_segment() {
-        use crate::resource::OutboundResource;
+        use crate::resource::{OutboundResource, ResourceSegment};
 
         let link = make_test_link();
         let mut rng = StdRng::seed_from_u64(42);
@@ -6942,11 +6517,10 @@ mod tests {
             vec![1, 2, 3],
             None,
             false,
-            true,
             None,
-            1,
-            None,
-            None,
+            ResourceSegment::First {
+                total_data_size: None,
+            },
         );
         assert!(single.is_last_segment());
 
@@ -6957,11 +6531,10 @@ mod tests {
             vec![1, 2, 3],
             None,
             false,
-            true,
             None,
-            1,
-            Some([0xAA; 32]),
-            Some(3), // total size = 3, so 1 segment
+            ResourceSegment::First {
+                total_data_size: Some(3),
+            },
         );
         assert!(last.is_last_segment());
     }
@@ -7231,7 +6804,7 @@ mod tests {
 
         // Verify B has the ratchet key
         let path_entry = b.path_table.get(&addr_a).unwrap();
-        assert!(path_entry.ratchet_key.is_some());
+        assert!(path_entry.announce.ratchet.is_some());
 
         // B sends raw data (will be encrypted with ratchet)
         b.send_raw(addr_a, b"ratchet encrypted").unwrap();
@@ -8617,7 +8190,7 @@ mod tests {
 
             if let Some(data) = events_a.iter().find_map(|e| match e {
                 ServiceEvent::RequestResult {
-                    result: Ok((_, data, _)),
+                    result: Ok((data, _)),
                     ..
                 } => Some(data.clone()),
                 _ => None,
@@ -8636,7 +8209,7 @@ mod tests {
 
     #[test]
     fn resource_confirmation_cleans_up_state() {
-        use crate::packet::{LinkContext, LinkDataDestination, Packet};
+        use crate::packet::{LinkContext, Packet, RoutedDestination};
 
         let mut a = test_node(true);
         let mut b = test_node(true);
@@ -8698,7 +8271,7 @@ mod tests {
         let icl_payload = link.encrypt(&mut rand::rngs::StdRng::from_entropy(), &resource_hash);
         let icl_packet = Packet::LinkData {
             hops: 0,
-            destination: LinkDataDestination::Direct(link_id),
+            destination: RoutedDestination::direct(link_id),
             context: LinkContext::ResourceIcl,
             data: icl_payload,
         };
@@ -8854,7 +8427,7 @@ mod tests {
         if let Some(link) = server.established_links.get_mut(&link_id) {
             link.last_inbound = now;
             link.last_keepalive_sent = None;
-            link.set_rtt(0);
+            link.activate(0);
         }
         server.poll(now + Duration::from_secs(10));
 
@@ -8902,7 +8475,7 @@ mod tests {
         if let Some(link) = a.established_links.get_mut(&link_id) {
             link.last_inbound = now;
             link.last_keepalive_sent = None;
-            link.set_rtt(0);
+            link.activate(0);
         }
 
         let future = now + Duration::from_secs(6);
@@ -8935,7 +8508,7 @@ mod tests {
     #[test]
     fn keepalive_response_is_not_encrypted() {
         use crate::link::{KEEPALIVE_REQUEST, KEEPALIVE_RESPONSE};
-        use crate::packet::LinkDataDestination;
+        use crate::packet::RoutedDestination;
 
         let mut a = test_node(true);
         let mut b = test_node(true);
@@ -8962,7 +8535,7 @@ mod tests {
 
         let keepalive_request = Packet::LinkData {
             hops: 0,
-            destination: LinkDataDestination::Direct(link_id),
+            destination: RoutedDestination::direct(link_id),
             context: LinkContext::Keepalive,
             data: vec![KEEPALIVE_REQUEST],
         };
@@ -8999,7 +8572,7 @@ mod tests {
     #[test]
     fn receives_unencrypted_keepalive_from_remote() {
         use crate::link::KEEPALIVE_REQUEST;
-        use crate::packet::LinkDataDestination;
+        use crate::packet::RoutedDestination;
 
         let mut a = test_node(true);
         let mut b = test_node(true);
@@ -9026,7 +8599,7 @@ mod tests {
 
         let keepalive_request = Packet::LinkData {
             hops: 0,
-            destination: LinkDataDestination::Direct(link_id),
+            destination: RoutedDestination::direct(link_id),
             context: LinkContext::Keepalive,
             data: vec![KEEPALIVE_REQUEST],
         };

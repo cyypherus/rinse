@@ -73,18 +73,17 @@ pub(crate) enum QueueChannelError {
     WindowFull,
 }
 
-pub(crate) struct OutboundEnvelope {
-    pub(crate) packet: crate::packet::Packet,
-    pub(crate) packet_hash: [u8; 32],
-    pub(crate) sent_at: Instant,
-    pub(crate) tries: u8,
+struct OutboundEnvelope {
+    packet: crate::packet::Packet,
+    sent_at: Instant,
+    tries: u8,
 }
 
 pub(crate) struct ChannelState {
     next_sequence: u16,
     next_rx_sequence: u16,
     rx: BTreeMap<u16, (u16, Vec<u8>)>,
-    pub(crate) outbound: VecDeque<OutboundEnvelope>,
+    outbound: VecDeque<OutboundEnvelope>,
     window: usize,
 }
 
@@ -118,15 +117,9 @@ impl ChannelState {
         Ok(raw)
     }
 
-    pub(crate) fn track(
-        &mut self,
-        packet: crate::packet::Packet,
-        packet_hash: [u8; 32],
-        now: Instant,
-    ) {
+    pub(crate) fn track(&mut self, packet: crate::packet::Packet, now: Instant) {
         self.outbound.push_back(OutboundEnvelope {
             packet,
-            packet_hash,
             sent_at: now,
             tries: 1,
         });
@@ -136,7 +129,7 @@ impl ChannelState {
         let Some(index) = self
             .outbound
             .iter()
-            .position(|envelope| &envelope.packet_hash == packet_hash)
+            .position(|envelope| &envelope.packet.packet_hash() == packet_hash)
         else {
             return false;
         };
@@ -203,6 +196,11 @@ impl ChannelState {
             .iter()
             .map(|envelope| envelope.sent_at + Self::retry_timeout(envelope.tries, rtt, ring_len))
             .min()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_idle(&self) -> bool {
+        self.outbound.is_empty()
     }
 }
 

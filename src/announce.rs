@@ -40,8 +40,8 @@ pub(crate) const MIN_ANNOUNCE_LEN_WITH_RATCHET: usize = MIN_ANNOUNCE_LEN + RATCH
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AnnounceData {
-    pub encryption_key: [u8; ENCRYPTION_KEY_LEN],
-    pub signing_key: [u8; SIGNING_KEY_LEN],
+    pub encryption_key: X25519Public,
+    pub signing_key: VerifyingKey,
     pub name_hash: [u8; NAME_HASH_LEN],
     pub random_hash: [u8; RANDOM_HASH_LEN],
     pub ratchet: Option<[u8; RATCHET_LEN]>,
@@ -74,8 +74,12 @@ impl AnnounceData {
         encryption_key.copy_from_slice(&data[pos..pos + ENCRYPTION_KEY_LEN]);
         pos += ENCRYPTION_KEY_LEN;
 
-        let mut signing_key = [0u8; SIGNING_KEY_LEN];
-        signing_key.copy_from_slice(&data[pos..pos + SIGNING_KEY_LEN]);
+        let signing_key =
+            VerifyingKey::from_bytes(data[pos..pos + SIGNING_KEY_LEN].try_into().unwrap())
+                .map_err(|error| {
+                    log::warn!("announce parse: invalid signing key: {error:?}");
+                    AnnounceError::InvalidSignature
+                })?;
         pos += SIGNING_KEY_LEN;
 
         let mut name_hash = [0u8; NAME_HASH_LEN];
@@ -102,7 +106,7 @@ impl AnnounceData {
         let app_data = data[pos..].to_vec();
 
         Ok(Self {
-            encryption_key,
+            encryption_key: X25519Public::from(encryption_key),
             signing_key,
             name_hash,
             random_hash,
@@ -114,8 +118,8 @@ impl AnnounceData {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.wire_len());
-        out.extend_from_slice(&self.encryption_key);
-        out.extend_from_slice(&self.signing_key);
+        out.extend_from_slice(self.encryption_key.as_bytes());
+        out.extend_from_slice(self.signing_key.as_bytes());
         out.extend_from_slice(&self.name_hash);
         out.extend_from_slice(&self.random_hash);
         if let Some(ref ratchet) = self.ratchet {
@@ -135,34 +139,11 @@ impl AnnounceData {
         }
     }
 
-    pub fn public_key_bytes(&self) -> [u8; PUBLIC_KEY_LEN] {
-        let mut out = [0u8; PUBLIC_KEY_LEN];
-        out[..ENCRYPTION_KEY_LEN].copy_from_slice(&self.encryption_key);
-        out[ENCRYPTION_KEY_LEN..].copy_from_slice(&self.signing_key);
-        out
-    }
-
-    pub fn encryption_public_key(&self) -> X25519Public {
-        X25519Public::from(self.encryption_key)
-    }
-
-    pub fn signing_public_key(&self) -> Result<VerifyingKey, AnnounceError> {
-        VerifyingKey::from_bytes(&self.signing_key).map_err(|_| AnnounceError::InvalidSignature)
-    }
-
     pub fn verify(&self, destination_hash: &[u8; 16]) -> Result<(), AnnounceError> {
-        let verifying_key = match self.signing_public_key() {
-            Ok(k) => k,
-            Err(e) => {
-                log::warn!("announce verify: invalid signing key");
-                return Err(e);
-            }
-        };
-
         let mut signed_data = Vec::new();
         signed_data.extend_from_slice(destination_hash);
-        signed_data.extend_from_slice(&self.encryption_key);
-        signed_data.extend_from_slice(&self.signing_key);
+        signed_data.extend_from_slice(self.encryption_key.as_bytes());
+        signed_data.extend_from_slice(self.signing_key.as_bytes());
         signed_data.extend_from_slice(&self.name_hash);
         signed_data.extend_from_slice(&self.random_hash);
         if let Some(ref ratchet) = self.ratchet {
@@ -172,18 +153,23 @@ impl AnnounceData {
 
         let signature = Signature::from_bytes(&self.signature);
 
-        verifying_key.verify(&signed_data, &signature).map_err(|e| {
-            log::warn!(
-                "announce verify: signature verification failed for dest {:02x?}: {:?}",
-                destination_hash,
-                e
-            );
-            AnnounceError::InvalidSignature
-        })
+        self.signing_key
+            .verify(&signed_data, &signature)
+            .map_err(|e| {
+                log::warn!(
+                    "announce verify: signature verification failed for dest {:02x?}: {:?}",
+                    destination_hash,
+                    e
+                );
+                AnnounceError::InvalidSignature
+            })
     }
 
     pub fn verify_destination(&self, destination_hash: &[u8; 16]) -> Result<(), AnnounceError> {
-        let identity_hash = &sha256(&self.public_key_bytes())[..16];
+        let mut public_key = [0u8; PUBLIC_KEY_LEN];
+        public_key[..ENCRYPTION_KEY_LEN].copy_from_slice(self.encryption_key.as_bytes());
+        public_key[ENCRYPTION_KEY_LEN..].copy_from_slice(self.signing_key.as_bytes());
+        let identity_hash = &sha256(&public_key)[..16];
         let mut hash_material = Vec::new();
         hash_material.extend_from_slice(&self.name_hash);
         hash_material.extend_from_slice(identity_hash);
@@ -255,8 +241,8 @@ impl AnnounceBuilder {
         let signature = self.signing_key.sign(&signed_data);
 
         AnnounceData {
-            encryption_key: self.encryption_key,
-            signing_key: signing_pub_bytes,
+            encryption_key: X25519Public::from(self.encryption_key),
+            signing_key: self.signing_key.verifying_key(),
             name_hash: self.name_hash,
             random_hash: self.random_hash,
             ratchet: self.ratchet,
