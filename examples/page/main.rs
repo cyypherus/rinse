@@ -8,9 +8,8 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use rinse::config::{Config, InterfaceConfig, load_or_create_persistent_identity};
 use rinse::{
-    EmbassyClock, IdentityHash, InlinePacketWork, InterfaceLimits, Link, LinkEvent, NodeBuilder,
-    NodeConfig, NodeHandle, RatchetAction, RequestPath, Service, ServiceConfig, ServiceEvent,
-    ServiceName, SystemEntropy,
+    IdentityHash, InterfaceLimits, Link, LinkEvent, NodeBuilder, NodeConfig, NodeHandle,
+    RatchetAction, RequestPath, Service, ServiceConfig, ServiceEvent, ServiceName,
 };
 use tokio::net::TcpListener;
 
@@ -50,7 +49,7 @@ async fn main() {
     } else {
         NodeConfig::endpoint()
     };
-    let mut builder = NodeBuilder::new(mode, EmbassyClock, InlinePacketWork, SystemEntropy);
+    let mut builder = NodeBuilder::new(mode);
     let mut listeners = Vec::new();
     for (interface_name, interface) in config.enabled_interfaces() {
         match interface {

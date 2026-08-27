@@ -3,8 +3,7 @@ mod common;
 use bytes::Bytes;
 use rinse::config::{Config, InterfaceConfig, load_or_create_persistent_identity};
 use rinse::{
-    Destination, EmbassyClock, InlinePacketWork, InterfaceLimits, NodeBuilder, NodeConfig,
-    RequestPath, ServiceConfig, ServiceName, SystemEntropy,
+    Destination, InterfaceLimits, NodeBuilder, NodeConfig, RequestPath, ServiceConfig, ServiceName,
 };
 
 #[tokio::main]
@@ -37,7 +36,7 @@ async fn main() {
     } else {
         NodeConfig::endpoint()
     };
-    let mut builder = NodeBuilder::new(mode, EmbassyClock, InlinePacketWork, SystemEntropy);
+    let mut builder = NodeBuilder::new(mode);
     for (name, interface) in config.enabled_interfaces() {
         if let InterfaceConfig::TCPClientInterface {
             target_host,

@@ -1,17 +1,14 @@
-use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use rinse::{
-    BufferChunk, ChannelMessage, ChannelReceive, Clock, EmbassyClock, InboundPacket,
-    InlinePacketWork, Interface, InterfaceError, InterfaceLimits, Link, LinkEvent, MessageType,
-    MonoTime, NodeBuilder, NodeConfig, OutboundPacket, PrivateIdentity, RatchetAction, RequestPath,
-    SendError, Service, ServiceConfig, ServiceEvent, ServiceName, ShutdownReason, StreamId,
-    SystemEntropy,
+    BufferChunk, ChannelMessage, ChannelReceive, InboundPacket, Interface, InterfaceError,
+    InterfaceLimits, Link, LinkEvent, MessageType, NodeBuilder, NodeConfig, OutboundPacket,
+    PrivateIdentity, RatchetAction, RequestPath, SendError, Service, ServiceConfig, ServiceEvent,
+    ServiceName, ShutdownReason, StreamId,
 };
 
 struct MemoryInterface {
@@ -63,87 +60,14 @@ fn connected_interfaces() -> (MemoryInterface, MemoryInterface, [Arc<AtomicBool>
     )
 }
 
-fn node_with_clock<C: Clock>(
-    interface: MemoryInterface,
-    clock: C,
-) -> (rinse::NodeHandle, rinse::NodeTask<C>) {
-    NodeBuilder::new(
-        NodeConfig::endpoint(),
-        clock,
-        InlinePacketWork,
-        SystemEntropy,
-    )
-    .interface(
-        interface,
-        InterfaceLimits::new(65_535, 256, 1_048_576).unwrap(),
-    )
-    .build()
-    .unwrap()
-}
-
-fn node(interface: MemoryInterface) -> (rinse::NodeHandle, rinse::NodeTask<EmbassyClock>) {
-    node_with_clock(interface, EmbassyClock)
-}
-
-#[derive(Clone)]
-struct TestClock {
-    now: Arc<AtomicU64>,
-    sleepers: Arc<Mutex<Vec<Waker>>>,
-}
-
-impl TestClock {
-    fn new() -> Self {
-        Self {
-            now: Arc::new(AtomicU64::new(1)),
-            sleepers: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    fn advance(&self, duration: Duration) {
-        self.now.fetch_add(
-            u64::try_from(duration.as_micros()).unwrap(),
-            Ordering::Relaxed,
-        );
-        for sleeper in std::mem::take(&mut *self.sleepers.lock().unwrap()) {
-            sleeper.wake();
-        }
-    }
-}
-
-struct TestSleep {
-    clock: TestClock,
-    deadline: MonoTime,
-}
-
-impl Future for TestSleep {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.clock.now() >= self.deadline {
-            Poll::Ready(())
-        } else {
-            let mut sleepers = self.clock.sleepers.lock().unwrap();
-            if !sleepers.iter().any(|waker| waker.will_wake(cx.waker())) {
-                sleepers.push(cx.waker().clone());
-            }
-            Poll::Pending
-        }
-    }
-}
-
-impl Clock for TestClock {
-    type Sleep<'a> = TestSleep;
-
-    fn now(&self) -> MonoTime {
-        MonoTime::from_micros(self.now.load(Ordering::Relaxed))
-    }
-
-    fn sleep_until(&self, deadline: MonoTime) -> Self::Sleep<'_> {
-        TestSleep {
-            clock: self.clone(),
-            deadline,
-        }
-    }
+fn node(interface: MemoryInterface) -> (rinse::NodeHandle, rinse::NodeTask) {
+    NodeBuilder::new(NodeConfig::endpoint())
+        .interface(
+            interface,
+            InterfaceLimits::new(65_535, 256, 1_048_576).unwrap(),
+        )
+        .build()
+        .unwrap()
 }
 
 async fn service(node: &rinse::NodeHandle, name: &str, paths: &[&str]) -> Service {
@@ -322,11 +246,10 @@ async fn rotating_an_announcement_returns_only_the_new_restart_secret() {
     running.await.unwrap().unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn learned_routes_expire() {
     let (client_interface, server_interface, forwarding) = connected_interfaces();
-    let clock = TestClock::new();
-    let (client_node, client_task) = node_with_clock(client_interface, clock.clone());
+    let (client_node, client_task) = node(client_interface);
     let (server_node, server_task) = node(server_interface);
     let client_running = tokio::spawn(client_task.run());
     let server_running = tokio::spawn(server_task.run());
@@ -344,7 +267,7 @@ async fn learned_routes_expire() {
         }
     }
     forwarding[0].store(false, Ordering::Relaxed);
-    clock.advance(Duration::from_secs(8 * 24 * 60 * 60));
+    tokio::time::advance(Duration::from_secs(8 * 24 * 60 * 60)).await;
     tokio::task::yield_now().await;
     let destination = server_service.destination();
     let pending = tokio::spawn({
@@ -352,7 +275,7 @@ async fn learned_routes_expire() {
         async move { node.send(destination, Bytes::from_static(b"expired")).await }
     });
     tokio::task::yield_now().await;
-    clock.advance(Duration::from_secs(61));
+    tokio::time::advance(Duration::from_secs(61)).await;
     assert_eq!(pending.await.unwrap(), Err(SendError::NoRoute));
     client_node.shutdown().await;
     server_node.shutdown().await;

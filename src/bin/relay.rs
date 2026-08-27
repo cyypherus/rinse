@@ -23,8 +23,7 @@ use ratatui::{
 };
 use rinse::config::{Config, InterfaceConfig, load_or_create_persistent_identity};
 use rinse::{
-    EmbassyClock, InlinePacketWork, InterfaceLimits, NodeBuilder, NodeConfig, RatchetAction,
-    Service, ServiceConfig, ServiceName, SystemEntropy,
+    InterfaceLimits, NodeBuilder, NodeConfig, RatchetAction, Service, ServiceConfig, ServiceName,
 };
 use serde::{Deserialize, Serialize};
 use simplelog::{
@@ -514,12 +513,7 @@ async fn main() {
     );
 
     let stats = RelayStats::new();
-    let mut builder = NodeBuilder::new(
-        NodeConfig::relay(),
-        EmbassyClock,
-        InlinePacketWork,
-        SystemEntropy,
-    );
+    let mut builder = NodeBuilder::new(NodeConfig::relay());
 
     let enabled_interfaces = config.enabled_interfaces();
     if enabled_interfaces.is_empty() {

@@ -84,65 +84,18 @@ pub(crate) enum NodeMode {
 
 pub struct NodeConfig {
     pub(crate) mode: NodeMode,
-    pub(crate) limits: NodeLimits,
 }
 
 impl NodeConfig {
     pub fn endpoint() -> Self {
         Self {
             mode: NodeMode::Endpoint,
-            limits: NodeLimits::desktop(),
         }
     }
 
     pub fn relay() -> Self {
         Self {
             mode: NodeMode::Relay,
-            limits: NodeLimits::desktop(),
-        }
-    }
-
-    pub fn with_limits(mut self, limits: NodeLimits) -> Self {
-        self.limits = limits;
-        self
-    }
-}
-
-pub struct NodeLimits {
-    pub(crate) command_capacity: usize,
-    pub(crate) preparation_in_flight: usize,
-    pub(crate) event_capacity: usize,
-    pub(crate) channel_queue_capacity: usize,
-    pub(crate) maximum_interfaces: usize,
-    pub(crate) maximum_links: usize,
-    pub(crate) maximum_services: usize,
-    pub(crate) duplicate_packet_hashes: usize,
-}
-
-impl NodeLimits {
-    pub fn desktop() -> Self {
-        Self {
-            command_capacity: 256,
-            preparation_in_flight: 64,
-            event_capacity: 128,
-            channel_queue_capacity: 64,
-            maximum_interfaces: 16,
-            maximum_links: 256,
-            maximum_services: 64,
-            duplicate_packet_hashes: 1_000_000,
-        }
-    }
-
-    pub fn embedded() -> Self {
-        Self {
-            command_capacity: 32,
-            preparation_in_flight: 2,
-            event_capacity: 8,
-            channel_queue_capacity: 8,
-            maximum_interfaces: 2,
-            maximum_links: 8,
-            maximum_services: 8,
-            duplicate_packet_hashes: 1_024,
         }
     }
 }

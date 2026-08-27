@@ -12,39 +12,59 @@ use zeroize::Zeroize;
 
 use crate::api::*;
 use crate::channel::QueueChannelError;
-use crate::entropy::{CryptoEntropy, ProtocolRng};
 use crate::interface::{AttachedInterface, OutboundPacket};
 use crate::model::*;
 use crate::timer::{TimerEvent, TimerQueue};
-use crate::work::{InterfaceId, PacketWork, PreparePacket};
-use crate::{Clock, MonoTime, PrivateIdentity};
+use crate::{MonoTime, PrivateIdentity};
 
 const LINK_HANDSHAKE_TIMEOUT: crate::TimeSpan = crate::TimeSpan::from_secs(15);
 const REQUEST_TIMEOUT: crate::TimeSpan = crate::TimeSpan::from_secs(30);
 const SHUTDOWN_GRACE: crate::TimeSpan = crate::TimeSpan::from_secs(5);
 const KEEP_STREAM_OPEN: bool = false;
 const FINISH_STREAM: bool = true;
+const COMMAND_CAPACITY: usize = 256;
+const PREPARED_PACKET_CAPACITY: usize = 64;
+const EVENT_CAPACITY: usize = 128;
+const CHANNEL_QUEUE_CAPACITY: usize = 64;
+const MAXIMUM_INTERFACES: usize = 16;
+const MAXIMUM_LINKS: usize = 256;
+const MAXIMUM_SERVICES: usize = 64;
+const DUPLICATE_PACKET_HASHES: usize = 1_000_000;
 
-pub struct NodeBuilder<C, W, E> {
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct InterfaceId(pub(crate) usize);
+
+struct PreparePacket {
+    interface: InterfaceId,
+    sequence: u64,
+    bytes: Vec<u8>,
+}
+
+struct PreparedPacket {
+    interface: InterfaceId,
+    sequence: u64,
+    packet: Option<crate::node::PreparedInbound>,
+}
+
+impl PreparePacket {
+    fn prepare(self) -> PreparedPacket {
+        PreparedPacket {
+            interface: self.interface,
+            sequence: self.sequence,
+            packet: crate::node::PreparedInbound::parse(self.bytes, self.interface.0),
+        }
+    }
+}
+
+pub struct NodeBuilder {
     config: NodeConfig,
-    clock: C,
-    packet_work: W,
-    entropy: E,
     interfaces: Vec<(AttachedInterface, InterfaceLimits)>,
 }
 
-impl<C, W, E> NodeBuilder<C, W, E>
-where
-    C: Clock,
-    W: PacketWork + 'static,
-    E: CryptoEntropy,
-{
-    pub fn new(config: NodeConfig, clock: C, packet_work: W, entropy: E) -> Self {
+impl NodeBuilder {
+    pub fn new(config: NodeConfig) -> Self {
         Self {
             config,
-            clock,
-            packet_work,
-            entropy,
             interfaces: Vec::new(),
         }
     }
@@ -57,12 +77,12 @@ where
         self
     }
 
-    pub fn build(mut self) -> Result<(NodeHandle, NodeTask<C>), BuildError> {
-        if self.interfaces.len() > self.config.limits.maximum_interfaces {
+    pub fn build(self) -> Result<(NodeHandle, NodeTask), BuildError> {
+        if self.interfaces.len() > MAXIMUM_INTERFACES {
             return Err(BuildError::TooManyInitialInterfaces);
         }
         let mut seed = [0; 32];
-        if self.entropy.fill_seed(&mut seed).is_err() {
+        if rand_core::RngCore::try_fill_bytes(&mut rand::rngs::OsRng, &mut seed).is_err() {
             seed.zeroize();
             return Err(BuildError::EntropyUnavailable);
         }
@@ -70,10 +90,9 @@ where
             seed.zeroize();
             return Err(BuildError::InvalidEntropy);
         }
-        let mut rng = ProtocolRng::from_seed(seed);
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed(seed);
         seed.zeroize();
         let relay = matches!(self.config.mode, NodeMode::Relay);
-        let duplicate_packet_hashes = self.config.limits.duplicate_packet_hashes;
         let mut relay_address = [0; 16];
         rng.fill_bytes(&mut relay_address);
         log::info!(
@@ -85,12 +104,10 @@ where
             .into_iter()
             .map(|(interface, limits)| InterfaceSlot::new(interface, limits))
             .collect();
-        let (command_sender, command_receiver) =
-            async_channel::bounded(self.config.limits.command_capacity);
+        let (command_sender, command_receiver) = async_channel::bounded(COMMAND_CAPACITY);
         let commands_for_new_clients = command_sender.downgrade();
-        let (resource_drop_sender, resource_drop_receiver) = async_channel::bounded(
-            self.config.limits.maximum_services + self.config.limits.maximum_links * 2,
-        );
+        let (resource_drop_sender, resource_drop_receiver) =
+            async_channel::bounded(MAXIMUM_SERVICES + MAXIMUM_LINKS * 2);
         let resource_drops_for_new_clients = resource_drop_sender.downgrade();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let shutdown = async move {
@@ -111,29 +128,21 @@ where
             },
             shutdown,
         };
-        let (work_tx, work_rx) = async_channel::bounded(self.config.limits.preparation_in_flight);
+        let (work_tx, work_rx) = async_channel::bounded(PREPARED_PACKET_CAPACITY);
         let (prepared_tx, prepared_rx) = async_channel::bounded(1);
         let preparing_packets = Arc::new(AtomicUsize::new(0));
         let pipeline_tasks = FuturesUnordered::new();
-        pipeline_tasks.push(
-            prepare_packets(
-                work_rx,
-                prepared_tx,
-                Arc::new(self.packet_work),
-                self.config.limits.preparation_in_flight,
-            )
-            .boxed(),
-        );
+        pipeline_tasks
+            .push(prepare_packets(work_rx, prepared_tx, PREPARED_PACKET_CAPACITY).boxed());
         let task = NodeTask {
-            clock: self.clock,
+            started: tokio::time::Instant::now(),
             owner: NodeOwner {
-                config: self.config,
                 rng,
                 relays_packets: relay,
                 relay_address,
                 path_table: HashMap::new(),
                 pending_announces: Vec::new(),
-                seen_packets: crate::packet_hashlist::PacketHashlist::new(duplicate_packet_hashes),
+                seen_packets: crate::packet_hashlist::PacketHashlist::new(DUPLICATE_PACKET_HASHES),
                 reverse_table: HashMap::new(),
                 receipts: Vec::new(),
                 pending_outbound_links: HashMap::new(),
@@ -171,8 +180,8 @@ where
     }
 }
 
-pub struct NodeTask<C> {
-    clock: C,
+pub struct NodeTask {
+    started: tokio::time::Instant,
     owner: NodeOwner,
 }
 
@@ -192,7 +201,7 @@ pub(crate) struct InterfaceSlot {
     outbound_bytes: usize,
     phase: InterfacePhase,
     next_sequence: u64,
-    prepared_by_sequence: BTreeMap<u64, crate::work::PreparedPacket>,
+    prepared_by_sequence: BTreeMap<u64, PreparedPacket>,
 }
 
 enum InterfacePhase {
@@ -409,8 +418,7 @@ enum PipelineStopped {
 }
 
 pub(crate) struct NodeOwner {
-    config: NodeConfig,
-    pub(crate) rng: ProtocolRng,
+    pub(crate) rng: rand_chacha::ChaCha20Rng,
     pub(crate) relays_packets: bool,
     pub(crate) relay_address: crate::packet::DestinationAddress,
     pub(crate) path_table: HashMap<crate::packet::DestinationAddress, crate::node::PathEntry>,
@@ -440,8 +448,7 @@ pub(crate) struct NodeOwner {
     close_operations: FuturesUnordered<InterfaceOperation>,
     pipeline_tasks: FuturesUnordered<PipelineOperation>,
     prepare_jobs: async_channel::Sender<PreparePacket>,
-    prepared_batches:
-        async_channel::Receiver<Vec<Result<crate::work::PreparedPacket, crate::PacketWorkError>>>,
+    prepared_batches: async_channel::Receiver<Vec<PreparedPacket>>,
     preparing_packets: Arc<AtomicUsize>,
     pub(crate) timers: TimerQueue,
     shutdown_tx: Option<oneshot::Sender<ShutdownReport>>,
@@ -494,12 +501,7 @@ enum RuntimeEvent {
     Sent((InterfaceId, Result<(), crate::InterfaceError>)),
     Closed((InterfaceId, Result<(), crate::InterfaceError>)),
     PipelineStopped(PipelineStopped),
-    Prepared(
-        Result<
-            Vec<Result<crate::work::PreparedPacket, crate::PacketWorkError>>,
-            async_channel::RecvError,
-        >,
-    ),
+    Prepared(Result<Vec<PreparedPacket>, async_channel::RecvError>),
     Timer,
 }
 
@@ -515,7 +517,11 @@ async fn receive_packets(
             Ok(packet) => packet,
             Err(_) => return PipelineStopped::Interface(interface_id),
         };
-        let job = PreparePacket::new(interface_id, sequence, packet.into_bytes());
+        let job = PreparePacket {
+            interface: interface_id,
+            sequence,
+            bytes: packet.into_bytes(),
+        };
         let Some(next) = sequence.checked_add(1) else {
             return PipelineStopped::Interface(interface_id);
         };
@@ -528,25 +534,18 @@ async fn receive_packets(
     }
 }
 
-async fn prepare_packets<W: PacketWork>(
+async fn prepare_packets(
     prepare_job_receiver: async_channel::Receiver<PreparePacket>,
-    prepared_batch_sender: async_channel::Sender<
-        Vec<Result<crate::work::PreparedPacket, crate::PacketWorkError>>,
-    >,
-    packet_work: Arc<W>,
+    prepared_batch_sender: async_channel::Sender<Vec<PreparedPacket>>,
     concurrency: usize,
 ) -> PipelineStopped {
     let results = prepare_job_receiver
-        .map(move |job| {
-            let packet_work = packet_work.clone();
-            async move { packet_work.prepare(job).await }
-        })
+        .map(|job| async move { job.prepare() })
         .buffer_unordered(concurrency)
         .ready_chunks(concurrency);
     futures_util::pin_mut!(results);
     while let Some(results) = results.next().await {
-        let batch_contains_error = results.iter().any(Result::is_err);
-        if prepared_batch_sender.send(results).await.is_err() || batch_contains_error {
+        if prepared_batch_sender.send(results).await.is_err() {
             break;
         }
     }
@@ -569,12 +568,9 @@ async fn receive_if_present<T>(
     }
 }
 
-impl<C> NodeTask<C>
-where
-    C: Clock + Sync,
-{
+impl NodeTask {
     pub async fn run(self) -> Result<ShutdownReport, NodeRunError> {
-        let NodeTask { clock, mut owner } = self;
+        let NodeTask { started, mut owner } = self;
         loop {
             owner.schedule_readers();
             owner.schedule_sends();
@@ -593,7 +589,13 @@ where
                 let prepared = owner.prepared_batches.recv().fuse();
                 let timer = async {
                     match deadline {
-                        Some(deadline) => clock.sleep_until(deadline).await,
+                        Some(deadline) => {
+                            let now = MonoTime::from_micros(started.elapsed().as_micros() as u64);
+                            tokio::time::sleep(
+                                deadline.checked_duration_since(now).unwrap_or_default(),
+                            )
+                            .await
+                        }
                         None => std::future::pending().await,
                     }
                 }
@@ -617,7 +619,7 @@ where
                     _ = timer => RuntimeEvent::Timer,
                 }
             };
-            let now = clock.now();
+            let now = MonoTime::from_micros(started.elapsed().as_micros() as u64);
             match event {
                 RuntimeEvent::Command(Ok(command)) => owner.handle_command(command, now),
                 RuntimeEvent::Command(Err(_)) => {
@@ -640,23 +642,20 @@ where
                     slot.fail();
                 }
                 RuntimeEvent::PipelineStopped(PipelineStopped::Preparation) => {
-                    return Err(NodeRunError::PacketWorkFailed);
+                    return Err(NodeRunError::ProtocolInvariant);
                 }
                 RuntimeEvent::Prepared(Ok(batch)) => {
-                    for result in batch {
+                    for packet in batch {
                         owner
                             .preparing_packets
                             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                                 count.checked_sub(1)
                             })
                             .map_err(|_| NodeRunError::ProtocolInvariant)?;
-                        match result {
-                            Ok(packet) => owner.accept_prepared_packet(packet, now)?,
-                            Err(_) => return Err(NodeRunError::PacketWorkFailed),
-                        }
+                        owner.accept_prepared_packet(packet, now)?;
                     }
                 }
-                RuntimeEvent::Prepared(Err(_)) => return Err(NodeRunError::PacketWorkFailed),
+                RuntimeEvent::Prepared(Err(_)) => return Err(NodeRunError::ProtocolInvariant),
                 RuntimeEvent::Timer => owner.expire_timers(now),
             }
         }
@@ -696,7 +695,7 @@ impl NodeOwner {
 
     fn accept_prepared_packet(
         &mut self,
-        prepared: crate::work::PreparedPacket,
+        prepared: PreparedPacket,
         now: MonoTime,
     ) -> Result<(), NodeRunError> {
         let slot = self
@@ -885,7 +884,7 @@ impl NodeOwner {
     }
 
     fn expire_timers(&mut self, now: MonoTime) {
-        for _ in 0..self.config.limits.command_capacity {
+        for _ in 0..COMMAND_CAPACITY {
             let Some(timer) = self.timers.pop_due(now) else {
                 break;
             };
@@ -925,7 +924,7 @@ impl NodeOwner {
                 limits,
                 reply,
             } => {
-                if self.interfaces.len() >= self.config.limits.maximum_interfaces {
+                if self.interfaces.len() >= MAXIMUM_INTERFACES {
                     let _ = reply.send(Err(NodeError::CapacityReached));
                 } else {
                     self.interfaces.push(InterfaceSlot::new(interface, limits));
@@ -942,13 +941,13 @@ impl NodeOwner {
                     accepted_request_paths: paths,
                     restart_ratchet,
                 } = *config;
-                if self.services.iter().flatten().count() >= self.config.limits.maximum_services {
+                if self.services.iter().flatten().count() >= MAXIMUM_SERVICES {
                     let _ = reply.send(Err(NodeError::CapacityReached));
                     return;
                 }
                 let destination = identity.destination(&name);
                 let path_values: Vec<_> = paths.iter().map(|path| path.as_str()).collect();
-                let events = ReceiveQueue::new(self.config.limits.event_capacity, usize::MAX);
+                let events = ReceiveQueue::new(EVENT_CAPACITY, usize::MAX);
                 let id = self.add_service(
                     name.as_str(),
                     &path_values,
@@ -1041,10 +1040,10 @@ impl NodeOwner {
                 }
             }
             Command::AcceptLink { offer, reply } => {
-                if self.established_links.len() >= self.config.limits.maximum_links {
+                if self.established_links.len() >= MAXIMUM_LINKS {
                     let _ = reply.send(Err(LinkError::CapacityReached));
                 } else if self.accept_incoming_link(offer.0, now) {
-                    let events = LinkEvents::new(self.config.limits.event_capacity);
+                    let events = LinkEvents::new(EVENT_CAPACITY);
                     self.established_links
                         .get_mut(&offer.0)
                         .expect("accepted link disappeared")
@@ -1198,7 +1197,7 @@ impl NodeOwner {
             },
             Command::OpenChannel { link, reply } => match self.open_channel(link.0) {
                 Ok(()) => {
-                    let capacity = self.config.limits.channel_queue_capacity;
+                    let capacity = CHANNEL_QUEUE_CAPACITY;
                     let events =
                         ReceiveQueue::new(capacity, capacity * crate::buffer::MAX_INPUT_BYTES);
                     self.established_links
@@ -1306,14 +1305,14 @@ impl NodeOwner {
     }
 
     fn has_route_wait_capacity(&self) -> bool {
-        self.route_waits.values().map(Vec::len).sum::<usize>() < self.config.limits.command_capacity
+        self.route_waits.values().map(Vec::len).sum::<usize>() < COMMAND_CAPACITY
     }
 
     pub(crate) fn at_link_capacity(&self) -> bool {
         self.pending_outbound_links.len()
             + self.pending_inbound_links.len()
             + self.established_links.len()
-            >= self.config.limits.maximum_links
+            >= MAXIMUM_LINKS
     }
 
     fn send_destination(
@@ -1347,7 +1346,7 @@ impl NodeOwner {
         } else if self.interfaces.iter().all(|slot| !slot.accepts_outbound()) {
             let _ = reply.send(Err(LinkError::InterfaceFailed));
         } else {
-            let events = LinkEvents::new(self.config.limits.event_capacity);
+            let events = LinkEvents::new(EVENT_CAPACITY);
             self.begin_outbound_link(
                 destination,
                 now,
@@ -1573,7 +1572,7 @@ impl NodeOwner {
         else {
             return;
         };
-        if events.inbound_requests.len() >= self.config.limits.event_capacity
+        if events.inbound_requests.len() >= EVENT_CAPACITY
             || events.inbound_requests.contains_key(&request.0)
         {
             self.close_link(link, LinkCloseReason::CapacityReached);
@@ -1660,7 +1659,7 @@ impl NodeOwner {
             Self::reply_to_failed_waiter(operation, ChannelError::ChannelClosed);
             return;
         };
-        if channel.blocked_channel_ops.len() < self.config.limits.channel_queue_capacity {
+        if channel.blocked_channel_ops.len() < CHANNEL_QUEUE_CAPACITY {
             channel.blocked_channel_ops.push_back(operation);
             return;
         }

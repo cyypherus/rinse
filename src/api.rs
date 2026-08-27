@@ -639,7 +639,6 @@ pub enum BuildError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NodeRunError {
-    PacketWorkFailed,
     ProtocolInvariant,
 }
 

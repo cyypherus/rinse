@@ -1,4 +1,4 @@
-#![cfg(all(feature = "tcp", feature = "std-clock"))]
+#![cfg(feature = "tcp")]
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
@@ -6,9 +6,8 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use rinse::{
-    BufferChunk, ChannelMessage, ChannelReceive, Destination, EmbassyClock, InlinePacketWork,
-    InterfaceLimits, MessageType, NodeBuilder, NodeConfig, ServiceConfig, ServiceName, StreamId,
-    SystemEntropy, TcpHdlcInterface as TcpHdlc,
+    BufferChunk, ChannelMessage, ChannelReceive, Destination, InterfaceLimits, MessageType,
+    NodeBuilder, NodeConfig, ServiceConfig, ServiceName, StreamId, TcpHdlcInterface as TcpHdlc,
 };
 
 const PYTHON_NODE: &str = r#"
@@ -142,13 +141,7 @@ async fn python_and_rust_exchange_channels_and_buffers() {
     let interface = TcpHdlc::connect(&format!("127.0.0.1:{port}"))
         .await
         .unwrap();
-    let builder = NodeBuilder::new(
-        NodeConfig::endpoint(),
-        EmbassyClock,
-        InlinePacketWork,
-        SystemEntropy,
-    )
-    .interface(
+    let builder = NodeBuilder::new(NodeConfig::endpoint()).interface(
         interface,
         InterfaceLimits::new(2048, 256, 1_048_576).unwrap(),
     );
