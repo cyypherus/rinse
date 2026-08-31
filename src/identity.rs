@@ -10,12 +10,6 @@ pub struct PrivateIdentity {
     pub(crate) signing_key: SigningKey,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum IdentityError {
-    InvalidSigningSecret,
-    InvalidAgreementSecret,
-}
-
 impl PrivateIdentity {
     pub(crate) fn generate<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
         let mut enc_bytes = [0u8; 32];
@@ -32,20 +26,20 @@ impl PrivateIdentity {
         }
     }
 
-    pub fn from_secret_bytes(bytes: [u8; 64]) -> Result<Self, IdentityError> {
+    pub fn from_secret_bytes(bytes: [u8; 64]) -> Option<Self> {
         let enc_bytes: [u8; 32] = bytes[..32].try_into().unwrap();
         let sig_bytes: [u8; 32] = bytes[32..].try_into().unwrap();
         if enc_bytes == [0; 32] {
-            return Err(IdentityError::InvalidAgreementSecret);
+            return None;
         }
         if sig_bytes == [0; 32] {
-            return Err(IdentityError::InvalidSigningSecret);
+            return None;
         }
 
         let encryption_secret = StaticSecret::from(enc_bytes);
         let signing_key = SigningKey::from_bytes(&sig_bytes);
 
-        Ok(Self {
+        Some(Self {
             encryption_secret,
             signing_key,
         })

@@ -57,7 +57,7 @@ impl Interface for TcpHdlc {
         self.stats.packets_received.fetch_add(1, Ordering::Relaxed);
         self.stats
             .bytes_received
-            .fetch_add(packet.len() as u64, Ordering::Relaxed);
+            .fetch_add(packet.byte_len() as u64, Ordering::Relaxed);
         Ok(packet)
     }
 
@@ -65,7 +65,7 @@ impl Interface for TcpHdlc {
         self.stats.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.stats
             .bytes_sent
-            .fetch_add(packet.len() as u64, Ordering::Relaxed);
+            .fetch_add(packet.byte_len() as u64, Ordering::Relaxed);
         self.inner.send(packet).await
     }
 

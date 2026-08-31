@@ -177,15 +177,9 @@ mod tests {
 
     #[test]
     fn rejects_reserved_and_oversized_user_messages() {
-        assert_eq!(
-            crate::MessageType::new(0xf000),
-            Err(crate::ReservedMessageType)
-        );
+        assert_eq!(crate::MessageType::new(0xf000), None);
         let message_type = crate::MessageType::new(1).unwrap();
-        assert!(matches!(
-            ChannelMessage::new(message_type, vec![0; CHANNEL_MDU + 1].into()),
-            Err(crate::ChannelMessageTooLarge)
-        ));
+        assert!(ChannelMessage::new(message_type, vec![0; CHANNEL_MDU + 1].into()).is_none());
     }
 
     #[test]

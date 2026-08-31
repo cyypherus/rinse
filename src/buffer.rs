@@ -68,7 +68,7 @@ pub(crate) fn decode(raw: &[u8]) -> Option<(StreamId, BufferChunk)> {
     } else {
         raw[2..].to_vec()
     };
-    let stream = StreamId::new(header & StreamId::MAX).ok()?;
+    let stream = StreamId::new(header & StreamId::MAX)?;
     let chunk = if header & 0x8000 == 0 {
         BufferChunk::Data(data.into())
     } else {
@@ -115,10 +115,7 @@ mod tests {
     #[test]
     fn rejects_invalid_streams_and_messages() {
         assert_eq!(StreamId::new(StreamId::MAX).unwrap().get(), StreamId::MAX);
-        assert_eq!(
-            StreamId::new(StreamId::MAX + 1),
-            Err(crate::StreamIdOutOfRange)
-        );
+        assert_eq!(StreamId::new(StreamId::MAX + 1), None);
         assert_eq!(decode(&[0]), None);
         assert_eq!(decode(&[0x40, 0, 1, 2, 3]), None);
     }

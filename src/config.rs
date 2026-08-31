@@ -2,50 +2,47 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::{Destination, RatchetSecret, identity::PrivateIdentity};
 
 #[derive(Debug)]
-pub enum ConfigError {
+pub struct ConfigError(ConfigErrorKind);
+
+#[derive(Debug)]
+enum ConfigErrorKind {
     Io(std::io::Error),
     InvalidToml(toml::de::Error),
-    TomlSerialization(toml::ser::Error),
     InvalidIdentity,
     InvalidRatchetSecrets,
 }
 
+impl ConfigError {
+    fn io(error: std::io::Error) -> Self {
+        Self(ConfigErrorKind::Io(error))
+    }
+
+    fn invalid_identity() -> Self {
+        Self(ConfigErrorKind::InvalidIdentity)
+    }
+
+    fn invalid_ratchet_secrets() -> Self {
+        Self(ConfigErrorKind::InvalidRatchetSecrets)
+    }
+}
+
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConfigError::Io(e) => write!(f, "io error: {}", e),
-            ConfigError::InvalidToml(e) => write!(f, "invalid toml: {}", e),
-            ConfigError::TomlSerialization(e) => write!(f, "toml serialization error: {}", e),
-            ConfigError::InvalidIdentity => write!(f, "invalid identity data"),
-            ConfigError::InvalidRatchetSecrets => write!(f, "invalid ratchet secret data"),
+        match &self.0 {
+            ConfigErrorKind::Io(error) => write!(f, "io error: {error}"),
+            ConfigErrorKind::InvalidToml(error) => write!(f, "invalid toml: {error}"),
+            ConfigErrorKind::InvalidIdentity => write!(f, "invalid identity data"),
+            ConfigErrorKind::InvalidRatchetSecrets => write!(f, "invalid ratchet secret data"),
         }
     }
 }
 
 impl std::error::Error for ConfigError {}
-
-impl From<std::io::Error> for ConfigError {
-    fn from(e: std::io::Error) -> Self {
-        ConfigError::Io(e)
-    }
-}
-
-impl From<toml::de::Error> for ConfigError {
-    fn from(e: toml::de::Error) -> Self {
-        ConfigError::InvalidToml(e)
-    }
-}
-
-impl From<toml::ser::Error> for ConfigError {
-    fn from(e: toml::ser::Error) -> Self {
-        ConfigError::TomlSerialization(e)
-    }
-}
 
 const DEFAULT_CONFIG: &str = r#"#
 
@@ -84,7 +81,7 @@ name = "Anonymous Peer"
 #   target_port = 4242
 "#;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub name: Option<String>,
@@ -94,13 +91,13 @@ pub struct Config {
     pub interfaces: HashMap<String, InterfaceConfig>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct NetworkConfig {
     #[serde(default)]
     pub relay: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum InterfaceConfig {
     TCPClientInterface {
@@ -129,11 +126,12 @@ impl Config {
         let path = path.as_ref();
 
         if path.exists() {
-            let contents = fs::read_to_string(path)?;
-            Ok(toml::from_str(&contents)?)
+            let contents = fs::read_to_string(path).map_err(ConfigError::io)?;
+            toml::from_str(&contents)
+                .map_err(|error| ConfigError(ConfigErrorKind::InvalidToml(error)))
         } else {
-            create_parent_directory(path)?;
-            fs::write(path, DEFAULT_CONFIG)?;
+            create_parent_directory(path).map_err(ConfigError::io)?;
+            fs::write(path, DEFAULT_CONFIG).map_err(ConfigError::io)?;
             Ok(Config::default())
         }
     }
@@ -145,14 +143,6 @@ impl Config {
             .map(|(name, iface)| (name.as_str(), iface))
             .collect()
     }
-
-    pub fn save_to(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
-        let path = path.as_ref();
-        create_parent_directory(path)?;
-        let contents = toml::to_string_pretty(self)?;
-        fs::write(path, contents)?;
-        Ok(())
-    }
 }
 
 pub fn load_or_create_persistent_identity(
@@ -161,12 +151,14 @@ pub fn load_or_create_persistent_identity(
     let path = path.as_ref();
 
     if path.exists() {
-        let hex_str = fs::read_to_string(path)?;
-        let bytes = hex::decode(hex_str.trim()).map_err(|_| ConfigError::InvalidIdentity)?;
+        let hex_str = fs::read_to_string(path).map_err(ConfigError::io)?;
+        let bytes = hex::decode(hex_str.trim()).map_err(|_| ConfigError::invalid_identity())?;
         PrivateIdentity::from_secret_bytes(
-            bytes.try_into().map_err(|_| ConfigError::InvalidIdentity)?,
+            bytes
+                .try_into()
+                .map_err(|_| ConfigError::invalid_identity())?,
         )
-        .map_err(|_| ConfigError::InvalidIdentity)
+        .ok_or_else(ConfigError::invalid_identity)
     } else {
         let identity = PrivateIdentity::generate(&mut rand::thread_rng());
         save_private_identity(path, &identity)?;
@@ -179,9 +171,9 @@ pub fn save_private_identity(
     identity: &PrivateIdentity,
 ) -> Result<(), ConfigError> {
     let path = path.as_ref();
-    create_parent_directory(path)?;
+    create_parent_directory(path).map_err(ConfigError::io)?;
     let hex_str = hex::encode(identity.to_secret_bytes());
-    fs::write(path, hex_str)?;
+    fs::write(path, hex_str).map_err(ConfigError::io)?;
     Ok(())
 }
 
@@ -194,20 +186,20 @@ pub fn load_ratchet_keys_for_restart(
         .join(hex::encode(service.as_bytes()));
 
     if path.exists() {
-        let contents = fs::read_to_string(&path)?;
+        let contents = fs::read_to_string(&path).map_err(ConfigError::io)?;
         let mut ratchets = Vec::new();
         for line in contents.lines() {
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
-            let bytes = hex::decode(line).map_err(|_| ConfigError::InvalidRatchetSecrets)?;
+            let bytes = hex::decode(line).map_err(|_| ConfigError::invalid_ratchet_secrets())?;
             if bytes.len() != 32 {
-                return Err(ConfigError::InvalidRatchetSecrets);
+                return Err(ConfigError::invalid_ratchet_secrets());
             }
             ratchets.push(
                 RatchetSecret::from_bytes(bytes.try_into().unwrap())
-                    .map_err(|_| ConfigError::InvalidRatchetSecrets)?,
+                    .ok_or_else(ConfigError::invalid_ratchet_secrets)?,
             );
         }
         Ok(ratchets)
@@ -225,14 +217,14 @@ pub fn save_ratchet_keys_for_restart(
         .as_ref()
         .join(hex::encode(service.as_bytes()));
 
-    create_parent_directory(&path)?;
+    create_parent_directory(&path).map_err(ConfigError::io)?;
     let contents: String = ratchet_keys
         .iter()
         .map(RatchetSecret::to_bytes)
         .map(hex::encode)
         .collect::<Vec<_>>()
         .join("\n");
-    fs::write(path, contents)?;
+    fs::write(path, contents).map_err(ConfigError::io)?;
     Ok(())
 }
 
@@ -267,13 +259,10 @@ mod tests {
     fn config_path_is_selected_by_caller() {
         let directory = test_directory();
         let path = directory.join("node.toml");
-        let mut config = Config::load_from(&path).unwrap();
-        config.name = Some("named node".into());
-        config.save_to(&path).unwrap();
-
+        assert!(Config::load_from(&path).unwrap().name.is_none());
         assert_eq!(
             Config::load_from(&path).unwrap().name.as_deref(),
-            Some("named node")
+            Some("Anonymous Peer")
         );
         std::fs::remove_dir_all(directory).unwrap();
     }

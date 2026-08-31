@@ -18,8 +18,7 @@ macro_rules! packet_bytes {
         impl $name {
             $new fn new(bytes: Vec<u8>) -> Self { Self { bytes } }
             pub fn into_bytes(self) -> Vec<u8> { self.bytes }
-            pub fn len(&self) -> usize { self.bytes.len() }
-            pub fn is_empty(&self) -> bool { self.bytes.is_empty() }
+            pub fn byte_len(&self) -> usize { self.bytes.len() }
         }
     };
 }
@@ -64,30 +63,19 @@ pub struct InterfaceAccessCode {
     transmitted_bytes: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InterfaceAccessCodeError {
-    EmptyPacketMaskingKey,
-    InvalidTransmittedAuthenticationBytes { bytes: usize, max: usize },
-}
-
 impl InterfaceAccessCode {
     pub fn new(
         interface_signing_secret: [u8; 32],
         packet_masking_key: Vec<u8>,
         transmitted_authentication_bytes: usize,
-    ) -> Result<Self, InterfaceAccessCodeError> {
+    ) -> Option<Self> {
         if packet_masking_key.is_empty() {
-            return Err(InterfaceAccessCodeError::EmptyPacketMaskingKey);
+            return None;
         }
         if !(1..=64).contains(&transmitted_authentication_bytes) {
-            return Err(
-                InterfaceAccessCodeError::InvalidTransmittedAuthenticationBytes {
-                    bytes: transmitted_authentication_bytes,
-                    max: 64,
-                },
-            );
+            return None;
         }
-        Ok(Self {
+        Some(Self {
             signing_key: SigningKey::from_bytes(&interface_signing_secret),
             shared_key: packet_masking_key,
             transmitted_bytes: transmitted_authentication_bytes,

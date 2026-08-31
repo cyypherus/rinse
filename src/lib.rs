@@ -27,16 +27,14 @@ pub mod config;
 
 pub use api::*;
 pub use aspect::ServiceHash;
-pub use identity::{IdentityError, PrivateIdentity};
+pub use identity::PrivateIdentity;
 pub use interface::{
-    AccessControlledInterface, InboundPacket, Interface, InterfaceAccessCode,
-    InterfaceAccessCodeError, InterfaceError, OutboundPacket,
+    AccessControlledInterface, InboundPacket, Interface, InterfaceAccessCode, InterfaceError,
+    OutboundPacket,
 };
 pub use model::{
-    ChannelMessage, ChannelMessageTooLarge, Destination, EmptyRequestPath, EmptyServiceName,
-    IdentityHash, InterfaceLimits, InterfaceLimitsError, InvalidRatchetSecret, MessageType,
-    NodeConfig, RatchetAction, RatchetSecret, RequestPath, ReservedMessageType, ServiceConfig,
-    ServiceName, StreamId, StreamIdOutOfRange, TooManyRequestPaths,
+    ChannelMessage, Destination, IdentityHash, InterfaceLimits, MessageType, NodeConfig,
+    RatchetAction, RatchetSecret, RequestPath, ServiceConfig, ServiceName, StreamId,
 };
 pub(crate) use request::RequestId;
 pub(crate) use request::WireRequestId;

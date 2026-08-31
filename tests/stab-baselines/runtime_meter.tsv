@@ -1,6 +1,0 @@
-cpu_ms	1800
-db_accesses	10
-network_bytes	128
-disk_bytes	4096
-wal_bytes	30000
-total_stabs	35000

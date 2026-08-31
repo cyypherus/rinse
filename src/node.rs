@@ -6,13 +6,13 @@ use rand::{Rng, RngCore};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
+use crate::ServiceEvent;
 use crate::announce::{AnnounceBuilder, AnnounceData};
 use crate::api::ServiceId;
 use crate::channel::{ChannelMessage, QueueChannelError};
 use crate::crypto::{EphemeralKeyPair, sha256};
 use crate::runtime::{NodeOwner, ReceiveQueue};
-use crate::{LinkError, MonoTime, SendError, TimeSpan};
-use crate::{ServiceEvent, ServiceReceiveError};
+use crate::{MonoTime, NodeError, TimeSpan};
 
 pub(crate) const LINK_MDU: usize = 431;
 use crate::link::{EstablishedLink, LinkId, LinkProof, LinkRequest, LinkResponder, PendingLink};
@@ -95,7 +95,7 @@ pub(crate) struct ServiceState {
     signing_key: SigningKey,
     registered_paths: HashMap<PathHash, String>,
     pub(crate) ratchets: Vec<StaticSecret>,
-    pub(crate) events: ReceiveQueue<ServiceEvent, ServiceReceiveError>,
+    pub(crate) events: ReceiveQueue<ServiceEvent, NodeError>,
 }
 
 impl ServiceState {
@@ -341,7 +341,7 @@ impl NodeOwner {
         let Some(mut removed) = entry.take() else {
             return Vec::new();
         };
-        removed.events.close(ServiceReceiveError::ServiceClosed);
+        removed.events.close(NodeError::ResourceClosed);
         self.pending_inbound_links
             .retain(|_, pending| pending.service != service);
         self.established_links
@@ -357,10 +357,10 @@ impl NodeOwner {
         data: &[u8],
         now: MonoTime,
         timeout: TimeSpan,
-    ) -> Result<PreparedRequest, LinkError> {
+    ) -> Result<PreparedRequest, NodeError> {
         if !self.established_links.contains_key(&link_id) {
             log::warn!("Request on non-existent link {}", hex::encode(link_id));
-            return Err(LinkError::LinkClosed);
+            return Err(NodeError::ResourceClosed);
         }
 
         let mut id_bytes = [0u8; 16];
@@ -378,7 +378,7 @@ impl NodeOwner {
         let link = self
             .established_links
             .get(&link_id)
-            .ok_or(LinkError::LinkClosed)?;
+            .ok_or(NodeError::ResourceClosed)?;
         let req = Request::new(path, data.to_vec());
         let encoded = req.encode();
         log::debug!(
@@ -439,13 +439,13 @@ impl NodeOwner {
         link_id: LinkId,
         wire_request_id: WireRequestId,
         data: &[u8],
-    ) -> Result<PreparedResponse, LinkError> {
+    ) -> Result<PreparedResponse, NodeError> {
         use crate::packet::RoutedDestination;
 
         let link = self
             .established_links
             .get(&link_id)
-            .ok_or(LinkError::LinkClosed)?;
+            .ok_or(NodeError::ResourceClosed)?;
         let target_interface = link.receiving_interface;
         if data.len() <= LINK_MDU {
             let resp = Response::new(wire_request_id, data.to_vec());
@@ -476,7 +476,7 @@ impl NodeOwner {
             .unwrap_or_else(|_| data.to_vec());
 
             if packed_response.len() > MAX_EFFICIENT_SIZE {
-                return Err(LinkError::PayloadTooLarge);
+                return Err(NodeError::InvalidInput);
             }
 
             let mut resource = crate::resource::OutboundResource::new_segment(
@@ -528,7 +528,7 @@ impl NodeOwner {
         paths: &[&str],
         identity: &crate::identity::PrivateIdentity,
         restart_ratchet: Option<crate::RatchetSecret>,
-        events: ReceiveQueue<ServiceEvent, ServiceReceiveError>,
+        events: ReceiveQueue<ServiceEvent, NodeError>,
     ) -> ServiceId {
         let name_hash: [u8; 10] = sha256(name.as_bytes())[..10].try_into().unwrap();
 
@@ -613,7 +613,7 @@ impl NodeOwner {
                     }
                 }
                 let next = StaticSecret::from(bytes);
-                let restart_ratchet = crate::RatchetSecret::from_bytes(bytes).ok()?;
+                let restart_ratchet = crate::RatchetSecret::from_bytes(bytes)?;
                 let ratchet_public = *X25519Public::from(&next).as_bytes();
                 let mut prospective =
                     Vec::with_capacity(RETAINED_RATCHETS.min(entry.ratchets.len() + 1));
@@ -734,9 +734,9 @@ impl NodeOwner {
         &mut self,
         destination: DestinationAddress,
         data: &[u8],
-    ) -> Result<ProtocolOutbound, SendError> {
+    ) -> Result<ProtocolOutbound, NodeError> {
         if !self.path_table.contains_key(&destination) {
-            return Err(SendError::NoRoute);
+            return Err(NodeError::NoRoute);
         }
         use crate::crypto::SingleDestEncryption;
         let entry = &self.path_table[&destination];
@@ -765,15 +765,15 @@ impl NodeOwner {
         &mut self,
         link: LinkId,
         data: &[u8],
-    ) -> Result<ProtocolOutbound, LinkError> {
+    ) -> Result<ProtocolOutbound, NodeError> {
         let established = self
             .established_links
             .get(&link)
-            .ok_or(LinkError::LinkClosed)?;
+            .ok_or(NodeError::ResourceClosed)?;
         let receiving_interface = established.receiving_interface;
         let packet = self
             .make_encrypted_link_packet(link, LinkContext::None, data)
-            .map_err(|_| LinkError::LinkClosed)?;
+            .map_err(|_| NodeError::ResourceClosed)?;
         Ok(ProtocolOutbound {
             interface: receiving_interface,
             packet,
@@ -866,13 +866,13 @@ impl NodeOwner {
         &mut self,
         link_id: LinkId,
         service: ServiceId,
-    ) -> Result<PreparedIdentify, crate::IdentifyError> {
+    ) -> Result<PreparedIdentify, NodeError> {
         let link = self
             .established_links
             .get(&link_id)
-            .ok_or(crate::IdentifyError::LinkClosed)?;
+            .ok_or(NodeError::ResourceClosed)?;
         if !link.is_initiator() {
-            return Err(crate::IdentifyError::LinkClosed);
+            return Err(NodeError::ResourceClosed);
         }
         let interface = link.receiving_interface;
         let local_identity = link.local_identity;
@@ -880,7 +880,7 @@ impl NodeOwner {
             .services
             .get(service.0)
             .and_then(Option::as_ref)
-            .ok_or(crate::IdentifyError::ServiceClosed)?;
+            .ok_or(NodeError::ResourceClosed)?;
         let encryption_public = *X25519Public::from(&service.encryption_secret).as_bytes();
         let mut public_keys = [0; 64];
         public_keys[..32].copy_from_slice(&encryption_public);
@@ -891,13 +891,13 @@ impl NodeOwner {
         if let crate::link::LocalIdentityState::Bound(bound) = local_identity
             && bound != identity
         {
-            return Err(crate::IdentifyError::BoundToDifferentIdentity);
+            return Err(NodeError::Conflict);
         }
         let identify =
             crate::link::LinkIdentify::create(&link_id, encryption_public, &service.signing_key);
         let packet = self
             .make_encrypted_link_packet(link_id, LinkContext::LinkIdentify, &identify.to_bytes())
-            .map_err(|_| crate::IdentifyError::LinkClosed)?;
+            .map_err(|_| NodeError::ResourceClosed)?;
         Ok(PreparedIdentify {
             outbound: ProtocolOutbound {
                 interface,
@@ -1674,7 +1674,8 @@ impl NodeOwner {
                                 self.destination_links.remove(&dest);
                                 self.established_links.remove(&link_id);
                                 for request_id in requests {
-                                    request_results.push((request_id, Err(LinkError::LinkClosed)));
+                                    request_results
+                                        .push((request_id, Err(NodeError::ResourceClosed)));
                                 }
                             } else {
                                 log::warn!(
@@ -1798,9 +1799,9 @@ impl NodeOwner {
                                             crate::ChannelReceive::Buffer { stream, chunk },
                                         ));
                                     }
-                                } else if let Ok(message_type) =
+                                } else if let Some(message_type) =
                                     crate::MessageType::new(message_type)
-                                    && let Ok(message) =
+                                    && let Some(message) =
                                         crate::ChannelMessage::new(message_type, data.into())
                                 {
                                     channel_deliveries
@@ -2305,7 +2306,7 @@ impl NodeOwner {
                     for packet in failed_packets {
                         self.handle_channel_delivery(link, packet, false, now);
                     }
-                    self.close_link_channel(link, crate::ChannelReceiveError::ChannelClosed);
+                    self.close_link_channel(link, NodeError::ResourceClosed);
                 } else {
                     if let Some(interface) = self
                         .established_links
@@ -2324,7 +2325,7 @@ impl NodeOwner {
                     take_timed_out_link(&mut self.pending_outbound_links, link)
                     && let Some(open) = pending.open.take()
                 {
-                    self.complete_link_open(link, open, Err(crate::LinkError::TimedOut));
+                    self.complete_link_open(link, open, Err(NodeError::TimedOut));
                 }
             }
             ProtocolTimer::PathRequestTimeout(destination) => {
@@ -2350,7 +2351,7 @@ impl NodeOwner {
                     removed |= link.pending_requests.len() != before;
                 }
                 if removed {
-                    self.complete_request(request, Err(LinkError::TimedOut));
+                    self.complete_request(request, Err(NodeError::TimedOut));
                 }
             }
             ProtocolTimer::LinkMaintenance(link_id) => {
@@ -2390,7 +2391,7 @@ impl NodeOwner {
                         .flat_map(|link| link.pending_requests.into_values())
                         .collect::<Vec<_>>();
                     for request_id in requests {
-                        self.complete_request(request_id, Err(LinkError::LinkClosed));
+                        self.complete_request(request_id, Err(NodeError::ResourceClosed));
                     }
                 } else {
                     if keepalive {

@@ -70,10 +70,9 @@ async fn sample() -> f64 {
     while received.load(Ordering::Acquire) != packets {
         tokio::task::yield_now().await;
     }
-    let report = node.shutdown().await;
+    node.shutdown().await;
     runtime.await.unwrap().unwrap();
     let elapsed = started.elapsed();
-    assert_eq!(report.reason, rinse::ShutdownReason::Requested);
     packets as f64 / elapsed.as_secs_f64()
 }
 

@@ -35,90 +35,90 @@ pub(crate) enum Command {
     },
     ReceiveService {
         service: ServiceId,
-        reply: Reply<Result<ServiceEvent, ServiceReceiveError>>,
+        reply: Reply<Result<ServiceEvent, NodeError>>,
     },
     Announce {
         service: ServiceId,
         application_data: Bytes,
         ratchet: RatchetAction,
-        reply: Reply<Result<Option<RatchetSecret>, AnnounceError>>,
+        reply: Reply<Result<Option<RatchetSecret>, NodeError>>,
     },
     SendDestination {
         destination: Destination,
         body: Bytes,
-        reply: Reply<Result<(), SendError>>,
+        reply: Reply<Result<(), NodeError>>,
     },
     OpenLink {
         destination: Destination,
-        reply: Reply<Result<Link, LinkError>>,
+        reply: Reply<Result<Link, NodeError>>,
     },
     AcceptLink {
         offer: LinkOfferId,
-        reply: Reply<Result<Link, LinkError>>,
+        reply: Reply<Result<Link, NodeError>>,
     },
     RejectLink {
         offer: LinkOfferId,
-        reply: Reply<Result<(), LinkError>>,
+        reply: Reply<Result<(), NodeError>>,
     },
     CloseLink {
         link: LinkId,
-        reply: Reply<Result<(), LinkError>>,
+        reply: Reply<Result<(), NodeError>>,
     },
     ReceiveLink {
         link: LinkId,
-        reply: Reply<Result<LinkEvent, LinkReceiveError>>,
+        reply: Reply<Result<LinkEvent, NodeError>>,
     },
     SendLinkDatagram {
         link: LinkId,
         body: Bytes,
-        reply: Reply<Result<(), LinkError>>,
+        reply: Reply<Result<(), NodeError>>,
     },
     Request {
         link: LinkId,
         path: RequestPath,
         body: Bytes,
-        reply: Reply<Result<Bytes, LinkError>>,
+        reply: Reply<Result<Bytes, NodeError>>,
     },
     Respond {
         link: LinkId,
         request: IncomingRequestId,
         response: Bytes,
-        reply: Reply<Result<(), LinkError>>,
+        reply: Reply<Result<(), NodeError>>,
     },
     Identify {
         link: LinkId,
         service: ServiceId,
-        reply: Reply<Result<(), IdentifyError>>,
+        reply: Reply<Result<(), NodeError>>,
     },
     OpenChannel {
         link: LinkId,
-        reply: Reply<Result<Channel, ChannelError>>,
+        reply: Reply<Result<Channel, NodeError>>,
     },
     ReceiveChannel {
         link: LinkId,
-        reply: Reply<Result<ChannelReceive, ChannelReceiveError>>,
+        reply: Reply<Result<ChannelReceive, NodeError>>,
     },
     SendChannel {
         link: LinkId,
         message: ChannelMessage,
-        reply: Reply<Result<(), ChannelError>>,
+        reply: Reply<Result<(), NodeError>>,
     },
     OpenBuffer {
         link: LinkId,
         stream: StreamId,
-        reply: Reply<Result<(), BufferError>>,
+        reply: Reply<Result<(), NodeError>>,
     },
     WriteBuffer {
         link: LinkId,
         stream: StreamId,
         input: Bytes,
-        reply: Reply<Result<BufferQueued, BufferError>>,
+        reply: Reply<Result<BufferQueued, NodeError>>,
     },
     FinishBuffer {
         link: LinkId,
         stream: StreamId,
         input: Bytes,
-        reply: Reply<Result<BufferQueued, BufferError>>,
+        reply: Reply<Result<BufferQueued, NodeError>>,
     },
     Shutdown,
 }
@@ -168,7 +168,7 @@ async fn ask<T>(client: &NodeClient, command: impl FnOnce(Reply<T>) -> Command) 
 }
 
 pub(crate) type ShutdownFuture =
-    futures_util::future::Shared<futures_util::future::BoxFuture<'static, ShutdownReport>>;
+    futures_util::future::Shared<futures_util::future::BoxFuture<'static, ()>>;
 
 #[derive(Clone)]
 pub struct NodeHandle {
@@ -211,9 +211,9 @@ impl NodeHandle {
         .unwrap_or(Err(NodeError::NodeStopping))
     }
 
-    pub async fn send(&self, destination: Destination, body: Bytes) -> Result<(), SendError> {
+    pub async fn send(&self, destination: Destination, body: Bytes) -> Result<(), NodeError> {
         if body.len() > Self::MAX_DATAGRAM_BYTES {
-            return Err(SendError::PayloadTooLarge);
+            return Err(NodeError::InvalidInput);
         }
         ask(&self.client, |reply| Command::SendDestination {
             destination,
@@ -221,19 +221,19 @@ impl NodeHandle {
             reply,
         })
         .await
-        .unwrap_or(Err(SendError::NodeStopping))
+        .unwrap_or(Err(NodeError::NodeStopping))
     }
 
-    pub async fn open_link(&self, destination: Destination) -> Result<Link, LinkError> {
+    pub async fn open_link(&self, destination: Destination) -> Result<Link, NodeError> {
         ask(&self.client, |reply| Command::OpenLink {
             destination,
             reply,
         })
         .await
-        .unwrap_or(Err(LinkError::NodeStopping))
+        .unwrap_or(Err(NodeError::NodeStopping))
     }
 
-    pub async fn shutdown(&self) -> ShutdownReport {
+    pub async fn shutdown(&self) {
         let _ = self.client.commands.send(Command::Shutdown).await;
         self.shutdown.clone().await
     }
@@ -257,9 +257,9 @@ impl Service {
         &self,
         application_data: Bytes,
         ratchet: RatchetAction,
-    ) -> Result<Option<RatchetSecret>, AnnounceError> {
+    ) -> Result<Option<RatchetSecret>, NodeError> {
         if application_data.len() > Self::MAX_ANNOUNCEMENT_BYTES {
-            return Err(AnnounceError::ApplicationDataTooLarge);
+            return Err(NodeError::InvalidInput);
         }
         ask(&self.registration.client, |reply| Command::Announce {
             service: self.id,
@@ -268,16 +268,16 @@ impl Service {
             reply,
         })
         .await
-        .unwrap_or(Err(AnnounceError::NodeStopping))
+        .unwrap_or(Err(NodeError::NodeStopping))
     }
 
-    pub async fn receive(&mut self) -> Result<ServiceEvent, ServiceReceiveError> {
+    pub async fn receive(&mut self) -> Result<ServiceEvent, NodeError> {
         ask(&self.registration.client, |reply| Command::ReceiveService {
             service: self.id,
             reply,
         })
         .await
-        .unwrap_or(Err(ServiceReceiveError::NodeStopped))
+        .unwrap_or(Err(NodeError::NodeStopping))
     }
 }
 
@@ -312,22 +312,22 @@ pub struct IncomingLink {
 }
 
 impl IncomingLink {
-    pub async fn accept(self) -> Result<Link, LinkError> {
+    pub async fn accept(self) -> Result<Link, NodeError> {
         ask(&self.client, |reply| Command::AcceptLink {
             offer: self.offer,
             reply,
         })
         .await
-        .unwrap_or(Err(LinkError::NodeStopping))
+        .unwrap_or(Err(NodeError::NodeStopping))
     }
 
-    pub async fn reject(self) -> Result<(), LinkError> {
+    pub async fn reject(self) -> Result<(), NodeError> {
         ask(&self.client, |reply| Command::RejectLink {
             offer: self.offer,
             reply,
         })
         .await
-        .unwrap_or(Err(LinkError::NodeStopping))
+        .unwrap_or(Err(NodeError::NodeStopping))
     }
 }
 
@@ -348,22 +348,22 @@ impl Link {
         }
     }
 
-    pub async fn receive(&mut self) -> Result<LinkEvent, LinkReceiveError> {
+    pub async fn receive(&mut self) -> Result<LinkEvent, NodeError> {
         ask(&self.registration.client, |reply| Command::ReceiveLink {
             link: self.id,
             reply,
         })
         .await
-        .unwrap_or(Err(LinkReceiveError::NodeStopped))
+        .unwrap_or(Err(NodeError::NodeStopping))
     }
 
-    pub async fn close(self) -> Result<(), LinkError> {
+    pub async fn close(self) -> Result<(), NodeError> {
         ask(&self.registration.client, |reply| Command::CloseLink {
             link: self.id,
             reply,
         })
         .await
-        .unwrap_or(Err(LinkError::NodeStopping))
+        .unwrap_or(Err(NodeError::NodeStopping))
     }
 }
 
@@ -377,9 +377,9 @@ impl LinkSender {
     pub const MAX_DATAGRAM_BYTES: usize = crate::node::LINK_MDU;
     pub const MAX_REQUEST_BODY_BYTES: usize = 400;
 
-    pub async fn send(&self, body: Bytes) -> Result<(), LinkError> {
+    pub async fn send(&self, body: Bytes) -> Result<(), NodeError> {
         if body.len() > Self::MAX_DATAGRAM_BYTES {
-            return Err(LinkError::PayloadTooLarge);
+            return Err(NodeError::InvalidInput);
         }
         ask(&self.client, |reply| Command::SendLinkDatagram {
             link: self.id,
@@ -387,12 +387,12 @@ impl LinkSender {
             reply,
         })
         .await
-        .unwrap_or(Err(LinkError::NodeStopping))
+        .unwrap_or(Err(NodeError::NodeStopping))
     }
 
-    pub async fn request(&self, path: RequestPath, body: Bytes) -> Result<Bytes, LinkError> {
+    pub async fn request(&self, path: RequestPath, body: Bytes) -> Result<Bytes, NodeError> {
         if body.len() > Self::MAX_REQUEST_BODY_BYTES {
-            return Err(LinkError::PayloadTooLarge);
+            return Err(NodeError::InvalidInput);
         }
         ask(&self.client, |reply| Command::Request {
             link: self.id,
@@ -401,28 +401,28 @@ impl LinkSender {
             reply,
         })
         .await
-        .unwrap_or(Err(LinkError::NodeStopping))
+        .unwrap_or(Err(NodeError::NodeStopping))
     }
 
-    pub async fn open_channel(&self) -> Result<Channel, ChannelError> {
+    pub async fn open_channel(&self) -> Result<Channel, NodeError> {
         ask(&self.client, |reply| Command::OpenChannel {
             link: self.id,
             reply,
         })
         .await
-        .unwrap_or(Err(ChannelError::NodeStopping))
+        .unwrap_or(Err(NodeError::NodeStopping))
     }
 }
 
 impl Service {
-    pub async fn identify_on(&self, link: &LinkSender) -> Result<(), IdentifyError> {
+    pub async fn identify_on(&self, link: &LinkSender) -> Result<(), NodeError> {
         if !self
             .registration
             .client
             .commands
             .same_channel(&link.client.commands)
         {
-            return Err(IdentifyError::DifferentNode);
+            return Err(NodeError::Conflict);
         }
         ask(&self.registration.client, |reply| Command::Identify {
             link: link.id,
@@ -430,7 +430,7 @@ impl Service {
             reply,
         })
         .await
-        .unwrap_or(Err(IdentifyError::NodeStopping))
+        .unwrap_or(Err(NodeError::NodeStopping))
     }
 }
 
@@ -446,7 +446,6 @@ pub enum LinkCloseReason {
     RemoteClosed,
     IdleTimeout,
     AuthenticationFailed,
-    InterfaceFailed,
     CapacityReached,
     ProtocolViolation,
 }
@@ -469,9 +468,9 @@ impl IncomingRequest {
         &self.body
     }
 
-    pub async fn respond(self, response: Bytes) -> Result<(), LinkError> {
+    pub async fn respond(self, response: Bytes) -> Result<(), NodeError> {
         if response.len() > Self::MAX_RESPONSE_BYTES {
-            return Err(LinkError::PayloadTooLarge);
+            return Err(NodeError::InvalidInput);
         }
         ask(&self.client, |reply| Command::Respond {
             link: self.link,
@@ -480,7 +479,7 @@ impl IncomingRequest {
             reply,
         })
         .await
-        .unwrap_or(Err(LinkError::NodeStopping))
+        .unwrap_or(Err(NodeError::NodeStopping))
     }
 }
 
@@ -496,13 +495,13 @@ impl Channel {
             client: self.registration.client.clone(),
         }
     }
-    pub async fn receive(&mut self) -> Result<ChannelReceive, ChannelReceiveError> {
+    pub async fn receive(&mut self) -> Result<ChannelReceive, NodeError> {
         ask(&self.registration.client, |reply| Command::ReceiveChannel {
             link: self.link,
             reply,
         })
         .await
-        .unwrap_or(Err(ChannelReceiveError::NodeStopped))
+        .unwrap_or(Err(NodeError::NodeStopping))
     }
 }
 
@@ -513,24 +512,24 @@ pub struct ChannelSender {
 }
 
 impl ChannelSender {
-    pub async fn send(&self, message: ChannelMessage) -> Result<(), ChannelError> {
+    pub async fn send(&self, message: ChannelMessage) -> Result<(), NodeError> {
         ask(&self.client, |reply| Command::SendChannel {
             link: self.link,
             message,
             reply,
         })
         .await
-        .unwrap_or(Err(ChannelError::NodeStopping))
+        .unwrap_or(Err(NodeError::NodeStopping))
     }
 
-    pub async fn open_buffer(&self, stream: StreamId) -> Result<BufferSender, BufferError> {
+    pub async fn open_buffer(&self, stream: StreamId) -> Result<BufferSender, NodeError> {
         ask(&self.client, |reply| Command::OpenBuffer {
             link: self.link,
             stream,
             reply,
         })
         .await
-        .unwrap_or(Err(BufferError::Channel(ChannelError::NodeStopping)))?;
+        .unwrap_or(Err(NodeError::NodeStopping))?;
         Ok(BufferSender {
             link: self.link,
             stream,
@@ -560,12 +559,12 @@ pub struct BufferSender {
 }
 
 impl BufferSender {
-    pub async fn write(&mut self, input: Bytes) -> Result<usize, BufferError> {
+    pub async fn write(&mut self, input: Bytes) -> Result<usize, NodeError> {
         if input.is_empty() {
-            return Err(BufferError::EmptyInput);
+            return Err(NodeError::InvalidInput);
         }
         if input.len() > crate::buffer::MAX_INPUT_BYTES {
-            return Err(BufferError::InputTooLarge);
+            return Err(NodeError::InvalidInput);
         }
         ask(&self.client, |reply| Command::WriteBuffer {
             link: self.link,
@@ -574,13 +573,13 @@ impl BufferSender {
             reply,
         })
         .await
-        .unwrap_or(Err(BufferError::Channel(ChannelError::NodeStopping)))
+        .unwrap_or(Err(NodeError::NodeStopping))
         .map(|queued| queued.input_bytes)
     }
 
-    pub async fn finish(self, input: Bytes) -> Result<usize, BufferError> {
+    pub async fn finish(self, input: Bytes) -> Result<usize, NodeError> {
         if input.len() > crate::buffer::MAX_INPUT_BYTES {
-            return Err(BufferError::InputTooLarge);
+            return Err(NodeError::InvalidInput);
         }
         let mut queued = 0;
         while queued < input.len() {
@@ -592,7 +591,7 @@ impl BufferSender {
                 reply,
             })
             .await
-            .unwrap_or(Err(BufferError::Channel(ChannelError::NodeStopping)))?;
+            .unwrap_or(Err(NodeError::NodeStopping))?;
             queued += result.input_bytes;
             if result.end_queued {
                 return Ok(queued);
@@ -605,7 +604,7 @@ impl BufferSender {
             reply,
         })
         .await
-        .unwrap_or(Err(BufferError::Channel(ChannelError::NodeStopping)))?;
+        .unwrap_or(Err(NodeError::NodeStopping))?;
         debug_assert!(result.end_queued);
         Ok(queued)
     }
@@ -617,51 +616,22 @@ pub(crate) struct BufferQueued {
     pub(crate) end_queued: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ShutdownReport {
-    pub reason: ShutdownReason,
-    pub links_closed: usize,
-    pub links_abandoned: usize,
-    pub interfaces_closed: usize,
-    pub interfaces_failed: usize,
-}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BuildError(pub(crate) ());
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ShutdownReason {
-    Requested,
-    LastHandleDropped,
-    DeadlineExpired,
-    TaskDropped,
-}
+pub struct NodeRunError(pub(crate) ());
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BuildError {
-    TooManyInitialInterfaces,
-    EntropyUnavailable,
-    InvalidEntropy,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NodeRunError {
-    ProtocolInvariant,
-}
-
-macro_rules! errors {
-    ($($name:ident { $($variant:ident $(($value:ty))?),* $(,)? })*) => {$(
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-        pub enum $name { $($variant $(($value))?),* }
-    )*};
-}
-
-errors! {
-    NodeError { NodeStopping, CapacityReached }
-    SendError { NodeStopping, NoRoute, PayloadTooLarge, InterfaceBusy, InterfaceFailed }
-    AnnounceError { NodeStopping, NoUsableInterface, ApplicationDataTooLarge, InterfaceBusy, InterfaceFailed }
-    LinkError { NodeStopping, NoRoute, LinkClosed, TimedOut, Rejected, PayloadTooLarge, InterfaceBusy, InterfaceFailed, CapacityReached }
-    IdentifyError { NodeStopping, DifferentNode, ServiceClosed, LinkClosed, BoundToDifferentIdentity, InterfaceBusy, InterfaceFailed }
-    ChannelError { NodeStopping, LinkClosed, ChannelClosed, AlreadyOpen, CapacityReached, RetryLimitReached }
-    ServiceReceiveError { NodeStopped, ServiceClosed }
-    LinkReceiveError { NodeStopped, LinkClosed(LinkCloseReason) }
-    ChannelReceiveError { NodeStopped, LinkClosed, ChannelClosed, ProtocolViolation }
-    BufferError { EmptyInput, InputTooLarge, StreamAlreadyOpen, Channel(ChannelError) }
+pub enum NodeError {
+    NodeStopping,
+    ResourceClosed,
+    LinkClosed(LinkCloseReason),
+    CapacityReached,
+    NoRoute,
+    InvalidInput,
+    InterfaceUnavailable,
+    TimedOut,
+    Rejected,
+    Conflict,
 }

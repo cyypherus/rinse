@@ -34,7 +34,7 @@ fn load_directory(base: &Path, current: &Path, files: &mut HashMap<String, Vec<u
             && let Ok(data) = std::fs::read(&path)
         {
             let request_path = format!("/{}", relative.display());
-            if RequestPath::new(request_path.clone()).is_ok() {
+            if RequestPath::new(request_path.clone()).is_some() {
                 files.insert(request_path, data);
             } else {
                 log::warn!("skipping unsupported request path {request_path}");

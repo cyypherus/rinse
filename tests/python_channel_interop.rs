@@ -227,10 +227,10 @@ async fn python_and_rust_exchange_channels_and_buffers() {
     .unwrap();
     assert_eq!(python_result, "PYTHON_RECEIVED");
 
-    let report = tokio::time::timeout(Duration::from_secs(10), node.shutdown())
+    tokio::time::timeout(Duration::from_secs(10), node.shutdown())
         .await
         .unwrap();
-    assert_eq!(run.await.unwrap().unwrap(), report);
+    run.await.unwrap().unwrap();
     tokio::task::spawn_blocking(move || child.wait().unwrap())
         .await
         .unwrap();

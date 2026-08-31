@@ -56,10 +56,6 @@ name = "rinse-relay"
 path = "src/bin/relay.rs"
 required-features = ["relay", "tcp"]
 
-[[bin]]
-name = "rinse-stab"
-path = "src/bin/stab.rs"
-
 [[example]]
 name = "serve"
 required-features = ["config", "tcp"]
@@ -78,5 +74,4 @@ harness = false
 
 [dev-dependencies]
 env_logger = "0.11"
-rusqlite = { version = "0.40.2", features = ["bundled", "trace"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "test-util", "time"] }

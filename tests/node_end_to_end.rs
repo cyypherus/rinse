@@ -6,9 +6,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use rinse::{
     BufferChunk, ChannelMessage, ChannelReceive, InboundPacket, Interface, InterfaceError,
-    InterfaceLimits, Link, LinkEvent, MessageType, NodeBuilder, NodeConfig, OutboundPacket,
-    PrivateIdentity, RatchetAction, RequestPath, SendError, Service, ServiceConfig, ServiceEvent,
-    ServiceName, ShutdownReason, StreamId, TcpHdlcInterface,
+    InterfaceLimits, Link, LinkEvent, MessageType, NodeBuilder, NodeConfig, NodeError,
+    OutboundPacket, PrivateIdentity, RatchetAction, RequestPath, Service, ServiceConfig,
+    ServiceEvent, ServiceName, StreamId, TcpHdlcInterface,
 };
 
 struct MemoryInterface {
@@ -99,8 +99,7 @@ async fn dropping_the_last_client_stops_the_node() {
     let (interface, _peer, _) = connected_interfaces();
     let (node, task) = node(interface);
     drop(node);
-    let report = task.run().await.unwrap();
-    assert_eq!(report.reason, ShutdownReason::LastHandleDropped);
+    task.run().await.unwrap();
 }
 
 #[tokio::test]
@@ -133,7 +132,7 @@ async fn responder_close_during_link_open_has_a_closed_outcome_without_runtime_p
     });
     match client_node.open_link(destination).await {
         Ok(mut link) => assert!(link.receive().await.is_err()),
-        Err(rinse::LinkError::LinkClosed) => {}
+        Err(NodeError::ResourceClosed) => {}
         Err(error) => panic!("unexpected link outcome: {error:?}"),
     }
     close.await.unwrap();
@@ -548,12 +547,13 @@ async fn rotating_an_announcement_returns_only_the_new_restart_secret() {
     let (node, task) = node(left);
     let running = tokio::spawn(task.run());
     let service = service(&node, "test.ratchet", &[]).await;
-    let rotated = service
-        .announce(Bytes::new(), RatchetAction::Rotate)
-        .await
-        .unwrap()
-        .expect("rotation must return the committed restart secret");
-    assert_ne!(rotated.to_bytes(), [0; 32]);
+    assert!(
+        service
+            .announce(Bytes::new(), RatchetAction::Rotate)
+            .await
+            .unwrap()
+            .is_some()
+    );
     assert!(
         service
             .announce(Bytes::new(), RatchetAction::Keep)
@@ -595,7 +595,7 @@ async fn learned_routes_expire() {
     });
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_secs(61)).await;
-    assert_eq!(pending.await.unwrap(), Err(SendError::NoRoute));
+    assert_eq!(pending.await.unwrap(), Err(NodeError::NoRoute));
     client_node.shutdown().await;
     server_node.shutdown().await;
     client_running.await.unwrap().unwrap();

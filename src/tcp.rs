@@ -70,7 +70,7 @@ impl Interface for TcpHdlcInterface {
     }
 
     async fn send(&self, packet: OutboundPacket) -> Result<(), InterfaceError> {
-        let mut frame = Vec::with_capacity(packet.len() + 2);
+        let mut frame = Vec::with_capacity(packet.byte_len() + 2);
         frame.push(FLAG);
         for byte in packet.into_bytes() {
             if matches!(byte, FLAG | ESCAPE) {
