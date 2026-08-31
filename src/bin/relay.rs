@@ -29,10 +29,10 @@ use serde::{Deserialize, Serialize};
 use simplelog::{
     ColorChoice, Config as LogConfig, SharedLogger, TermLogger, TerminalMode, WriteLogger,
 };
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 mod relay_interface;
-use relay_interface::{LifetimeStats, RelayStats, TcpHdlc};
+use relay_interface::{RelayStats, TcpHdlc};
 
 const BANNER: &str = r#"    ____  _
    / __ \(_)___  ________
@@ -66,37 +66,20 @@ impl PersistedStats {
         }
     }
 
-    fn merge(&mut self, session: &LifetimeStats) {
-        self.total_uptime_secs += session.uptime_secs;
+    fn merge(&mut self, session: &Self) {
+        self.total_uptime_secs += session.total_uptime_secs;
         self.packets_received += session.packets_received;
         self.bytes_received += session.bytes_received;
         self.packets_sent += session.packets_sent;
         self.bytes_sent += session.bytes_sent;
     }
 
-    fn combined(&self, session: &LifetimeStats) -> CombinedStats {
-        CombinedStats {
-            session_uptime_secs: session.uptime_secs,
-            total_uptime_secs: self.total_uptime_secs + session.uptime_secs,
-            packets_received: self.packets_received + session.packets_received,
-            bytes_received: self.bytes_received + session.bytes_received,
-            packets_sent: self.packets_sent + session.packets_sent,
-            bytes_sent: self.bytes_sent + session.bytes_sent,
-            session_packets_sent: session.packets_sent,
-            session_bytes_sent: session.bytes_sent,
-        }
+    fn save_session(&self, session: &Self, path: &PathBuf) {
+        let mut total = self.clone();
+        total.merge(session);
+        total.total_uptime_secs = self.total_uptime_secs;
+        total.save(path);
     }
-}
-
-struct CombinedStats {
-    session_uptime_secs: u64,
-    total_uptime_secs: u64,
-    packets_received: u64,
-    bytes_received: u64,
-    packets_sent: u64,
-    bytes_sent: u64,
-    session_packets_sent: u64,
-    session_bytes_sent: u64,
 }
 
 struct LogEntry {
@@ -109,34 +92,22 @@ struct TuiLogger {
     file_logger: Box<dyn SharedLogger>,
 }
 
-impl TuiLogger {
-    fn new(buffer: Arc<Mutex<VecDeque<LogEntry>>>, file_logger: Box<dyn SharedLogger>) -> Self {
-        Self {
-            buffer,
-            file_logger,
-        }
-    }
-}
-
 impl log::Log for TuiLogger {
     fn enabled(&self, _metadata: &log::Metadata) -> bool {
         true
     }
 
     fn log(&self, record: &log::Record) {
-        if self.enabled(record.metadata()) {
-            let entry = LogEntry {
+        if let Ok(mut buf) = self.buffer.lock() {
+            buf.push_back(LogEntry {
                 level: record.level(),
                 message: format!("{}", record.args()),
-            };
-            if let Ok(mut buf) = self.buffer.lock() {
-                buf.push_back(entry);
-                while buf.len() > 100 {
-                    buf.pop_front();
-                }
+            });
+            if buf.len() > 100 {
+                buf.pop_front();
             }
-            self.file_logger.log(record);
         }
+        self.file_logger.log(record);
     }
 
     fn flush(&self) {
@@ -173,32 +144,6 @@ impl RelayTui {
         }
     }
 
-    fn format_bytes(bytes: u64) -> String {
-        if bytes >= 1_000_000_000_000 {
-            format!("{:.2} TB", bytes as f64 / 1_000_000_000_000.0)
-        } else if bytes >= 1_000_000_000 {
-            format!("{:.2} GB", bytes as f64 / 1_000_000_000.0)
-        } else if bytes >= 1_000_000 {
-            format!("{:.2} MB", bytes as f64 / 1_000_000.0)
-        } else if bytes >= 1_000 {
-            format!("{:.2} KB", bytes as f64 / 1_000.0)
-        } else {
-            format!("{} B", bytes)
-        }
-    }
-
-    fn format_uptime(secs: u64) -> String {
-        if secs >= 86400 {
-            format!("{}d {}h", secs / 86400, (secs % 86400) / 3600)
-        } else if secs >= 3600 {
-            format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
-        } else if secs >= 60 {
-            format!("{}m {}s", secs / 60, secs % 60)
-        } else {
-            format!("{}s", secs)
-        }
-    }
-
     fn format_rate(bytes_per_sec: f64) -> String {
         if bytes_per_sec >= 1_000_000.0 {
             format!("{:.1} MB/s", bytes_per_sec / 1_000_000.0)
@@ -212,41 +157,43 @@ impl RelayTui {
     fn render(
         &mut self,
         frame: &mut Frame,
-        combined: &CombinedStats,
+        persisted: &PersistedStats,
+        session: &PersistedStats,
         interval_secs: f64,
         upstreams: &[String],
     ) {
-        let sent_delta = combined
-            .session_packets_sent
+        let sent_delta = session
+            .packets_sent
             .saturating_sub(self.prev_session_packets);
-        let bytes_delta = combined
-            .session_bytes_sent
-            .saturating_sub(self.prev_session_bytes);
-
+        let bytes_delta = session.bytes_sent.saturating_sub(self.prev_session_bytes);
         let bytes_per_sec = bytes_delta as f64 / interval_secs;
-
         let area = frame.area();
-
         let chunks = Layout::vertical([
             Constraint::Length(7),
             Constraint::Min(10),
             Constraint::Length(12),
         ])
         .split(area);
-
-        self.render_header(frame, chunks[0], combined, upstreams);
-        self.render_stats(frame, chunks[1], combined, sent_delta, bytes_per_sec);
+        self.render_header(frame, chunks[0], persisted, session, upstreams);
+        self.render_stats(
+            frame,
+            chunks[1],
+            persisted,
+            session,
+            sent_delta,
+            bytes_per_sec,
+        );
         self.render_logs(frame, chunks[2]);
-
-        self.prev_session_packets = combined.session_packets_sent;
-        self.prev_session_bytes = combined.session_bytes_sent;
+        self.prev_session_packets = session.packets_sent;
+        self.prev_session_bytes = session.bytes_sent;
     }
 
     fn render_header(
         &self,
         frame: &mut Frame,
         area: Rect,
-        combined: &CombinedStats,
+        persisted: &PersistedStats,
+        session: &PersistedStats,
         upstreams: &[String],
     ) {
         let mut lines: Vec<Line> = BANNER
@@ -257,12 +204,12 @@ impl RelayTui {
         lines.push(Line::from(vec![
             Span::styled(" Session: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                Self::format_uptime(combined.session_uptime_secs),
+                format_uptime(session.total_uptime_secs),
                 Style::default().fg(Color::White),
             ),
             Span::styled(" | Total: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                Self::format_uptime(combined.total_uptime_secs),
+                format_uptime(persisted.total_uptime_secs + session.total_uptime_secs),
                 Style::default().fg(Color::White),
             ),
             if !upstreams.is_empty() {
@@ -287,18 +234,20 @@ impl RelayTui {
         &self,
         frame: &mut Frame,
         area: Rect,
-        combined: &CombinedStats,
+        persisted: &PersistedStats,
+        session: &PersistedStats,
         sent_delta: u64,
         bytes_per_sec: f64,
     ) {
-        let sections =
-            Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).split(area);
-
+        let packets_sent = persisted.packets_sent + session.packets_sent;
+        let bytes_sent = persisted.bytes_sent + session.bytes_sent;
+        let packets_received = persisted.packets_received + session.packets_received;
+        let bytes_received = persisted.bytes_received + session.bytes_received;
         let perf_lines = vec![
             Line::from(vec![
                 Span::styled("  Packets sent:     ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    format!("{:>10}", combined.packets_sent),
+                    format!("{:>10}", packets_sent),
                     Style::default().fg(Color::Green),
                 ),
                 Span::styled(
@@ -309,7 +258,7 @@ impl RelayTui {
             Line::from(vec![
                 Span::styled("  Data sent:        ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    format!("{:>10}", Self::format_bytes(combined.bytes_sent)),
+                    format!("{:>10}", format_bytes(bytes_sent)),
                     Style::default().fg(Color::Green),
                 ),
                 Span::styled(
@@ -320,14 +269,14 @@ impl RelayTui {
             Line::from(vec![
                 Span::styled("  Packets received: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    format!("{:>10}", combined.packets_received),
+                    format!("{:>10}", packets_received),
                     Style::default().fg(Color::Yellow),
                 ),
             ]),
             Line::from(vec![
                 Span::styled("  Data received:    ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    format!("{:>10}", Self::format_bytes(combined.bytes_received)),
+                    format!("{:>10}", format_bytes(bytes_received)),
                     Style::default().fg(Color::Yellow),
                 ),
             ]),
@@ -343,46 +292,7 @@ impl RelayTui {
                     .add_modifier(Modifier::BOLD),
             ));
         let perf_para = Paragraph::new(perf_lines).block(perf_block);
-        frame.render_widget(perf_para, sections[0]);
-
-        let io_lines = vec![
-            Line::from(vec![
-                Span::styled("  RX: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("{} pkts", combined.packets_received),
-                    Style::default().fg(Color::Blue),
-                ),
-                Span::styled(" / ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    Self::format_bytes(combined.bytes_received),
-                    Style::default().fg(Color::Blue),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("  TX: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("{} pkts", combined.packets_sent),
-                    Style::default().fg(Color::Magenta),
-                ),
-                Span::styled(" / ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    Self::format_bytes(combined.bytes_sent),
-                    Style::default().fg(Color::Magenta),
-                ),
-            ]),
-        ];
-
-        let io_block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(Span::styled(
-                " Network I/O ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let io_para = Paragraph::new(io_lines).block(io_block);
-        frame.render_widget(io_para, sections[1]);
+        frame.render_widget(perf_para, area);
     }
 
     fn render_logs(&self, frame: &mut Frame, area: Rect) {
@@ -433,12 +343,22 @@ impl RelayTui {
     }
 }
 
-fn stats_path() -> PathBuf {
-    data_dir().join("relay_stats.json")
-}
-
 fn data_dir() -> PathBuf {
     PathBuf::from(".rinse")
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_000_000_000_000 {
+        format!("{:.2} TB", bytes as f64 / 1_000_000_000_000.0)
+    } else if bytes >= 1_000_000_000 {
+        format!("{:.2} GB", bytes as f64 / 1_000_000_000.0)
+    } else if bytes >= 1_000_000 {
+        format!("{:.2} MB", bytes as f64 / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{:.2} KB", bytes as f64 / 1_000.0)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 fn format_uptime(secs: u64) -> String {
@@ -474,8 +394,7 @@ fn log_level_from_env() -> LevelFilter {
 
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let headless = args.iter().any(|a| a == "--headless");
+    let headless = std::env::args().any(|arg| arg == "--headless");
 
     let _ = std::fs::create_dir_all(data_dir());
 
@@ -495,7 +414,10 @@ async fn main() {
         simplelog::CombinedLogger::init(vec![term_logger, file_logger])
             .expect("failed to set logger");
     } else {
-        let tui_logger = TuiLogger::new(log_buffer.clone(), file_logger);
+        let tui_logger = TuiLogger {
+            buffer: log_buffer.clone(),
+            file_logger,
+        };
         log::set_boxed_logger(Box::new(tui_logger)).expect("failed to set logger");
         log::set_max_level(log_level);
     }
@@ -504,7 +426,7 @@ async fn main() {
     let identity = load_or_create_persistent_identity(data_dir().join("identity"))
         .expect("failed to load identity");
 
-    let stats_file = stats_path();
+    let stats_file = data_dir().join("relay_stats.json");
     let persisted = PersistedStats::load(&stats_file);
     log::info!(
         "Loaded persisted stats: {} packets sent, {} uptime",
@@ -512,7 +434,7 @@ async fn main() {
         format_uptime(persisted.total_uptime_secs)
     );
 
-    let stats = RelayStats::new();
+    let stats = Arc::new(RelayStats::new());
     let mut builder = NodeBuilder::new(NodeConfig::relay());
 
     let enabled_interfaces = config.enabled_interfaces();
@@ -542,14 +464,15 @@ async fn main() {
             } => {
                 let addr = format!("{}:{}", target_host, target_port);
                 log::info!("Connecting to {} ({})", name, addr);
-                match TcpHdlc::connect(&addr, stats.clone()).await {
+                match TcpStream::connect(&addr)
+                    .await
+                    .and_then(|stream| TcpHdlc::new(stream, stats.clone()))
+                {
                     Ok(interface) => {
                         builder = builder.interface(interface, interface_limits());
                         upstreams.push(addr);
                     }
-                    Err(e) => {
-                        log::warn!("Failed to connect to {}: {}", addr, e);
-                    }
+                    Err(e) => log::warn!("Failed to connect to {}: {}", addr, e),
                 }
             }
             InterfaceConfig::TCPServerInterface {
@@ -647,10 +570,7 @@ async fn run_headless(
                 );
 
                 if last_save.elapsed() >= save_interval {
-                    let mut save_persisted = persisted.clone();
-                    save_persisted.merge(&session_stats);
-                    save_persisted.total_uptime_secs = persisted.total_uptime_secs;
-                    save_persisted.save(&stats_file);
+                    persisted.save_session(&session_stats, &stats_file);
                     last_save = std::time::Instant::now();
                 }
             }
@@ -695,22 +615,18 @@ async fn run_tui(
             }
             _ = tick.tick() => {
                 let session_stats = stats.snapshot();
-                let combined = persisted.combined(&session_stats);
-
                 terminal.draw(|frame| {
                     tui.render(
                         frame,
-                        &combined,
+                        &persisted,
+                        &session_stats,
                         stats_interval.as_secs_f64(),
                         &upstreams,
                     );
                 }).ok();
 
                 if last_save.elapsed() >= save_interval {
-                    let mut save_persisted = persisted.clone();
-                    save_persisted.merge(&session_stats);
-                    save_persisted.total_uptime_secs = persisted.total_uptime_secs;
-                    save_persisted.save(&stats_file);
+                    persisted.save_session(&session_stats, &stats_file);
                     last_save = std::time::Instant::now();
                 }
 
@@ -732,7 +648,7 @@ async fn run_tui(
                     println!("    Packets sent: {}", persisted.packets_sent);
                     println!(
                         "    Data sent: {}",
-                        RelayTui::format_bytes(persisted.bytes_sent)
+                        format_bytes(persisted.bytes_sent)
                     );
                     println!(
                         "    Total uptime: {}",

@@ -5,13 +5,7 @@ use std::time::Instant;
 use rinse::{InboundPacket, Interface, InterfaceError, OutboundPacket};
 use tokio::net::TcpStream;
 
-pub struct LifetimeStats {
-    pub uptime_secs: u64,
-    pub packets_received: u64,
-    pub bytes_received: u64,
-    pub packets_sent: u64,
-    pub bytes_sent: u64,
-}
+use super::PersistedStats;
 
 pub struct RelayStats {
     started: Instant,
@@ -22,25 +16,23 @@ pub struct RelayStats {
 }
 
 impl RelayStats {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new() -> Self {
+        Self {
             started: Instant::now(),
             packets_received: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
             packets_sent: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
-        })
+        }
     }
 
-    pub fn snapshot(&self) -> LifetimeStats {
-        let packets_sent = self.packets_sent.load(Ordering::Relaxed);
-        let bytes_sent = self.bytes_sent.load(Ordering::Relaxed);
-        LifetimeStats {
-            uptime_secs: self.started.elapsed().as_secs(),
+    pub fn snapshot(&self) -> PersistedStats {
+        PersistedStats {
+            total_uptime_secs: self.started.elapsed().as_secs(),
             packets_received: self.packets_received.load(Ordering::Relaxed),
             bytes_received: self.bytes_received.load(Ordering::Relaxed),
-            packets_sent,
-            bytes_sent,
+            packets_sent: self.packets_sent.load(Ordering::Relaxed),
+            bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
         }
     }
 }
@@ -51,10 +43,6 @@ pub struct TcpHdlc {
 }
 
 impl TcpHdlc {
-    pub async fn connect(address: &str, stats: Arc<RelayStats>) -> std::io::Result<Self> {
-        Self::new(TcpStream::connect(address).await?, stats)
-    }
-
     pub fn new(stream: TcpStream, stats: Arc<RelayStats>) -> std::io::Result<Self> {
         Ok(Self {
             inner: rinse::TcpHdlcInterface::new(stream)?,

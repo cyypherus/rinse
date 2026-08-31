@@ -39,9 +39,6 @@ impl Request {
     pub fn encode(&self) -> Vec<u8> {
         let data_value: Value = match &self.data {
             Some(d) => {
-                // If data is valid msgpack (e.g. a pre-encoded dict), embed it directly.
-                // Otherwise treat as raw binary (matches Python msgpack behavior).
-                // Must consume entire input to be valid msgpack.
                 let mut cursor = &d[..];
                 match rmpv::decode::read_value(&mut cursor) {
                     Ok(v) if cursor.is_empty() => v,
@@ -176,8 +173,6 @@ mod tests {
 
     #[test]
     fn request_no_data_matches_python() {
-        // Python: import umsgpack; umsgpack.packb([1234567890.123, bytes.fromhex("b04c3b75c4731c02f72d2ea9afcd7b66"), None]).hex()
-        // = "93cb41d26580b487df3bc410b04c3b75c4731c02f72d2ea9afcd7b66c0"
         let mut req = Request::new("test/path", vec![]);
         req.timestamp = 1234567890.123;
         let encoded = req.encode();
@@ -189,8 +184,6 @@ mod tests {
 
     #[test]
     fn request_with_dict_matches_python() {
-        // Python: import umsgpack; umsgpack.packb([1234567890.123, bytes.fromhex("b04c3b75c4731c02f72d2ea9afcd7b66"), {"field_username": "alice"}]).hex()
-        // = "93cb41d26580b487df3bc410b04c3b75c4731c02f72d2ea9afcd7b6681ae6669656c645f757365726e616d65a5616c696365"
         let mut form_data = HashMap::new();
         form_data.insert("field_username".to_string(), "alice".to_string());
         let data = rmp_serde::to_vec(&form_data).unwrap();

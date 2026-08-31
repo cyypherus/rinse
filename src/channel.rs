@@ -10,7 +10,6 @@ const MAX_TRIES: u8 = 5;
 pub(crate) enum QueueChannelError {
     LinkNotFound,
     LinkNotActive,
-    AlreadyOpen,
     WindowFull,
 }
 

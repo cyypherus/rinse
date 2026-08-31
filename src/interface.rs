@@ -11,49 +11,21 @@ pub enum InterfaceError {
     Io(io::Error),
 }
 
-pub struct InboundPacket {
-    bytes: Vec<u8>,
+macro_rules! packet_bytes {
+    ($name:ident, $new:vis) => {
+        pub struct $name { bytes: Vec<u8> }
+
+        impl $name {
+            $new fn new(bytes: Vec<u8>) -> Self { Self { bytes } }
+            pub fn into_bytes(self) -> Vec<u8> { self.bytes }
+            pub fn len(&self) -> usize { self.bytes.len() }
+            pub fn is_empty(&self) -> bool { self.bytes.is_empty() }
+        }
+    };
 }
 
-impl InboundPacket {
-    pub fn new(bytes: Vec<u8>) -> Self {
-        Self { bytes }
-    }
-
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
-    }
-
-    pub fn len(&self) -> usize {
-        self.bytes.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-}
-
-pub struct OutboundPacket {
-    bytes: Vec<u8>,
-}
-
-impl OutboundPacket {
-    pub(crate) fn new(bytes: Vec<u8>) -> Self {
-        Self { bytes }
-    }
-
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
-    }
-
-    pub fn len(&self) -> usize {
-        self.bytes.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-}
+packet_bytes!(InboundPacket, pub);
+packet_bytes!(OutboundPacket, pub(crate));
 
 pub trait Interface: Send + Sync {
     fn receive(&self) -> impl Future<Output = Result<InboundPacket, InterfaceError>> + Send;

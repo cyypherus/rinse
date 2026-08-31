@@ -337,6 +337,10 @@ pub struct Link {
 }
 
 impl Link {
+    pub const fn id(&self) -> [u8; 16] {
+        self.id.0
+    }
+
     pub fn send_handle(&self) -> LinkSender {
         LinkSender {
             id: self.id,
@@ -456,7 +460,7 @@ pub struct IncomingRequest {
 }
 
 impl IncomingRequest {
-    pub const MAX_RESPONSE_BYTES: usize = 1_048_576;
+    pub const MAX_RESPONSE_BYTES: usize = 1_048_543;
 
     pub fn path(&self) -> &RequestPath {
         &self.path
@@ -651,7 +655,7 @@ macro_rules! errors {
 
 errors! {
     NodeError { NodeStopping, CapacityReached }
-    SendError { NodeStopping, NoRoute, PayloadTooLarge, InterfaceBusy, InterfaceFailed, CapacityReached }
+    SendError { NodeStopping, NoRoute, PayloadTooLarge, InterfaceBusy, InterfaceFailed }
     AnnounceError { NodeStopping, NoUsableInterface, ApplicationDataTooLarge, InterfaceBusy, InterfaceFailed }
     LinkError { NodeStopping, NoRoute, LinkClosed, TimedOut, Rejected, PayloadTooLarge, InterfaceBusy, InterfaceFailed, CapacityReached }
     IdentifyError { NodeStopping, DifferentNode, ServiceClosed, LinkClosed, BoundToDifferentIdentity, InterfaceBusy, InterfaceFailed }

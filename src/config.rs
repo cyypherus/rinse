@@ -73,8 +73,8 @@ name = "Anonymous Peer"
 
 
 # Various resources curate tcp/ip relays you can use to connect to the network.
-# https://unsigned.io/rnode_bootstrap_console/r/connect.html
-# https://directory.rns.recipes/
+# https:
+# https:
 
 # An entry like this must be converted to TOML as seen above
 # [[Test Network Example]]
@@ -118,8 +118,8 @@ pub enum InterfaceConfig {
 impl InterfaceConfig {
     pub fn is_enabled(&self) -> bool {
         match self {
-            InterfaceConfig::TCPClientInterface { enabled, .. } => *enabled,
-            InterfaceConfig::TCPServerInterface { enabled, .. } => *enabled,
+            InterfaceConfig::TCPClientInterface { enabled, .. }
+            | InterfaceConfig::TCPServerInterface { enabled, .. } => *enabled,
         }
     }
 }

@@ -1,26 +1,3 @@
-// Announce packet data format
-// Reference: rns-reference/RNS/Identity.py validate_announce()
-//
-// Announce data layout (without ratchet, context_flag = 0):
-//   [public_key: 64 bytes] [name_hash: 10 bytes] [random_hash: 10 bytes] [signature: 64 bytes] [app_data: 0+ bytes]
-//
-// Announce data layout (with ratchet, context_flag = 1):
-//   [public_key: 64 bytes] [name_hash: 10 bytes] [random_hash: 10 bytes] [ratchet: 32 bytes] [signature: 64 bytes] [app_data: 0+ bytes]
-//
-// Where:
-//   public_key = encryption_key (32 bytes X25519) || signing_key (32 bytes Ed25519)
-//   name_hash = truncated SHA-256 of destination name (10 bytes)
-//   random_hash = random(5 bytes) || timestamp(5 bytes)
-//   ratchet = X25519 public key for forward secrecy (32 bytes, optional)
-//   signature = Ed25519 signature over: destination_hash || public_key || name_hash || random_hash || ratchet || app_data
-//   app_data = application-specific data (variable length)
-//
-// Constants from RNS/Identity.py:
-//   KEYSIZE = 512 bits = 64 bytes (32 + 32)
-//   NAME_HASH_LENGTH = 80 bits = 10 bytes
-//   SIGLENGTH = 512 bits = 64 bytes
-//   RATCHETSIZE = 256 bits = 32 bytes
-
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use x25519_dalek::PublicKey as X25519Public;
 
@@ -28,15 +5,15 @@ use crate::crypto::sha256;
 
 pub(crate) const ENCRYPTION_KEY_LEN: usize = 32;
 pub(crate) const SIGNING_KEY_LEN: usize = 32;
-pub(crate) const PUBLIC_KEY_LEN: usize = ENCRYPTION_KEY_LEN + SIGNING_KEY_LEN; // 64
+pub(crate) const PUBLIC_KEY_LEN: usize = ENCRYPTION_KEY_LEN + SIGNING_KEY_LEN;
 pub(crate) const NAME_HASH_LEN: usize = 10;
 pub(crate) const RANDOM_HASH_LEN: usize = 10;
 pub(crate) const SIGNATURE_LEN: usize = 64;
 pub(crate) const RATCHET_LEN: usize = 32;
 
 pub(crate) const MIN_ANNOUNCE_LEN: usize =
-    PUBLIC_KEY_LEN + NAME_HASH_LEN + RANDOM_HASH_LEN + SIGNATURE_LEN; // 148
-pub(crate) const MIN_ANNOUNCE_LEN_WITH_RATCHET: usize = MIN_ANNOUNCE_LEN + RATCHET_LEN; // 180
+    PUBLIC_KEY_LEN + NAME_HASH_LEN + RANDOM_HASH_LEN + SIGNATURE_LEN;
+pub(crate) const MIN_ANNOUNCE_LEN_WITH_RATCHET: usize = MIN_ANNOUNCE_LEN + RATCHET_LEN;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AnnounceData {
@@ -256,9 +233,6 @@ impl AnnounceBuilder {
 mod tests {
     use super::*;
 
-    // Test vectors generated from RNS Python implementation:
-    // enc_prv = bytes(0..32), sig_prv = bytes(32..64)
-    // name = "test.app", random_hash = [1,2,3,4,5,0,0,0,0,0]
     mod rns_vectors {
         pub const DEST_HASH: [u8; 16] = [
             85, 145, 28, 204, 77, 65, 140, 130, 169, 25, 222, 45, 116, 198, 106, 149,
@@ -287,7 +261,6 @@ mod tests {
         ];
         pub const APP_DATA: &[u8] = b"hello";
 
-        // Vector 2: Different keys, name="myapp.service"
         pub const DEST_HASH_2: [u8; 16] = [
             117, 251, 200, 95, 21, 214, 33, 220, 41, 114, 99, 202, 132, 2, 61, 225,
         ];
@@ -302,7 +275,6 @@ mod tests {
             150, 122, 253, 33, 239, 213, 201, 172, 11, 136, 214, 22, 33, 14,
         ];
 
-        // Vector 3: With ratchet
         pub const DEST_HASH_3: [u8; 16] = [
             5, 42, 133, 142, 158, 10, 202, 58, 106, 117, 167, 110, 60, 36, 196, 38,
         ];
@@ -319,7 +291,6 @@ mod tests {
             197, 26, 3,
         ];
 
-        // Vector 4: With longer app_data
         pub const DEST_HASH_4: [u8; 16] = [
             127, 114, 103, 2, 178, 126, 157, 211, 40, 181, 243, 75, 94, 33, 251, 187,
         ];
@@ -368,7 +339,6 @@ mod tests {
     fn encode_matches_rns() {
         use x25519_dalek::StaticSecret;
 
-        // Same keys used to generate RNS test vectors
         let enc_prv_bytes: [u8; 32] = core::array::from_fn(|i| i as u8);
         let sig_prv_bytes: [u8; 32] = core::array::from_fn(|i| (i + 32) as u8);
 
@@ -422,7 +392,7 @@ mod tests {
     #[test]
     fn invalid_signature_rejected() {
         let mut data = rns_vectors::ANNOUNCE_DATA.to_vec();
-        data[84] ^= 0xFF; // Tamper with signature
+        data[84] ^= 0xFF;
 
         let parsed = AnnounceData::parse(&data, false).unwrap();
         assert_eq!(

@@ -8,7 +8,7 @@ use rinse::{
     BufferChunk, ChannelMessage, ChannelReceive, InboundPacket, Interface, InterfaceError,
     InterfaceLimits, Link, LinkEvent, MessageType, NodeBuilder, NodeConfig, OutboundPacket,
     PrivateIdentity, RatchetAction, RequestPath, SendError, Service, ServiceConfig, ServiceEvent,
-    ServiceName, ShutdownReason, StreamId,
+    ServiceName, ShutdownReason, StreamId, TcpHdlcInterface,
 };
 
 struct MemoryInterface {
@@ -101,6 +101,46 @@ async fn dropping_the_last_client_stops_the_node() {
     drop(node);
     let report = task.run().await.unwrap();
     assert_eq!(report.reason, ShutdownReason::LastHandleDropped);
+}
+
+#[tokio::test]
+async fn responder_close_during_link_open_has_a_closed_outcome_without_runtime_panic() {
+    let (client_interface, server_interface, _) = connected_interfaces();
+    let (client_node, client_task) = node(client_interface);
+    let (server_node, server_task) = node(server_interface);
+    let client_running = tokio::spawn(client_task.run());
+    let server_running = tokio::spawn(server_task.run());
+    let mut client_service = service(&client_node, "close.client", &[]).await;
+    let mut server_service = service(&server_node, "close.server", &[]).await;
+    server_service
+        .announce(Bytes::new(), RatchetAction::Keep)
+        .await
+        .unwrap();
+    loop {
+        if let ServiceEvent::Announce(discovered) = client_service.receive().await.unwrap()
+            && discovered.destination() == server_service.destination()
+        {
+            break;
+        }
+    }
+    let destination = server_service.destination();
+    let close = tokio::spawn(async move {
+        accept_link(&mut server_service)
+            .await
+            .close()
+            .await
+            .unwrap();
+    });
+    match client_node.open_link(destination).await {
+        Ok(mut link) => assert!(link.receive().await.is_err()),
+        Err(rinse::LinkError::LinkClosed) => {}
+        Err(error) => panic!("unexpected link outcome: {error:?}"),
+    }
+    close.await.unwrap();
+    client_node.shutdown().await;
+    server_node.shutdown().await;
+    assert!(client_running.await.unwrap().is_ok());
+    assert!(server_running.await.unwrap().is_ok());
 }
 
 #[tokio::test]
@@ -221,6 +261,285 @@ async fn public_api_connects_services_links_requests_channels_and_buffers() {
     server_node.shutdown().await;
     client_running.await.unwrap().unwrap();
     server_running.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn relay_forwards_service_routes_between_interfaces() {
+    let (server_interface, relay_server, _) = connected_interfaces();
+    let (client_interface, relay_client, _) = connected_interfaces();
+    let (server_node, server_task) = node(server_interface);
+    let (client_node, client_task) = node(client_interface);
+    let (relay_node, relay_task) = NodeBuilder::new(NodeConfig::relay())
+        .interface(
+            relay_server,
+            InterfaceLimits::new(65_535, 256, 1_048_576).unwrap(),
+        )
+        .interface(
+            relay_client,
+            InterfaceLimits::new(65_535, 256, 1_048_576).unwrap(),
+        )
+        .build()
+        .unwrap();
+    let server_running = tokio::spawn(server_task.run());
+    let client_running = tokio::spawn(client_task.run());
+    let relay_running = tokio::spawn(relay_task.run());
+    let mut server_service = service(&server_node, "relay.server", &[]).await;
+    let mut client_service = service(&client_node, "relay.client", &[]).await;
+    server_service
+        .announce(Bytes::new(), RatchetAction::Keep)
+        .await
+        .unwrap();
+    loop {
+        if let ServiceEvent::Announce(announce) = client_service.receive().await.unwrap()
+            && announce.destination() == server_service.destination()
+        {
+            break;
+        }
+    }
+    let (client_link, server_link) = tokio::join!(
+        client_node.open_link(server_service.destination()),
+        accept_link(&mut server_service)
+    );
+    let client_link = client_link.unwrap();
+    let client_sender = client_link.send_handle();
+    let server_sender = server_link.send_handle();
+    let (client_channel, server_channel) =
+        tokio::join!(client_sender.open_channel(), server_sender.open_channel());
+    let client_channel = client_channel.unwrap();
+    let mut server_channel = server_channel.unwrap();
+    let client_channel_sender = client_channel.send_handle();
+    let delivered = client_channel_sender.send(
+        ChannelMessage::new(
+            MessageType::new(0x0101).unwrap(),
+            Bytes::from_static(b"relayed channel"),
+        )
+        .unwrap(),
+    );
+    let received = server_channel.receive();
+    let (delivered, received) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(delivered, received)
+    })
+    .await
+    .expect("relayed channel delivery proof timed out");
+    delivered.unwrap();
+    assert!(matches!(
+        received.unwrap(),
+        ChannelReceive::Message(message) if message.body() == b"relayed channel"
+    ));
+    client_link.close().await.unwrap();
+    let _ = server_link.close().await;
+    client_node.shutdown().await;
+    server_node.shutdown().await;
+    relay_node.shutdown().await;
+    client_running.await.unwrap().unwrap();
+    server_running.await.unwrap().unwrap();
+    relay_running.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn tcp_relay_forwards_service_routes_between_interfaces() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (relay_node, relay_task) = NodeBuilder::new(NodeConfig::relay()).build().unwrap();
+    let relay_running = tokio::spawn(relay_task.run());
+    let relay_acceptor = relay_node.clone();
+    let accepting = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            relay_acceptor
+                .attach_interface(
+                    TcpHdlcInterface::new(stream).unwrap(),
+                    InterfaceLimits::new(65_535, 256, 1_048_576).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let server_interface = TcpHdlcInterface::connect(&address.to_string())
+        .await
+        .unwrap();
+    let client_interface = TcpHdlcInterface::connect(&address.to_string())
+        .await
+        .unwrap();
+    let (server_node, server_task) = NodeBuilder::new(NodeConfig::endpoint())
+        .interface(
+            server_interface,
+            InterfaceLimits::new(65_535, 256, 1_048_576).unwrap(),
+        )
+        .build()
+        .unwrap();
+    let (client_node, client_task) = NodeBuilder::new(NodeConfig::endpoint())
+        .interface(
+            client_interface,
+            InterfaceLimits::new(65_535, 256, 1_048_576).unwrap(),
+        )
+        .build()
+        .unwrap();
+    accepting.await.unwrap();
+    let server_running = tokio::spawn(server_task.run());
+    let client_running = tokio::spawn(client_task.run());
+    let mut server_service = service(&server_node, "tcp.relay.server", &[]).await;
+    let mut client_service = service(&client_node, "tcp.relay.client", &[]).await;
+    server_service
+        .announce(Bytes::new(), RatchetAction::Keep)
+        .await
+        .unwrap();
+    loop {
+        if let ServiceEvent::Announce(announce) = client_service.receive().await.unwrap()
+            && announce.destination() == server_service.destination()
+        {
+            break;
+        }
+    }
+    let (client_link, server_link) = tokio::join!(
+        client_node.open_link(server_service.destination()),
+        accept_link(&mut server_service)
+    );
+    let client_link = client_link.unwrap();
+    let client_sender = client_link.send_handle();
+    let server_sender = server_link.send_handle();
+    let (client_channel, server_channel) =
+        tokio::join!(client_sender.open_channel(), server_sender.open_channel());
+    let client_channel = client_channel.unwrap();
+    let mut server_channel = server_channel.unwrap();
+    let client_channel_sender = client_channel.send_handle();
+    let delivered = client_channel_sender.send(
+        ChannelMessage::new(
+            MessageType::new(0x0101).unwrap(),
+            Bytes::from_static(b"tcp relayed channel"),
+        )
+        .unwrap(),
+    );
+    let received = server_channel.receive();
+    let (delivered, received) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(delivered, received)
+    })
+    .await
+    .expect("TCP-relayed channel delivery proof timed out");
+    delivered.unwrap();
+    assert!(matches!(
+        received.unwrap(),
+        ChannelReceive::Message(message) if message.body() == b"tcp relayed channel"
+    ));
+    client_link.close().await.unwrap();
+    let _ = server_link.close().await;
+    client_node.shutdown().await;
+    server_node.shutdown().await;
+    relay_node.shutdown().await;
+    client_running.await.unwrap().unwrap();
+    server_running.await.unwrap().unwrap();
+    relay_running.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn tcp_relay_opens_parallel_links_to_one_service() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (relay_node, relay_task) = NodeBuilder::new(NodeConfig::relay()).build().unwrap();
+    let relay_running = tokio::spawn(relay_task.run());
+    let relay_acceptor = relay_node.clone();
+    let accepting = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            relay_acceptor
+                .attach_interface(
+                    TcpHdlcInterface::new(stream).unwrap(),
+                    InterfaceLimits::new(65_535, 256, 1_048_576).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let server_interface = TcpHdlcInterface::connect(&address.to_string())
+        .await
+        .unwrap();
+    let client_interface = TcpHdlcInterface::connect(&address.to_string())
+        .await
+        .unwrap();
+    let (server_node, server_task) = NodeBuilder::new(NodeConfig::endpoint())
+        .interface(
+            server_interface,
+            InterfaceLimits::new(65_535, 256, 1_048_576).unwrap(),
+        )
+        .build()
+        .unwrap();
+    let (client_node, client_task) = NodeBuilder::new(NodeConfig::endpoint())
+        .interface(
+            client_interface,
+            InterfaceLimits::new(65_535, 256, 1_048_576).unwrap(),
+        )
+        .build()
+        .unwrap();
+    accepting.await.unwrap();
+    let server_running = tokio::spawn(server_task.run());
+    let client_running = tokio::spawn(client_task.run());
+    let mut server_service = service(&server_node, "parallel.server", &[]).await;
+    let mut client_service = service(&client_node, "parallel.client", &[]).await;
+    server_service
+        .announce(Bytes::new(), RatchetAction::Keep)
+        .await
+        .unwrap();
+    loop {
+        if let ServiceEvent::Announce(announce) = client_service.receive().await.unwrap()
+            && announce.destination() == server_service.destination()
+        {
+            break;
+        }
+    }
+    let destination = server_service.destination();
+    let clients = async {
+        futures_util::future::try_join_all((0..8).map(|_| client_node.open_link(destination))).await
+    };
+    let servers = async {
+        let mut links = Vec::new();
+        for _ in 0..8 {
+            links.push(accept_link(&mut server_service).await);
+        }
+        links
+    };
+    let (clients, servers) = tokio::join!(clients, servers);
+    let clients = clients.unwrap();
+    assert_eq!(clients.len(), 8);
+    assert_eq!(servers.len(), 8);
+    let client_channels = futures_util::future::try_join_all(clients.iter().map(|link| {
+        let sender = link.send_handle();
+        async move { sender.open_channel().await }
+    }))
+    .await
+    .unwrap();
+    for (ordinal, channel) in client_channels.iter().enumerate() {
+        channel
+            .send_handle()
+            .send(
+                ChannelMessage::new(
+                    MessageType::new(0x0101).unwrap(),
+                    Bytes::from(vec![ordinal as u8]),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    let mut server_channels = futures_util::future::try_join_all(servers.iter().map(|link| {
+        let sender = link.send_handle();
+        async move { sender.open_channel().await }
+    }))
+    .await
+    .unwrap();
+    for (ordinal, channel) in server_channels.iter_mut().enumerate() {
+        assert!(matches!(
+            channel.receive().await.unwrap(),
+            ChannelReceive::Message(message) if message.body() == [ordinal as u8]
+        ));
+    }
+    client_node.shutdown().await;
+    server_node.shutdown().await;
+    relay_node.shutdown().await;
+    drop(clients);
+    drop(servers);
+    client_running.await.unwrap().unwrap();
+    server_running.await.unwrap().unwrap();
+    relay_running.await.unwrap().unwrap();
 }
 
 #[tokio::test]

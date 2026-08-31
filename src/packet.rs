@@ -1,3 +1,5 @@
+use bytes::Bytes;
+
 pub const ADDR_LEN: usize = 16;
 pub type DestinationAddress = [u8; ADDR_LEN];
 
@@ -55,29 +57,29 @@ pub enum Packet {
         destination: RoutedDestination,
         has_ratchet: bool,
         is_path_response: bool,
-        data: Vec<u8>,
+        data: Bytes,
     },
     Proof {
         hops: u8,
         destination: ProofDestination,
         context: ProofContext,
-        data: Vec<u8>,
+        data: Bytes,
     },
     LinkData {
         hops: u8,
         destination: RoutedDestination,
         context: LinkContext,
-        data: Vec<u8>,
+        data: Bytes,
     },
     LinkRequest {
         hops: u8,
         destination: RoutedDestination,
-        data: Vec<u8>,
+        data: Bytes,
     },
     LinkProof {
         hops: u8,
         destination: RoutedDestination,
-        data: Vec<u8>,
+        data: Bytes,
     },
     PathRequest {
         hops: u8,
@@ -88,12 +90,12 @@ pub enum Packet {
     SingleData {
         hops: u8,
         destination: RoutedDestination,
-        ciphertext: Vec<u8>,
+        ciphertext: Bytes,
     },
     GroupData {
         hops: u8,
         destination: DestinationAddress,
-        ciphertext: Vec<u8>,
+        ciphertext: Bytes,
     },
 }
 
@@ -207,90 +209,13 @@ impl Packet {
         out
     }
 
-    pub fn log_format(&self) -> String {
-        let dest = hex::encode(self.destination_hash());
-        let transport = self
-            .transport_id()
-            .map(|t| format!(" via <{}>", hex::encode(t)))
-            .unwrap_or_default();
-        match self {
-            Packet::Announce {
-                hops,
-                has_ratchet,
-                data,
-                ..
-            } => {
-                format!(
-                    "Announce <{dest}>{transport} hops={hops} ratchet={has_ratchet} len={}",
-                    data.len()
-                )
-            }
-            Packet::Proof {
-                hops,
-                context,
-                data,
-                ..
-            } => {
-                format!(
-                    "Proof to <{dest}> hops={hops} ctx={context:?} len={}",
-                    data.len()
-                )
-            }
-            Packet::LinkData {
-                hops,
-                context,
-                data,
-                ..
-            } => {
-                format!(
-                    "LinkData to <{dest}>{transport} hops={hops} ctx={context:?} len={}",
-                    data.len()
-                )
-            }
-            Packet::LinkRequest { hops, data, .. } => {
-                format!(
-                    "LinkRequest to <{dest}>{transport} hops={hops} len={}",
-                    data.len()
-                )
-            }
-            Packet::LinkProof { hops, data, .. } => {
-                format!(
-                    "LinkProof for <{dest}>{transport} hops={hops} len={}",
-                    data.len()
-                )
-            }
-            Packet::PathRequest {
-                hops,
-                query_destination,
-                ..
-            } => {
-                format!(
-                    "PathRequest for <{}> hops={hops}",
-                    hex::encode(query_destination)
-                )
-            }
-            Packet::SingleData {
-                hops, ciphertext, ..
-            } => {
-                format!(
-                    "SingleData to <{dest}>{transport} hops={hops} len={}",
-                    ciphertext.len()
-                )
-            }
-            Packet::GroupData {
-                hops, ciphertext, ..
-            } => {
-                format!("GroupData to <{dest}> hops={hops} len={}", ciphertext.len())
-            }
-        }
-    }
-
     #[cfg(test)]
     pub fn from_bytes(raw: &[u8]) -> Result<Self, ParseError> {
         Self::from_vec(raw.to_vec())
     }
 
-    pub(crate) fn from_vec(mut raw: Vec<u8>) -> Result<Self, ParseError> {
+    pub(crate) fn from_vec(raw: Vec<u8>) -> Result<Self, ParseError> {
+        let raw = Bytes::from(raw);
         if raw.len() < 4 {
             return Err(ParseError::TooShort);
         }
@@ -326,8 +251,7 @@ impl Packet {
                 2 + ADDR_LEN + 1,
             )
         };
-        raw.drain(..data_offset);
-        let data = raw;
+        let data = raw.slice(data_offset..);
 
         match packet_type {
             PKT_DATA => {
@@ -488,8 +412,7 @@ impl Packet {
             | Packet::LinkProof { destination, .. }
             | Packet::SingleData { destination, .. } => destination.address,
             Packet::Proof { destination, .. } => match destination {
-                ProofDestination::Single(a) => *a,
-                ProofDestination::Link(a) => *a,
+                ProofDestination::Single(a) | ProofDestination::Link(a) => *a,
             },
             Packet::PathRequest { .. } => PATH_REQUEST_DEST,
             Packet::GroupData { destination, .. } => *destination,
@@ -566,22 +489,48 @@ impl Packet {
         }
     }
 
-    pub fn hashable_part(&self) -> Vec<u8> {
-        let bytes = self.to_bytes();
-        let mut hashable = Vec::new();
-        hashable.push(bytes[0] & 0b0000_1111);
-        let skip = if self.transport_id().is_some() {
-            2 + ADDR_LEN
-        } else {
-            2
+    pub(crate) fn link_id(&self) -> Option<[u8; 16]> {
+        let Self::LinkRequest { data, .. } = self else {
+            return None;
         };
-        hashable.extend_from_slice(&bytes[skip..]);
-        hashable
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update([self.header_byte() & 0b0000_1111]);
+        hasher.update(self.destination_hash());
+        hasher.update([self.context_byte()]);
+        hasher.update(&data[..data.len().min(64)]);
+        Some(hasher.finalize()[..16].try_into().unwrap())
     }
 
     pub fn packet_hash(&self) -> [u8; 32] {
-        use crate::crypto::sha256;
-        sha256(&self.hashable_part())
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update([self.header_byte() & 0b0000_1111]);
+        hasher.update(self.destination_hash());
+        hasher.update([self.context_byte()]);
+        match self {
+            Packet::Announce { data, .. }
+            | Packet::Proof { data, .. }
+            | Packet::LinkData { data, .. }
+            | Packet::LinkRequest { data, .. }
+            | Packet::LinkProof { data, .. } => hasher.update(data),
+            Packet::PathRequest {
+                query_destination,
+                requesting_transport,
+                tag,
+                ..
+            } => {
+                hasher.update(query_destination);
+                if let Some(transport) = requesting_transport {
+                    hasher.update(transport);
+                }
+                hasher.update(tag);
+            }
+            Packet::SingleData { ciphertext, .. } | Packet::GroupData { ciphertext, .. } => {
+                hasher.update(ciphertext)
+            }
+        }
+        hasher.finalize().into()
     }
 
     pub fn set_transport_id(&mut self, new_id: DestinationAddress) {
@@ -621,12 +570,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn from_vec_reuses_input_allocation() {
+    fn from_vec_keeps_payload_in_input_allocation() {
         let packet = Packet::LinkData {
             hops: 0,
             destination: RoutedDestination::direct([1; 16]),
             context: LinkContext::Resource,
-            data: vec![2; 1024],
+            data: vec![2; 1024].into(),
         };
         let raw = packet.to_bytes();
         let allocation = raw.as_ptr();
@@ -634,21 +583,18 @@ mod tests {
         let Packet::LinkData { data, .. } = parsed else {
             panic!("expected link data");
         };
-        assert_eq!(data.as_ptr(), allocation);
+        assert_eq!(data.as_ptr(), allocation.wrapping_add(19));
     }
 
     #[test]
     fn spec_example1_type2_transport_single_data_hops4() {
-        // 01010000 00000100 [HASH1, 16 bytes] [HASH2, 16 bytes] [CONTEXT, 1 byte] [DATA]
-        // IFAC=0, HeaderType=1, ContextFlag=0, Propagation=1, Destination=00, PacketType=00
-        // Hops=4
         let hash1 = [1u8; 16];
         let hash2 = [2u8; 16];
         let ciphertext = vec![0xAB, 0xCD];
         let packet = Packet::SingleData {
             hops: 4,
             destination: RoutedDestination::via(hash1, hash2),
-            ciphertext: ciphertext.clone(),
+            ciphertext: ciphertext.clone().into(),
         };
 
         let bytes = packet.to_bytes();
@@ -665,15 +611,12 @@ mod tests {
 
     #[test]
     fn spec_example2_type1_broadcast_single_data_hops7() {
-        // 00000000 00000111 [HASH1, 16 bytes] [CONTEXT, 1 byte] [DATA]
-        // IFAC=0, HeaderType=0, ContextFlag=0, Propagation=0, Destination=00, PacketType=00
-        // Hops=7
         let hash1 = [3u8; 16];
         let ciphertext = vec![0xEF];
         let packet = Packet::SingleData {
             hops: 7,
             destination: RoutedDestination::direct(hash1),
-            ciphertext: ciphertext.clone(),
+            ciphertext: ciphertext.clone().into(),
         };
 
         let bytes = packet.to_bytes();
@@ -693,7 +636,7 @@ mod tests {
             hops: 0,
             destination: RoutedDestination::direct([0u8; 16]),
             context: LinkContext::Keepalive,
-            data: vec![0u8; 1],
+            data: vec![0u8; 1].into(),
         };
         assert_eq!(packet.to_bytes().len(), 20);
 
@@ -710,7 +653,7 @@ mod tests {
             requesting_transport: None,
             tag: [0u8; 16],
         };
-        // 2 (header) + 16 (dest) + 1 (context) + 32 (query_dest + tag) = 51
+
         assert_eq!(packet.to_bytes().len(), 51);
 
         let bytes = packet.to_bytes();
@@ -723,7 +666,7 @@ mod tests {
         let packet = Packet::LinkRequest {
             hops: 0,
             destination: RoutedDestination::via([0u8; 16], [0u8; 16]),
-            data: vec![0u8; 48],
+            data: vec![0u8; 48].into(),
         };
         assert_eq!(packet.to_bytes().len(), 83);
 
@@ -738,7 +681,7 @@ mod tests {
             hops: 0,
             destination: RoutedDestination::via([0u8; 16], [0u8; 16]),
             context: LinkContext::LinkRtt,
-            data: vec![0u8; 64],
+            data: vec![0u8; 64].into(),
         };
         assert_eq!(packet.to_bytes().len(), 99);
 
@@ -752,7 +695,7 @@ mod tests {
         let packet = Packet::LinkProof {
             hops: 0,
             destination: RoutedDestination::via([0u8; 16], [0u8; 16]),
-            data: vec![0u8; 80],
+            data: vec![0u8; 80].into(),
         };
         assert_eq!(packet.to_bytes().len(), 115);
 
@@ -768,7 +711,7 @@ mod tests {
             destination: RoutedDestination::direct([0u8; 16]),
             has_ratchet: false,
             is_path_response: false,
-            data: vec![0u8; 148],
+            data: vec![0u8; 148].into(),
         };
         assert_eq!(packet.to_bytes().len(), 167);
 
@@ -783,7 +726,6 @@ mod tests {
         use ed25519_dalek::SigningKey;
         use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
-        // Create keys
         let enc_prv_bytes: [u8; 32] = core::array::from_fn(|i| i as u8);
         let sig_prv_bytes: [u8; 32] = core::array::from_fn(|i| (i + 32) as u8);
         let enc_secret = StaticSecret::from(enc_prv_bytes);
@@ -791,111 +733,83 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&sig_prv_bytes);
         let expected_signing_pub = signing_key.verifying_key().to_bytes();
 
-        // Create destination hash (name_hash + identity_hash truncated)
         let name_hash: [u8; 10] = [198, 102, 83, 152, 248, 48, 103, 107, 210, 131];
         let random_hash: [u8; 10] = [1, 2, 3, 4, 5, 0, 0, 0, 0, 0];
         let dest_hash: [u8; 16] = [
             85, 145, 28, 204, 77, 65, 140, 130, 169, 25, 222, 45, 116, 198, 106, 149,
         ];
 
-        // Build announce data
         let announce =
             AnnounceBuilder::new(*enc_public.as_bytes(), signing_key, name_hash, random_hash)
                 .build(&dest_hash);
 
-        // Create packet
         let packet = Packet::Announce {
             hops: 0,
             destination: RoutedDestination::direct(dest_hash),
             has_ratchet: false,
             is_path_response: false,
-            data: announce.to_bytes(),
+            data: announce.to_bytes().into(),
         };
 
         let bytes = packet.to_bytes();
 
-        // Verify header byte format:
-        // bit 7: IFAC flag (0)
-        // bit 6: header_type (0 = Type1)
-        // bit 5: context_flag (0 = no ratchet)
-        // bit 4: propagation_type (0 = broadcast)
-        // bits 3-2: destination_type (00 = single)
-        // bits 1-0: packet_type (01 = announce)
         assert_eq!(
             bytes[0], 0b0000_0001,
             "header byte should be 0x01 for announce"
         );
 
-        // Verify hops
         assert_eq!(bytes[1], 0, "hops should be 0");
 
-        // Verify destination hash
         assert_eq!(&bytes[2..18], &dest_hash, "destination hash mismatch");
 
-        // Verify context byte (should be 0x00 for announce)
         assert_eq!(bytes[18], 0x00, "context byte should be 0x00");
 
-        // Verify announce data starts at byte 19
         let announce_data = &bytes[19..];
 
-        // First 32 bytes should be encryption public key
         assert_eq!(
             &announce_data[..32],
             enc_public.as_bytes(),
             "encryption key mismatch"
         );
 
-        // Next 32 bytes should be signing public key
         assert_eq!(
             &announce_data[32..64],
             &expected_signing_pub,
             "signing key mismatch"
         );
 
-        // Next 10 bytes should be name_hash
         assert_eq!(&announce_data[64..74], &name_hash, "name_hash mismatch");
 
-        // Next 10 bytes should be random_hash
         assert_eq!(&announce_data[74..84], &random_hash, "random_hash mismatch");
 
-        // Next 64 bytes should be signature
         assert_eq!(
             announce_data.len(),
             64 + 10 + 10 + SIGNATURE_LEN,
             "total announce data length mismatch"
         );
 
-        // Verify the packet can be parsed back
         let parsed = Packet::from_bytes(&bytes).unwrap();
         assert_eq!(parsed, packet);
 
-        // Verify announce data can be parsed
         let parsed_announce = AnnounceData::parse(&announce.to_bytes(), false).unwrap();
         assert_eq!(parsed_announce.encryption_key, enc_public);
         parsed_announce.verify(&dest_hash).unwrap();
 
-        // Verify packet.data (bytes[19:]) matches announce_data.to_bytes()
-        // This is exactly what Python's unpack() does: self.data = self.raw[DST_LEN+3:]
-        // where DST_LEN = 16, so data starts at byte 19
-        let packet_data_start = 19; // 2 (header) + 16 (dest) + 1 (context)
+        let packet_data_start = 19;
         assert_eq!(
             &bytes[packet_data_start..],
             &announce.to_bytes()[..],
             "packet data should match announce bytes"
         );
 
-        // Verify total packet size matches Python expectations
-        // Header (2) + dest_hash (16) + context (1) + announce_data (148) = 167
         assert_eq!(bytes.len(), 167, "total packet size");
 
-        // Verify that data portion is exactly 148 bytes (the announce data)
         assert_eq!(
             bytes.len() - packet_data_start,
             148,
             "announce data should be 148 bytes"
         );
 
-        // Print debug info for manual verification
         eprintln!("=== ANNOUNCE PACKET DEBUG ===");
         eprintln!("Total length: {} bytes", bytes.len());
         eprintln!("Header byte: 0x{:02x} (expect 0x01)", bytes[0]);

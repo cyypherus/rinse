@@ -10,9 +10,6 @@ use crate::packet::DestinationAddress;
 
 pub type LinkId = [u8; 16];
 
-// Link Request: 83 bytes on wire
-// Header Type 2, destination + transport_id addresses
-// Data: encryption_public (32) + signing_public (32) = 64 bytes
 pub(crate) struct LinkRequest {
     pub encryption_public: X25519Public,
     pub signing_public: [u8; 32],
@@ -44,23 +41,8 @@ impl LinkRequest {
             signing_public,
         })
     }
-
-    pub fn link_id_from_packet(hashable_part: &[u8], data_len: usize) -> LinkId {
-        const ECPUBSIZE: usize = 64;
-        let truncated = if data_len > ECPUBSIZE {
-            let diff = data_len - ECPUBSIZE;
-            &hashable_part[..hashable_part.len() - diff]
-        } else {
-            hashable_part
-        };
-        sha256(truncated)[..16].try_into().unwrap()
-    }
 }
 
-// Link Proof: 115 bytes on wire
-// Header Type 2, link_id + transport_id addresses
-// Context: LinkProof (0xFD)
-// Data: signature (64) + encryption_public (32) + signalling_bytes (3) = 99 bytes
 pub(crate) struct LinkProof {
     pub encryption_public: X25519Public,
     pub signalling_bytes: [u8; 3],
@@ -73,10 +55,7 @@ impl LinkProof {
         responder_encryption_public: &X25519Public,
         responder_signing_key: &SigningKey,
     ) -> Self {
-        // signed_data = link_id + pub_bytes + sig_pub_bytes + signalling_bytes
-        // signalling_value = (mtu & 0x1FFFFF) + (((mode << 5) & 0xE0) << 16)
-        // MTU=500, mode=1 (AES_256_CBC) -> 0x2001F4 -> [0x20, 0x01, 0xF4]
-        let signalling_bytes = [0x20, 0x01, 0xF4]; // MTU=500, mode=1 (AES_256_CBC)
+        let signalling_bytes = [0x20, 0x01, 0xF4];
         let mut sign_data = Vec::with_capacity(83);
         sign_data.extend_from_slice(link_id);
         sign_data.extend_from_slice(responder_encryption_public.as_bytes());
@@ -91,7 +70,6 @@ impl LinkProof {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        // proof_data = signature + pub_bytes + signalling_bytes
         let mut out = Vec::with_capacity(99);
         out.extend_from_slice(&self.signature.to_bytes());
         out.extend_from_slice(self.encryption_public.as_bytes());
@@ -100,7 +78,6 @@ impl LinkProof {
     }
 
     pub fn parse(data: &[u8]) -> Option<Self> {
-        // proof_data = signature (64) + pub_bytes (32) + signalling_bytes (3)
         if data.len() < 99 {
             return None;
         }
@@ -115,7 +92,6 @@ impl LinkProof {
     }
 
     pub fn verify(&self, link_id: &LinkId, responder_signing_key: &VerifyingKey) -> bool {
-        // signed_data = link_id + pub_bytes + sig_pub_bytes + signalling_bytes
         let mut sign_data = Vec::with_capacity(83);
         sign_data.extend_from_slice(link_id);
         sign_data.extend_from_slice(self.encryption_public.as_bytes());
@@ -224,12 +200,6 @@ pub(crate) struct LinkResponder<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LinkState {
-    ResponderHandshake { local_service: ServiceId },
-    Active { rtt: TimeSpan, role: ActiveLinkRole },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveLinkRole {
     Initiator { local_service: Option<ServiceId> },
     Responder { local_service: ServiceId },
@@ -243,7 +213,8 @@ pub(crate) enum LocalIdentityState {
 
 pub(crate) struct EstablishedLink {
     pub destination: DestinationAddress,
-    state: LinkState,
+    pub(crate) rtt: TimeSpan,
+    role: ActiveLinkRole,
     pub last_inbound: MonoTime,
     pub last_outbound: MonoTime,
     pub last_keepalive_sent: Option<MonoTime>,
@@ -277,11 +248,9 @@ impl EstablishedLink {
         let rtt_ms = now.duration_since(pending.request_time).as_millis() as u64;
         Self {
             destination: pending.destination,
-            state: LinkState::Active {
-                rtt: TimeSpan::from_millis(rtt_ms),
-                role: ActiveLinkRole::Initiator {
-                    local_service: pending.local_service,
-                },
+            rtt: TimeSpan::from_millis(rtt_ms),
+            role: ActiveLinkRole::Initiator {
+                local_service: pending.local_service,
             },
             last_inbound: now,
             last_outbound: now,
@@ -313,7 +282,8 @@ impl EstablishedLink {
         let keys = LinkEncryption::derive_keys(&shared_key, &link_id);
         Self {
             destination: responder.destination,
-            state: LinkState::ResponderHandshake {
+            rtt: TimeSpan::from_millis(0),
+            role: ActiveLinkRole::Responder {
                 local_service: responder.service,
             },
             last_inbound: now,
@@ -339,72 +309,20 @@ impl EstablishedLink {
         LinkEncryption::decrypt(&self.keys, ciphertext)
     }
 
-    pub(crate) fn touch_inbound(&mut self, now: MonoTime) {
-        self.last_inbound = now;
-    }
-
-    pub(crate) fn touch_outbound(&mut self, now: MonoTime) {
-        self.last_outbound = now;
-    }
-
-    pub(crate) fn activate(&mut self, rtt_ms: u64) {
-        let role = match self.state {
-            LinkState::ResponderHandshake { local_service } => {
-                ActiveLinkRole::Responder { local_service }
-            }
-            LinkState::Active { role, .. } => role,
-        };
-        self.state = LinkState::Active {
-            rtt: TimeSpan::from_millis(rtt_ms),
-            role,
-        };
-    }
-
-    pub(crate) fn rtt(&self) -> Option<TimeSpan> {
-        match self.state {
-            LinkState::ResponderHandshake { .. } => None,
-            LinkState::Active { rtt, .. } => Some(rtt),
-        }
-    }
-
-    pub(crate) fn is_active(&self) -> bool {
-        matches!(self.state, LinkState::Active { .. })
-    }
-
     pub(crate) fn is_initiator(&self) -> bool {
-        matches!(
-            self.state,
-            LinkState::Active {
-                role: ActiveLinkRole::Initiator { .. },
-                ..
-            }
-        )
+        matches!(self.role, ActiveLinkRole::Initiator { .. })
     }
 
     pub(crate) fn local_service(&self) -> Option<ServiceId> {
-        match self.state {
-            LinkState::ResponderHandshake { local_service }
-            | LinkState::Active {
-                role: ActiveLinkRole::Responder { local_service },
-                ..
-            } => Some(local_service),
-            LinkState::Active {
-                role: ActiveLinkRole::Initiator { local_service },
-                ..
-            } => local_service,
+        match self.role {
+            ActiveLinkRole::Responder { local_service } => Some(local_service),
+            ActiveLinkRole::Initiator { local_service } => local_service,
         }
     }
 
     pub(crate) fn keepalive_interval_secs(&self) -> u64 {
-        if let Some(rtt) = self.rtt() {
-            let rtt_ms = rtt.as_millis() as u64;
-            // rtt * (KEEPALIVE_MAX / KEEPALIVE_MAX_RTT) where KEEPALIVE_MAX_RTT = 1.75s = 1750ms
-            // = rtt_ms * 360 / 1750
-            let scaled = (rtt_ms * KEEPALIVE_MAX_SECS) / 1750;
-            scaled.clamp(KEEPALIVE_MIN_SECS, KEEPALIVE_MAX_SECS)
-        } else {
-            KEEPALIVE_MAX_SECS
-        }
+        let scaled = (self.rtt.as_millis() as u64 * KEEPALIVE_MAX_SECS) / 1750;
+        scaled.clamp(KEEPALIVE_MIN_SECS, KEEPALIVE_MAX_SECS)
     }
 
     pub(crate) fn stale_time_secs(&self) -> u64 {
@@ -552,9 +470,9 @@ mod tests {
         let packet = Packet::LinkRequest {
             hops: 0,
             destination: RoutedDestination::direct(dest),
-            data: request_data.clone(),
+            data: request_data.clone().into(),
         };
-        let link_id = LinkRequest::link_id_from_packet(&packet.hashable_part(), request_data.len());
+        let link_id = packet.link_id().unwrap();
 
         let responder_enc = EphemeralKeyPair::generate(&mut rng);
         let responder_sig = SigningKey::generate(&mut rng);
@@ -603,16 +521,15 @@ mod tests {
 
     #[test]
     fn rtt_encode_decode_roundtrip() {
-        let rtt = 0.05; // 50ms
+        let rtt = 0.05;
         let encoded = super::encode_rtt(rtt);
-        assert_eq!(encoded[0], 0xcb); // msgpack float64
+        assert_eq!(encoded[0], 0xcb);
         let decoded = super::decode_rtt(&encoded).unwrap();
         assert!((decoded - rtt).abs() < 1e-10);
     }
 
     #[test]
     fn rtt_decode_float32() {
-        // msgpack float32: 0xca + big-endian f32
         let rtt: f32 = 0.025;
         let mut data = vec![0xca];
         data.extend_from_slice(&rtt.to_be_bytes());
@@ -647,8 +564,7 @@ mod tests {
         let link =
             EstablishedLink::from_initiator(pending, &responder_keypair.public, 0, proof_time);
 
-        assert!(link.rtt().is_some());
-        assert!(link.rtt().unwrap() >= TimeSpan::from_millis(10));
+        assert!(link.rtt >= TimeSpan::from_millis(10));
     }
 
     #[test]
@@ -675,19 +591,15 @@ mod tests {
 
         let mut link = EstablishedLink::from_initiator(pending, &responder_keypair.public, 0, now);
 
-        // With no/zero RTT, should use max keepalive
-        link.activate(0);
+        link.rtt = TimeSpan::from_millis(0);
         assert_eq!(link.keepalive_interval_secs(), KEEPALIVE_MIN_SECS);
 
-        // With 1750ms RTT (KEEPALIVE_MAX_RTT), should use max keepalive
-        link.activate(1750);
+        link.rtt = TimeSpan::from_millis(1750);
         assert_eq!(link.keepalive_interval_secs(), KEEPALIVE_MAX_SECS);
 
-        // With 875ms RTT (half of max), should use ~180s (half of max)
-        link.activate(875);
+        link.rtt = TimeSpan::from_millis(875);
         assert_eq!(link.keepalive_interval_secs(), 180);
 
-        // Stale time is 2x keepalive
         assert_eq!(link.stale_time_secs(), 360);
     }
 }

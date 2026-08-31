@@ -1,8 +1,6 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
-use crate::PageState;
+use crate::SharedState;
 use rinse::IdentityHash;
+use std::collections::HashMap;
 
 const INDEX_TEMPLATE: &str = include_str!("templates/index.mu");
 const GUESTBOOK_TEMPLATE: &str = include_str!("templates/guestbook.mu");
@@ -18,7 +16,7 @@ fn render(template: &str, vars: &[(&str, &str)]) -> String {
 }
 
 pub fn index(
-    state: &Arc<Mutex<PageState>>,
+    state: &SharedState,
     name: &str,
     form_data: &HashMap<String, String>,
     remote_identity: Option<IdentityHash>,
@@ -35,14 +33,17 @@ pub fn index(
         .get("field_username")
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.as_str())
-        .or_else(|| state.get_username(remote_identity))
+        .or_else(|| {
+            remote_identity
+                .and_then(|identity| state.known_users.get(&identity).map(String::as_str))
+        })
         .unwrap_or("Anonymous");
 
     render(INDEX_TEMPLATE, &[("name", name), ("username", username)])
 }
 
 pub fn guestbook(
-    state: &Arc<Mutex<PageState>>,
+    state: &SharedState,
     form_data: &HashMap<String, String>,
     remote_identity: Option<IdentityHash>,
 ) -> String {
@@ -55,7 +56,9 @@ pub fn guestbook(
             .get("field_author")
             .cloned()
             .filter(|s| !s.trim().is_empty())
-            .or_else(|| state.get_username(remote_identity).map(|s| s.to_string()))
+            .or_else(|| {
+                remote_identity.and_then(|identity| state.known_users.get(&identity).cloned())
+            })
             .unwrap_or_else(|| {
                 remote_identity
                     .map(|id| format!("<{}>", &hex::encode(id.as_bytes())[..8]))

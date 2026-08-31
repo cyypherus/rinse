@@ -119,12 +119,6 @@ impl EphemeralKeyPair {
 pub struct SingleDestEncryption;
 
 impl SingleDestEncryption {
-    // "When the packet is sent to a single destination type, Reticulum will automatically
-    // create an ephemeral encryption key, perform an ECDH key exchange with the destination's
-    // public key (or ratchet key, if available), and encrypt the information."
-    //
-    // "The public part of the newly generated ephemeral key-pair is included with the
-    // encrypted token, and sent along with the encrypted payload data in the packet."
     pub fn encrypt<R: RngCore>(
         rng: &mut R,
         dest_public: &X25519Public,
@@ -143,8 +137,6 @@ impl SingleDestEncryption {
         (ephemeral.public, ciphertext)
     }
 
-    // "When the destination receives the packet, it can itself perform an ECDH key exchange
-    // and decrypt the packet."
     pub fn decrypt(
         dest_secret: &StaticSecret,
         sender_ephemeral_public: &X25519Public,
@@ -259,10 +251,6 @@ mod tests {
         StdRng::seed_from_u64(12345)
     }
 
-    // "A packet is always created with an associated destination and some payload data.
-    // When the packet is sent to a single destination type, Reticulum will automatically
-    // create an ephemeral encryption key, perform an ECDH key exchange with the destination's
-    // public key, and encrypt the information."
     #[test]
     fn single_destination_ecdh_encrypts_payload() {
         let mut rng = test_rng();
@@ -276,8 +264,6 @@ mod tests {
         assert!(!ephemeral_pub.as_bytes().iter().all(|&b| b == 0));
     }
 
-    // "The public part of the newly generated ephemeral key-pair is included with the
-    // encrypted token, and sent along with the encrypted payload data in the packet."
     #[test]
     fn ephemeral_public_key_included_in_packet() {
         let mut rng = test_rng();
@@ -290,7 +276,6 @@ mod tests {
         assert_eq!(ephemeral_pub.as_bytes().len(), 32);
     }
 
-    // "A new ephemeral key is used for every packet sent in this way."
     #[test]
     fn new_ephemeral_key_per_packet() {
         let mut rng = test_rng();
@@ -305,8 +290,6 @@ mod tests {
         assert_ne!(ephemeral1.as_bytes(), ephemeral2.as_bytes());
     }
 
-    // "When the destination receives the packet, it can itself perform an ECDH key exchange
-    // and decrypt the packet."
     #[test]
     fn destination_decrypts_with_ecdh() {
         let mut rng = test_rng();
@@ -416,7 +399,6 @@ mod tests {
 
     #[test]
     fn hkdf_output_deterministic() {
-        // Test that HKDF produces consistent output
         let shared_key =
             hex::decode("19c245e0302f723aed3abfdefc08e962b70d6eb97c1f4f4ae63bc8374c44fe40")
                 .unwrap();
@@ -429,11 +411,9 @@ mod tests {
 
         let keys = LinkEncryption::derive_keys(&shared_arr, &link_arr);
 
-        // These are the values we computed - just verify they're stable
         println!("signing_key: {}", hex::encode(keys.signing_key));
         println!("encryption_key: {}", hex::encode(keys.encryption_key));
 
-        // The output should be deterministic
         let keys2 = LinkEncryption::derive_keys(&shared_arr, &link_arr);
         assert_eq!(keys.signing_key, keys2.signing_key);
         assert_eq!(keys.encryption_key, keys2.encryption_key);

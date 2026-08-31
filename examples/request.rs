@@ -2,9 +2,7 @@ mod common;
 
 use bytes::Bytes;
 use rinse::config::{Config, InterfaceConfig, load_or_create_persistent_identity};
-use rinse::{
-    Destination, InterfaceLimits, NodeBuilder, NodeConfig, RequestPath, ServiceConfig, ServiceName,
-};
+use rinse::{Destination, RequestPath, ServiceConfig, ServiceName};
 
 #[tokio::main]
 async fn main() {
@@ -31,12 +29,7 @@ async fn main() {
                 std::process::exit(1);
             }),
     );
-    let mode = if config.network.relay {
-        NodeConfig::relay()
-    } else {
-        NodeConfig::endpoint()
-    };
-    let mut builder = NodeBuilder::new(mode);
+    let mut builder = common::node_builder(config.network.relay);
     for (name, interface) in config.enabled_interfaces() {
         if let InterfaceConfig::TCPClientInterface {
             target_host,
@@ -47,7 +40,7 @@ async fn main() {
             let address = format!("{target_host}:{target_port}");
             match common::TcpHdlc::connect(&address).await {
                 Ok(interface) => {
-                    builder = builder.interface(interface, interface_limits());
+                    builder = builder.interface(interface, common::interface_limits());
                     log::info!("[{name}] connected to {address}");
                 }
                 Err(error) => log::warn!("[{name}] failed to connect to {address}: {error}"),
@@ -92,10 +85,6 @@ async fn main() {
     }
     node.shutdown().await;
     running.await.unwrap().unwrap();
-}
-
-fn interface_limits() -> InterfaceLimits {
-    InterfaceLimits::new(65_535, 256, 1_048_576).unwrap()
 }
 
 fn usage() -> ! {

@@ -20,14 +20,17 @@ impl PacketHashlist {
     }
 
     pub(crate) fn insert(&mut self, hash: [u8; 32]) -> bool {
-        if self.members.contains(&hash) {
-            return false;
+        if self.order.len() < self.limit {
+            if !self.members.insert(hash) {
+                return false;
+            }
+        } else {
+            if self.members.contains(&hash) {
+                return false;
+            }
+            self.members.remove(&self.order.pop_front().unwrap());
+            self.members.insert(hash);
         }
-        if self.order.len() == self.limit {
-            let oldest = self.order.pop_front().unwrap();
-            self.members.remove(&oldest);
-        }
-        self.members.insert(hash);
         self.order.push_back(hash);
         true
     }

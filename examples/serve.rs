@@ -7,10 +7,12 @@ use std::sync::Arc;
 use bytes::Bytes;
 use rinse::config::{Config, InterfaceConfig, load_or_create_persistent_identity};
 use rinse::{
-    IncomingRequest, InterfaceLimits, Link, LinkEvent, NodeBuilder, NodeConfig, NodeHandle,
-    RatchetAction, RequestPath, Service, ServiceConfig, ServiceEvent, ServiceName,
+    IncomingRequest, Link, LinkEvent, NodeHandle, RatchetAction, RequestPath, Service,
+    ServiceConfig, ServiceEvent, ServiceName,
 };
 use tokio::net::TcpListener;
+
+type Files = Arc<HashMap<String, Vec<u8>>>;
 
 fn load_directory(base: &Path, current: &Path, files: &mut HashMap<String, Vec<u8>>) {
     let Ok(entries) = std::fs::read_dir(current) else {
@@ -62,12 +64,7 @@ async fn main() {
         .map(|path| RequestPath::new(path.clone()).unwrap())
         .collect();
     let files = Arc::new(files);
-    let mode = if config.network.relay {
-        NodeConfig::relay()
-    } else {
-        NodeConfig::endpoint()
-    };
-    let mut builder = NodeBuilder::new(mode);
+    let mut builder = common::node_builder(config.network.relay);
     let mut listeners = Vec::new();
     for (name, interface) in config.enabled_interfaces() {
         match interface {
@@ -79,7 +76,7 @@ async fn main() {
                 let address = format!("{target_host}:{target_port}");
                 match common::TcpHdlc::connect(&address).await {
                     Ok(interface) => {
-                        builder = builder.interface(interface, interface_limits());
+                        builder = builder.interface(interface, common::interface_limits());
                         log::info!("[{name}] connected to {address}");
                     }
                     Err(error) => log::warn!("[{name}] failed to connect to {address}: {error}"),
@@ -133,7 +130,7 @@ async fn accept_connections(listener: TcpListener, node: NodeHandle) {
             continue;
         };
         if node
-            .attach_interface(interface, interface_limits())
+            .attach_interface(interface, common::interface_limits())
             .await
             .is_err()
         {
@@ -142,7 +139,7 @@ async fn accept_connections(listener: TcpListener, node: NodeHandle) {
     }
 }
 
-async fn serve(mut service: Service, files: Arc<HashMap<String, Vec<u8>>>) {
+async fn serve(mut service: Service, files: Files) {
     let mut announcements = tokio::time::interval(std::time::Duration::from_secs(60));
     loop {
         tokio::select! {
@@ -164,7 +161,7 @@ async fn serve(mut service: Service, files: Arc<HashMap<String, Vec<u8>>>) {
     }
 }
 
-async fn serve_link(mut link: Link, files: Arc<HashMap<String, Vec<u8>>>) {
+async fn serve_link(mut link: Link, files: Files) {
     while let Ok(event) = link.receive().await {
         if let LinkEvent::Request(request) = event {
             respond(request, &files).await;
@@ -180,8 +177,4 @@ async fn respond(request: IncomingRequest, files: &HashMap<String, Vec<u8>>) {
     if let Err(error) = request.respond(Bytes::from(body)).await {
         log::warn!("response failed: {error:?}");
     }
-}
-
-fn interface_limits() -> InterfaceLimits {
-    InterfaceLimits::new(65_535, 256, 1_048_576).unwrap()
 }

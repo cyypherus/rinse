@@ -4,37 +4,20 @@ use bytes::Bytes;
 
 use crate::identity::PrivateIdentity;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Destination([u8; 16]);
+macro_rules! fixed_hash {
+    ($($name:ident),+) => {$(
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name([u8; 16]);
 
-impl Destination {
-    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
-        Self(bytes)
-    }
-
-    pub const fn as_bytes(&self) -> &[u8; 16] {
-        &self.0
-    }
-
-    pub const fn into_bytes(self) -> [u8; 16] {
-        self.0
-    }
+        impl $name {
+            pub const fn from_bytes(bytes: [u8; 16]) -> Self { Self(bytes) }
+            pub const fn as_bytes(&self) -> &[u8; 16] { &self.0 }
+            pub const fn into_bytes(self) -> [u8; 16] { self.0 }
+        }
+    )+};
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct IdentityHash([u8; 16]);
-
-impl IdentityHash {
-    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
-        Self(bytes)
-    }
-    pub const fn as_bytes(&self) -> &[u8; 16] {
-        &self.0
-    }
-    pub const fn into_bytes(self) -> [u8; 16] {
-        self.0
-    }
-}
+fixed_hash!(Destination, IdentityHash);
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ServiceName(String);
