@@ -12,6 +12,8 @@ config = ["dep:toml"]
 relay = ["tcp", "config", "dep:env_logger", "dep:serde_json", "dep:simplelog", "dep:ratatui", "dep:crossterm", "tokio/fs", "tokio/macros", "tokio/rt-multi-thread", "tokio/signal"]
 
 [dependencies]
+aws-lc-rs = { version = "1.16.3", default-features = false, features = ["alloc", "non-fips"] }
+curve25519-dalek = "4.1.3"
 aes = "0.8.4"
 async-channel = { version = "2.5.0", default-features = false, features = ["std"] }
 cbc = { version = "0.1.2", features = ["alloc"] }
@@ -73,5 +75,6 @@ name = "throughput"
 harness = false
 
 [dev-dependencies]
+criterion = { version = "0.8", features = ["async_tokio"] }
 env_logger = "0.11"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "test-util", "time"] }

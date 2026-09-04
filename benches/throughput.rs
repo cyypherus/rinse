@@ -1,34 +1,31 @@
-use std::collections::VecDeque;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use rand::{RngCore, SeedableRng};
+use bytes::Bytes;
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rinse::{
     InboundPacket, Interface, InterfaceError, InterfaceLimits, NodeBuilder, NodeConfig,
-    OutboundPacket,
+    OutboundPacket, PrivateIdentity, RatchetAction, ServiceConfig, ServiceEvent, ServiceName,
 };
 
-struct BurstInterface {
-    packets: Mutex<VecDeque<Vec<u8>>>,
-    received: Arc<AtomicUsize>,
+struct MemoryInterface {
+    inbound: async_channel::Receiver<Vec<u8>>,
+    outbound: async_channel::Sender<Vec<u8>>,
 }
 
-impl Interface for BurstInterface {
+impl Interface for MemoryInterface {
     async fn receive(&self) -> Result<InboundPacket, InterfaceError> {
-        let packet = self.packets.lock().unwrap().pop_front();
-        match packet {
-            Some(bytes) => {
-                self.received.fetch_add(1, Ordering::Release);
-                Ok(InboundPacket::new(bytes))
-            }
-            None => std::future::pending().await,
-        }
+        self.inbound
+            .recv()
+            .await
+            .map(InboundPacket::new)
+            .map_err(|_| InterfaceError::Closed)
     }
 
-    async fn send(&self, _: OutboundPacket) -> Result<(), InterfaceError> {
-        Ok(())
+    async fn send(&self, packet: OutboundPacket) -> Result<(), InterfaceError> {
+        self.outbound
+            .send(packet.into_bytes())
+            .await
+            .map_err(|_| InterfaceError::Closed)
     }
 
     async fn close(&self) -> Result<(), InterfaceError> {
@@ -36,55 +33,141 @@ impl Interface for BurstInterface {
     }
 }
 
-async fn sample() -> f64 {
-    let packets = 250_000;
-    let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(0x5eed);
-    let mut inbound = VecDeque::with_capacity(packets);
-    for _ in 0..packets {
-        let payload_len = match rng.next_u32() % 100 {
-            0..=59 => 32 + rng.next_u32() as usize % 225,
-            60..=89 => 257 + rng.next_u32() as usize % 768,
-            _ => 1025 + rng.next_u32() as usize % 3072,
-        };
-        let mut raw = Vec::with_capacity(payload_len + 19);
-        raw.extend_from_slice(&[0x0c, (rng.next_u32() % 2) as u8]);
-        let mut destination = [0; 16];
-        rng.fill_bytes(&mut destination);
-        raw.extend_from_slice(&destination);
-        raw.push(1);
-        raw.resize(payload_len + 19, 0);
-        rng.fill_bytes(&mut raw[19..]);
-        inbound.push_back(raw);
-    }
-    let received = Arc::new(AtomicUsize::new(0));
-    let builder = NodeBuilder::new(NodeConfig::endpoint()).interface(
-        BurstInterface {
-            packets: Mutex::new(inbound),
-            received: received.clone(),
+fn interfaces() -> (MemoryInterface, MemoryInterface) {
+    let (left, left_inbound) = async_channel::unbounded();
+    let (right, right_inbound) = async_channel::unbounded();
+    (
+        MemoryInterface {
+            inbound: left_inbound,
+            outbound: right,
         },
-        InterfaceLimits::new(4115, 256, 1_048_576).unwrap(),
-    );
-    let (node, task) = builder.build().unwrap();
-    let started = Instant::now();
-    let runtime = tokio::spawn(task.run());
-    while received.load(Ordering::Acquire) != packets {
-        tokio::task::yield_now().await;
-    }
-    node.shutdown().await;
-    runtime.await.unwrap().unwrap();
-    let elapsed = started.elapsed();
-    packets as f64 / elapsed.as_secs_f64()
+        MemoryInterface {
+            inbound: right_inbound,
+            outbound: left,
+        },
+    )
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() {
-    let mut samples = Vec::with_capacity(7);
-    for _ in 0..7 {
-        samples.push(sample().await);
-    }
-    samples.sort_unstable_by(f64::total_cmp);
-    println!(
-        "inbound_serial random_seed=0x5eed packets=250000 samples=7 min={:.0} median={:.0} max={:.0} packets/s",
-        samples[0], samples[3], samples[6]
+fn node(interface: MemoryInterface) -> (rinse::NodeHandle, rinse::NodeTask) {
+    NodeBuilder::new(NodeConfig::endpoint())
+        .interface(
+            interface,
+            InterfaceLimits::new(65_535, 256, 1_048_576).unwrap(),
+        )
+        .build()
+        .unwrap()
+}
+
+fn throughput(criterion: &mut Criterion) {
+    datagram_throughput(
+        criterion,
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap(),
+        "single_thread",
+    );
+    datagram_throughput(
+        criterion,
+        tokio::runtime::Runtime::new().unwrap(),
+        "runtime",
     );
 }
+
+fn datagram_throughput(criterion: &mut Criterion, runtime: tokio::runtime::Runtime, name: &str) {
+    let (client_interface, server_interface) = interfaces();
+    let (client_node, client_task) = node(client_interface);
+    let (server_node, server_task) = node(server_interface);
+    let client_running = runtime.spawn(client_task.run());
+    let server_running = runtime.spawn(server_task.run());
+    let (client_service, mut server_service) = runtime.block_on(async {
+        let mut client_service = client_node
+            .register_service(
+                ServiceConfig::new(
+                    ServiceName::new("benchmark.client").unwrap(),
+                    PrivateIdentity::from_secret_bytes([1; 64]).unwrap(),
+                    [],
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let server_service = server_node
+            .register_service(
+                ServiceConfig::new(
+                    ServiceName::new("benchmark.server").unwrap(),
+                    PrivateIdentity::from_secret_bytes([2; 64]).unwrap(),
+                    [],
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        server_service
+            .announce(Bytes::new(), RatchetAction::Keep)
+            .await
+            .unwrap();
+        loop {
+            if matches!(
+                client_service.receive().await.unwrap(),
+                ServiceEvent::Announce(_)
+            ) {
+                break;
+            }
+        }
+        (client_service, server_service)
+    });
+    let destination = server_service.destination();
+    let (inflight, delivered) = async_channel::bounded(32);
+    let mut group = criterion.benchmark_group(name);
+    group.throughput(Throughput::Elements(1));
+    for size in [9, 256, rinse::NodeHandle::MAX_DATAGRAM_BYTES] {
+        let body = Bytes::from(vec![0x42; size]);
+        group.bench_with_input(
+            BenchmarkId::new("datagram_stream_end_to_end", size),
+            &body,
+            |bencher, body| {
+                bencher.iter_custom(|packets| {
+                    runtime.block_on(async {
+                        let started = Instant::now();
+                        tokio::join!(
+                            async {
+                                for _ in 0..packets {
+                                    inflight.send(()).await.unwrap();
+                                    client_node.send(destination, body.clone()).await.unwrap();
+                                }
+                            },
+                            async {
+                                let mut received = 0;
+                                while received < packets {
+                                    if matches!(
+                                        server_service.receive().await.unwrap(),
+                                        ServiceEvent::Datagram(_)
+                                    ) {
+                                        delivered.recv().await.unwrap();
+                                        received += 1;
+                                    }
+                                }
+                            }
+                        );
+                        started.elapsed()
+                    })
+                });
+            },
+        );
+    }
+    group.finish();
+    runtime.block_on(async {
+        drop(client_service);
+        drop(server_service);
+        client_node.shutdown().await;
+        server_node.shutdown().await;
+        client_running.await.unwrap().unwrap();
+        server_running.await.unwrap().unwrap();
+    });
+}
+
+criterion_group!(benches, throughput);
+criterion_main!(benches);

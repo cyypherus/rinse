@@ -4,13 +4,13 @@ use bytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::{Rng, RngCore};
 use sha2::{Digest, Sha256};
-use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
+use x25519_dalek::PublicKey as X25519Public;
 
 use crate::ServiceEvent;
 use crate::announce::{AnnounceBuilder, AnnounceData};
 use crate::api::ServiceId;
 use crate::channel::{ChannelMessage, QueueChannelError};
-use crate::crypto::{EphemeralKeyPair, sha256};
+use crate::crypto::{EphemeralKeyPair, X25519Key, sha256};
 use crate::runtime::{NodeOwner, ReceiveQueue};
 use crate::{MonoTime, NodeError, TimeSpan};
 
@@ -91,10 +91,10 @@ mod tests {
 pub(crate) struct ServiceState {
     address: DestinationAddress,
     name_hash: [u8; 10],
-    encryption_secret: StaticSecret,
+    encryption_secret: X25519Key,
     signing_key: SigningKey,
     registered_paths: HashMap<PathHash, String>,
-    pub(crate) ratchets: Vec<StaticSecret>,
+    pub(crate) ratchets: Vec<X25519Key>,
     pub(crate) events: ReceiveQueue<ServiceEvent, NodeError>,
 }
 
@@ -102,16 +102,8 @@ impl ServiceState {
     fn decrypt(&self, ephemeral: &X25519Public, ciphertext: &[u8]) -> Option<Vec<u8>> {
         self.ratchets
             .iter()
-            .find_map(|ratchet| {
-                crate::crypto::SingleDestEncryption::decrypt(ratchet, ephemeral, ciphertext)
-            })
-            .or_else(|| {
-                crate::crypto::SingleDestEncryption::decrypt(
-                    &self.encryption_secret,
-                    ephemeral,
-                    ciphertext,
-                )
-            })
+            .find_map(|ratchet| ratchet.decrypt(ephemeral, ciphertext))
+            .or_else(|| self.encryption_secret.decrypt(ephemeral, ciphertext))
     }
 }
 
@@ -254,7 +246,7 @@ struct PreparedResponseResource {
 pub(crate) struct PreparedAnnouncement {
     pub(crate) outbounds: Vec<ProtocolOutbound>,
     service: ServiceId,
-    ratchets: Option<Vec<StaticSecret>>,
+    ratchets: Option<Vec<X25519Key>>,
     restart_ratchet: Option<crate::RatchetSecret>,
 }
 
@@ -532,7 +524,7 @@ impl NodeOwner {
     ) -> ServiceId {
         let name_hash: [u8; 10] = sha256(name.as_bytes())[..10].try_into().unwrap();
 
-        let encryption_secret = StaticSecret::from(*identity.encryption_secret.as_bytes());
+        let encryption_secret = X25519Key::from_bytes(*identity.encryption_secret.as_bytes());
         let signing_key = SigningKey::from_bytes(identity.signing_key.as_bytes());
 
         let identity_hash = identity.hash();
@@ -573,7 +565,7 @@ impl NodeOwner {
             signing_key,
             registered_paths,
             ratchets: restart_ratchet
-                .map(|secret| StaticSecret::from(secret.to_bytes()))
+                .map(|secret| X25519Key::from_bytes(secret.to_bytes()))
                 .into_iter()
                 .collect(),
             events,
@@ -600,7 +592,7 @@ impl NodeOwner {
                 entry
                     .ratchets
                     .first()
-                    .map(|secret| *X25519Public::from(secret).as_bytes()),
+                    .map(|secret| *secret.public_key().as_bytes()),
                 None,
                 None,
             ),
@@ -612,21 +604,16 @@ impl NodeOwner {
                         break;
                     }
                 }
-                let next = StaticSecret::from(bytes);
+                let next = X25519Key::from_bytes(bytes);
                 let restart_ratchet = crate::RatchetSecret::from_bytes(bytes)?;
-                let ratchet_public = *X25519Public::from(&next).as_bytes();
-                let mut prospective =
+                let ratchet_public = *next.public_key().as_bytes();
+                let mut prospective: Vec<X25519Key> =
                     Vec::with_capacity(RETAINED_RATCHETS.min(entry.ratchets.len() + 1));
-                for secret in core::iter::once(next).chain(
-                    entry
-                        .ratchets
-                        .iter()
-                        .map(|secret| StaticSecret::from(secret.to_bytes())),
-                ) {
-                    let public = *X25519Public::from(&secret).as_bytes();
+                for secret in core::iter::once(next).chain(entry.ratchets.iter().cloned()) {
+                    let public = *secret.public_key().as_bytes();
                     if prospective
                         .iter()
-                        .all(|stored| *X25519Public::from(stored).as_bytes() != public)
+                        .all(|stored| *stored.public_key().as_bytes() != public)
                     {
                         prospective.push(secret);
                         if prospective.len() == RETAINED_RATCHETS {
@@ -648,7 +635,7 @@ impl NodeOwner {
         self.rng.fill_bytes(&mut random_hash);
 
         let mut builder = AnnounceBuilder::new(
-            *X25519Public::from(&entry.encryption_secret).as_bytes(),
+            *entry.encryption_secret.public_key().as_bytes(),
             entry.signing_key.clone(),
             entry.name_hash,
             random_hash,
@@ -735,16 +722,14 @@ impl NodeOwner {
         destination: DestinationAddress,
         data: &[u8],
     ) -> Result<ProtocolOutbound, NodeError> {
-        if !self.path_table.contains_key(&destination) {
-            return Err(NodeError::NoRoute);
-        }
-        use crate::crypto::SingleDestEncryption;
-        let entry = &self.path_table[&destination];
+        let entry = self
+            .path_table
+            .get(&destination)
+            .ok_or(NodeError::NoRoute)?;
         let target_key = entry.encryption_key();
-        let (ephemeral_pub, ciphertext) =
-            SingleDestEncryption::encrypt(&mut self.rng, &target_key, data);
-        let mut payload = ephemeral_pub.as_bytes().to_vec();
-        payload.extend(ciphertext);
+        let ciphertext = self
+            .datagram_encryption
+            .encrypt(&mut self.rng, &target_key, data);
         let packet = Packet::SingleData {
             hops: 0,
             destination: if entry.hops > 1 {
@@ -752,7 +737,7 @@ impl NodeOwner {
             } else {
                 RoutedDestination::direct(destination)
             },
-            ciphertext: payload.into(),
+            ciphertext: ciphertext.into(),
         };
         Ok(ProtocolOutbound {
             interface: entry.receiving_interface,
@@ -881,7 +866,7 @@ impl NodeOwner {
             .get(service.0)
             .and_then(Option::as_ref)
             .ok_or(NodeError::ResourceClosed)?;
-        let encryption_public = *X25519Public::from(&service.encryption_secret).as_bytes();
+        let encryption_public = *service.encryption_secret.public_key().as_bytes();
         let mut public_keys = [0; 64];
         public_keys[..32].copy_from_slice(&encryption_public);
         public_keys[32..].copy_from_slice(service.signing_key.verifying_key().as_bytes());
@@ -1150,7 +1135,7 @@ impl NodeOwner {
                 self.rng.fill_bytes(&mut random_hash);
 
                 let builder = AnnounceBuilder::new(
-                    *X25519Public::from(&entry.encryption_secret).as_bytes(),
+                    *entry.encryption_secret.public_key().as_bytes(),
                     entry.signing_key.clone(),
                     entry.name_hash,
                     random_hash,

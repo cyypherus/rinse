@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use futures_channel::oneshot;
 use futures_util::future::BoxFuture;
-use futures_util::stream::FuturesUnordered;
+use futures_util::stream::{BoxStream, FuturesUnordered};
 use futures_util::{FutureExt, StreamExt};
 use rand_core::{RngCore, SeedableRng};
 use zeroize::Zeroize;
@@ -23,7 +22,6 @@ const SHUTDOWN_GRACE: crate::TimeSpan = crate::TimeSpan::from_secs(5);
 const KEEP_STREAM_OPEN: bool = false;
 const FINISH_STREAM: bool = true;
 const COMMAND_CAPACITY: usize = 256;
-const INBOUND_PACKET_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 128;
 const CHANNEL_QUEUE_CAPACITY: usize = 64;
 const MAXIMUM_INTERFACES: usize = 16;
@@ -105,14 +103,11 @@ impl NodeBuilder {
             },
             shutdown,
         };
-        let (inbound_packet_sender, inbound_packets) =
-            async_channel::bounded(INBOUND_PACKET_CAPACITY);
-        let pending_inbound_packets = Arc::new(AtomicUsize::new(0));
-        let interface_tasks = FuturesUnordered::new();
         let task = NodeTask {
             started: tokio::time::Instant::now(),
             owner: NodeOwner {
                 rng,
+                datagram_encryption: crate::crypto::SingleDestEncryption::default(),
                 relays_packets: relay,
                 relay_address,
                 path_table: HashMap::new(),
@@ -137,10 +132,7 @@ impl NodeBuilder {
                 interfaces,
                 send_operations: FuturesUnordered::new(),
                 close_operations: FuturesUnordered::new(),
-                interface_tasks,
-                inbound_packet_sender,
-                inbound_packets,
-                pending_inbound_packets,
+                inbound_packets: VecDeque::new(),
                 timers: TimerQueue::default(),
                 shutdown_tx: Some(shutdown_tx),
                 phase: NodePhase::Running,
@@ -374,9 +366,9 @@ impl InterfaceSlot {
 }
 
 type InterfaceOperation = BoxFuture<'static, (InterfaceId, Result<(), crate::InterfaceError>)>;
-type InterfaceTask = BoxFuture<'static, InterfaceId>;
 
 pub(crate) struct NodeOwner {
+    pub(crate) datagram_encryption: crate::crypto::SingleDestEncryption,
     pub(crate) rng: rand_chacha::ChaCha20Rng,
     pub(crate) relays_packets: bool,
     pub(crate) relay_address: crate::packet::DestinationAddress,
@@ -403,10 +395,7 @@ pub(crate) struct NodeOwner {
     pub(crate) interfaces: Vec<InterfaceSlot>,
     send_operations: FuturesUnordered<InterfaceOperation>,
     close_operations: FuturesUnordered<InterfaceOperation>,
-    interface_tasks: FuturesUnordered<InterfaceTask>,
-    inbound_packet_sender: async_channel::Sender<ReceivedPacket>,
-    inbound_packets: async_channel::Receiver<ReceivedPacket>,
-    pending_inbound_packets: Arc<AtomicUsize>,
+    inbound_packets: VecDeque<BoxStream<'static, Result<ReceivedPacket, InterfaceId>>>,
     pub(crate) timers: TimerQueue,
     shutdown_tx: Option<oneshot::Sender<()>>,
     phase: NodePhase,
@@ -461,32 +450,8 @@ enum RuntimeEvent {
     ResourceDropped(Result<RegisteredResource, async_channel::RecvError>),
     Sent((InterfaceId, Result<(), crate::InterfaceError>)),
     Closed((InterfaceId, Result<(), crate::InterfaceError>)),
-    InterfaceStopped(InterfaceId),
-    Inbound(Result<ReceivedPacket, async_channel::RecvError>),
+    Inbound(Result<ReceivedPacket, InterfaceId>),
     Timer,
-}
-
-async fn receive_packets(
-    interface_id: InterfaceId,
-    interface: AttachedInterface,
-    inbound_packet_sender: async_channel::Sender<ReceivedPacket>,
-    pending_inbound_packets: Arc<AtomicUsize>,
-) -> InterfaceId {
-    loop {
-        let packet = match interface.receive().await {
-            Ok(packet) => packet,
-            Err(_) => return interface_id,
-        };
-        let packet = ReceivedPacket {
-            interface: interface_id,
-            bytes: packet.into_bytes(),
-        };
-        pending_inbound_packets.fetch_add(1, Ordering::AcqRel);
-        if inbound_packet_sender.send(packet).await.is_err() {
-            pending_inbound_packets.fetch_sub(1, Ordering::AcqRel);
-            return interface_id;
-        }
-    }
 }
 
 async fn next_operation<T>(operations: &mut FuturesUnordered<BoxFuture<'static, T>>) -> T {
@@ -522,8 +487,20 @@ impl NodeTask {
                     receive_if_present(owner.resource_drop_receiver.as_ref()).fuse();
                 let send = next_operation(&mut owner.send_operations).fuse();
                 let close = next_operation(&mut owner.close_operations).fuse();
-                let interface = next_operation(&mut owner.interface_tasks).fuse();
-                let inbound = owner.inbound_packets.recv().fuse();
+                let inbound = std::future::poll_fn(|cx| {
+                    for _ in 0..owner.inbound_packets.len() {
+                        let mut stream = owner.inbound_packets.pop_front().unwrap();
+                        let packet = stream.poll_next_unpin(cx);
+                        if !matches!(packet, std::task::Poll::Ready(None)) {
+                            owner.inbound_packets.push_back(stream);
+                        }
+                        if let std::task::Poll::Ready(Some(packet)) = packet {
+                            return std::task::Poll::Ready(packet);
+                        }
+                    }
+                    std::task::Poll::Pending
+                })
+                .fuse();
                 let timer = async {
                     match deadline {
                         Some(deadline) => {
@@ -537,21 +514,12 @@ impl NodeTask {
                     }
                 }
                 .fuse();
-                futures_util::pin_mut!(
-                    command,
-                    resource_dropped,
-                    send,
-                    close,
-                    interface,
-                    inbound,
-                    timer
-                );
+                futures_util::pin_mut!(command, resource_dropped, send, close, inbound, timer);
                 futures_util::select_biased! {
                     command = command => RuntimeEvent::Command(command),
                     dropped = resource_dropped => RuntimeEvent::ResourceDropped(dropped),
                     send = send => RuntimeEvent::Sent(send),
                     close = close => RuntimeEvent::Closed(close),
-                    interface = interface => RuntimeEvent::InterfaceStopped(interface),
                     inbound = inbound => RuntimeEvent::Inbound(inbound),
                     _ = timer => RuntimeEvent::Timer,
                 }
@@ -571,7 +539,7 @@ impl NodeTask {
                 RuntimeEvent::ResourceDropped(Err(_)) => owner.resource_drop_receiver = None,
                 RuntimeEvent::Sent(result) => owner.handle_send_completion(result)?,
                 RuntimeEvent::Closed(result) => owner.handle_close_completion(result)?,
-                RuntimeEvent::InterfaceStopped(interface) => {
+                RuntimeEvent::Inbound(Err(interface)) => {
                     let slot = owner
                         .interfaces
                         .get_mut(interface.0)
@@ -579,19 +547,12 @@ impl NodeTask {
                     slot.fail();
                 }
                 RuntimeEvent::Inbound(Ok(inbound)) => {
-                    owner
-                        .pending_inbound_packets
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                            count.checked_sub(1)
-                        })
-                        .map_err(|_| NodeRunError(()))?;
                     if let Some(packet) =
                         crate::node::PreparedInbound::parse(inbound.bytes, inbound.interface.0)
                     {
                         owner.handle_packet(now, packet);
                     }
                 }
-                RuntimeEvent::Inbound(Err(_)) => return Err(NodeRunError(())),
                 RuntimeEvent::Timer => owner.expire_timers(now),
             }
         }
@@ -643,13 +604,20 @@ impl NodeOwner {
             *reading = true;
             let interface = slot.interface.clone();
             let id = InterfaceId(id);
-            self.interface_tasks.push(
-                receive_packets(
-                    id,
-                    interface,
-                    self.inbound_packet_sender.clone(),
-                    self.pending_inbound_packets.clone(),
-                )
+            self.inbound_packets.push_back(
+                futures_util::stream::unfold(Some(interface), move |interface| async move {
+                    let interface = interface?;
+                    match interface.receive().await {
+                        Ok(packet) => Some((
+                            Ok(ReceivedPacket {
+                                interface: id,
+                                bytes: packet.into_bytes(),
+                            }),
+                            Some(interface),
+                        )),
+                        Err(_) => Some((Err(id), None)),
+                    }
+                })
                 .boxed(),
             );
         }
@@ -910,12 +878,7 @@ impl NodeOwner {
                 body,
                 reply,
             } => {
-                let destination = destination.into_bytes();
-                if self.has_path(destination) {
-                    self.send_destination(destination, body, reply);
-                } else {
-                    let _ = reply.send(Err(NodeError::NoRoute));
-                }
+                self.send_destination(destination.into_bytes(), body, reply);
             }
             Command::OpenLink { destination, reply } => {
                 let destination = destination.into_bytes();
@@ -1659,11 +1622,10 @@ impl NodeOwner {
         let NodePhase::Closing { deadline_expired } = self.phase else {
             return None;
         };
-        let drained = self.pending_inbound_packets.load(Ordering::Acquire) == 0
-            && self
-                .interfaces
-                .iter()
-                .all(|slot| matches!(slot.phase, InterfacePhase::Closed));
+        let drained = self
+            .interfaces
+            .iter()
+            .all(|slot| matches!(slot.phase, InterfacePhase::Closed));
         if !drained && !deadline_expired {
             return None;
         }

@@ -173,40 +173,38 @@ impl ProofContext {
 
 impl Packet {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.push(self.header_byte());
-        out.push(self.hops());
-
-        if let Some(transport_id) = self.transport_id() {
-            out.extend_from_slice(&transport_id);
-        }
-        out.extend_from_slice(&self.destination_hash());
-        out.push(self.context_byte());
-
-        match self {
+        let payload: [&[u8]; 3] = match self {
             Packet::Announce { data, .. }
             | Packet::Proof { data, .. }
             | Packet::LinkData { data, .. }
             | Packet::LinkRequest { data, .. }
-            | Packet::LinkProof { data, .. } => out.extend_from_slice(data),
+            | Packet::LinkProof { data, .. } => [data, &[], &[]],
             Packet::PathRequest {
                 query_destination,
                 requesting_transport,
                 tag,
                 ..
-            } => {
-                out.extend_from_slice(query_destination);
-                if let Some(transport) = requesting_transport {
-                    out.extend_from_slice(transport);
-                }
-                out.extend_from_slice(tag);
-            }
+            } => [
+                query_destination,
+                requesting_transport
+                    .as_ref()
+                    .map_or(&[], |id| id.as_slice()),
+                tag,
+            ],
             Packet::SingleData { ciphertext, .. } | Packet::GroupData { ciphertext, .. } => {
-                out.extend_from_slice(ciphertext)
+                [ciphertext, &[], &[]]
             }
-        }
-
-        out
+        };
+        [
+            [self.header_byte(), self.hops()].as_slice(),
+            self.transport_id().as_ref().map_or(&[], |id| id.as_slice()),
+            &self.destination_hash(),
+            &[self.context_byte()],
+            payload[0],
+            payload[1],
+            payload[2],
+        ]
+        .concat()
     }
 
     #[cfg(test)]
