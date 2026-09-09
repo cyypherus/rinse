@@ -8,8 +8,10 @@ use rinse::{
     BufferChunk, ChannelMessage, ChannelReceive, InboundPacket, Interface, InterfaceError,
     InterfaceLimits, Link, LinkEvent, MessageType, NodeBuilder, NodeConfig, NodeError,
     OutboundPacket, PrivateIdentity, RatchetAction, RequestPath, Service, ServiceConfig,
-    ServiceEvent, ServiceName, StreamId, TcpHdlcInterface,
+    ServiceEvent, ServiceName, StreamId
 };
+#[cfg(feature = "tcp")]
+use rinse::TcpHdlcInterface;
 
 struct MemoryInterface {
     inbound: Pin<Box<async_channel::Receiver<Vec<u8>>>>,
@@ -335,6 +337,7 @@ async fn relay_forwards_service_routes_between_interfaces() {
     relay_running.await.unwrap().unwrap();
 }
 
+#[cfg(feature = "tcp")]
 #[tokio::test]
 async fn tcp_relay_forwards_service_routes_between_interfaces() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -430,6 +433,7 @@ async fn tcp_relay_forwards_service_routes_between_interfaces() {
     relay_running.await.unwrap().unwrap();
 }
 
+#[cfg(feature = "tcp")]
 #[tokio::test]
 async fn tcp_relay_opens_parallel_links_to_one_service() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

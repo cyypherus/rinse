@@ -166,7 +166,7 @@ impl InboundResource {
     pub fn from_advertisement(adv: &ResourceAdvertisement) -> Self {
         let received_hashes: Vec<[u8; MAPHASH_LEN]> = adv
             .hashmap
-            .chunks_exact(MAPHASH_LEN)
+            .as_chunks::<MAPHASH_LEN>().0.iter()            
             .map(|c| [c[0], c[1], c[2], c[3]])
             .collect();
 
@@ -221,7 +221,7 @@ impl InboundResource {
 
     pub fn receive_hashmap_update(&mut self, start_index: usize, data: &[u8]) {
         let new_hashes: Vec<[u8; MAPHASH_LEN]> = data
-            .chunks_exact(MAPHASH_LEN)
+            .as_chunks::<MAPHASH_LEN>().0.iter()
             .map(|c| [c[0], c[1], c[2], c[3]])
             .collect();
 

@@ -2571,7 +2571,7 @@ impl NodeOwner {
                 }
                 let hash: [u8; 32] = plaintext[offset..offset + 32].try_into().unwrap();
                 let requested_hashes: Vec<[u8; MAPHASH_LEN]> = plaintext[offset + 32..]
-                    .chunks_exact(MAPHASH_LEN)
+                    .as_chunks::<MAPHASH_LEN>().0.iter()
                     .map(|c| [c[0], c[1], c[2], c[3]])
                     .collect();
 
