@@ -33,10 +33,6 @@ pub(crate) enum Command {
         config: Box<ServiceConfig>,
         reply: Reply<Result<Service, NodeError>>,
     },
-    ReceiveService {
-        service: ServiceId,
-        reply: Reply<Result<ServiceEvent, NodeError>>,
-    },
     Announce {
         service: ServiceId,
         application_data: Bytes,
@@ -240,6 +236,7 @@ impl NodeHandle {
 }
 
 pub struct Service {
+    pub(crate) events: Arc<std::sync::Mutex<crate::runtime::ReceiveQueue<ServiceEvent, NodeError>>>,
     pub(crate) id: ServiceId,
     pub(crate) destination: Destination,
     pub(crate) registration: ResourceRegistration,
@@ -272,12 +269,12 @@ impl Service {
     }
 
     pub async fn receive(&mut self) -> Result<ServiceEvent, NodeError> {
-        ask(&self.registration.client, |reply| Command::ReceiveService {
-            service: self.id,
-            reply,
-        })
-        .await
-        .unwrap_or(Err(NodeError::NodeStopping))
+        if self.registration.client.commands.is_closed() {
+            return Err(NodeError::NodeStopping);
+        }
+        let (reply, result) = oneshot::channel();
+        self.events.lock().unwrap().receive(reply);
+        result.await.unwrap_or(Err(NodeError::NodeStopping))
     }
 }
 

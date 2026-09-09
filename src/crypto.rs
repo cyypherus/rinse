@@ -1,13 +1,13 @@
 use aes::cipher::KeyIvInit;
 use cbc::cipher::{BlockDecryptMut, BlockEncryptMut};
+use curve25519_dalek::{
+    edwards::EdwardsBasepointTable, montgomery::MontgomeryPoint, traits::BasepointTable,
+};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
-
-type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
-type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 
 const AES_KEY_LEN: usize = 32;
 const AES_IV_LEN: usize = 16;
@@ -40,38 +40,24 @@ pub fn hkdf_expand(ikm: &[u8], salt: &[u8], length: usize) -> Vec<u8> {
     output
 }
 
-fn pad_pkcs7(data: &[u8], block_size: usize) -> Vec<u8> {
-    let padding_len = block_size - (data.len() % block_size);
-    let mut padded = data.to_vec();
-    padded.extend(std::iter::repeat_n(padding_len as u8, padding_len));
-    padded
+fn encrypt_aes256_token(key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8], prefix: &[u8]) -> Vec<u8> {
+    let cipher = cbc::Encryptor::<aes::Aes256>::new(key.into(), iv.into());
+    let header_len = prefix.len() + AES_IV_LEN;
+    let mut token = vec![0; header_len + (plaintext.len() / 16 + 1) * 16];
+    token[..prefix.len()].copy_from_slice(prefix);
+    token[prefix.len()..header_len].copy_from_slice(iv);
+    let encrypted_len = cipher
+        .encrypt_padded_b2b_mut::<aes::cipher::block_padding::Pkcs7>(
+            plaintext,
+            &mut token[header_len..],
+        )
+        .expect("allocated space for PKCS7 padding")
+        .len();
+    token.truncate(header_len + encrypted_len);
+    token
 }
 
-fn unpad_pkcs7(data: &[u8]) -> Option<Vec<u8>> {
-    let padding_len = *data.last()? as usize;
-    if padding_len == 0 || padding_len > 16 || padding_len > data.len() {
-        return None;
-    }
-    if !data[data.len() - padding_len..]
-        .iter()
-        .all(|&b| b == padding_len as u8)
-    {
-        return None;
-    }
-    Some(data[..data.len() - padding_len].to_vec())
-}
-
-pub fn encrypt_aes256(key: &[u8; AES_KEY_LEN], iv: &[u8; AES_IV_LEN], plaintext: &[u8]) -> Vec<u8> {
-    let padded = pad_pkcs7(plaintext, 16);
-    let cipher = Aes256CbcEnc::new(key.into(), iv.into());
-    cipher.encrypt_padded_vec_mut::<aes::cipher::block_padding::NoPadding>(&padded)
-}
-
-pub fn decrypt_aes256(
-    key: &[u8; AES_KEY_LEN],
-    iv: &[u8; AES_IV_LEN],
-    ciphertext: &[u8],
-) -> Option<Vec<u8>> {
+fn decrypt_aes256(key: &[u8; 32], iv: &[u8; 16], ciphertext: &[u8]) -> Option<Vec<u8>> {
     if !ciphertext.len().is_multiple_of(16) {
         log::warn!(
             "decrypt_aes256: ciphertext length {} not multiple of 16",
@@ -79,19 +65,14 @@ pub fn decrypt_aes256(
         );
         return None;
     }
-    let cipher = Aes256CbcDec::new(key.into(), iv.into());
-    let decrypted =
-        match cipher.decrypt_padded_vec_mut::<aes::cipher::block_padding::NoPadding>(ciphertext) {
-            Ok(d) => d,
-            Err(e) => {
-                log::warn!("decrypt_aes256: decryption failed: {:?}", e);
-                return None;
-            }
-        };
-    match unpad_pkcs7(&decrypted) {
-        Some(d) => Some(d),
-        None => {
-            log::warn!("decrypt_aes256: invalid PKCS7 padding");
+    let cipher = cbc::Decryptor::<aes::Aes256>::new(key.into(), iv.into());
+    match cipher.decrypt_padded_vec_mut::<aes::cipher::block_padding::Pkcs7>(ciphertext) {
+        Ok(plaintext) => Some(plaintext),
+        Err(error) => {
+            log::warn!(
+                "decrypt_aes256: invalid ciphertext or PKCS7 padding: {:?}",
+                error
+            );
             None
         }
     }
@@ -107,7 +88,7 @@ impl EphemeralKeyPair {
         let mut bytes = [0u8; 32];
         rng.fill_bytes(&mut bytes);
         let secret = StaticSecret::from(bytes);
-        let public = X25519Public::from(&secret);
+        let public = X25519Key::from_bytes(bytes).public_key();
         Self { secret, public }
     }
 
@@ -116,29 +97,91 @@ impl EphemeralKeyPair {
     }
 }
 
-pub struct SingleDestEncryption;
+#[derive(Clone, Default)]
+enum DestinationMultiplication {
+    #[default]
+    Unseen,
+    Observed(X25519Public),
+    Prepared(X25519Public, Option<std::sync::Arc<EdwardsBasepointTable>>),
+}
+
+#[derive(Clone, Default)]
+pub struct SingleDestEncryption {
+    destination: DestinationMultiplication,
+}
 
 impl SingleDestEncryption {
+    pub(crate) fn prepare(&mut self, dest_public: &X25519Public) {
+        match &self.destination {
+            DestinationMultiplication::Prepared(key, _) if key == dest_public => {}
+            DestinationMultiplication::Observed(key) if key == dest_public => {
+                let table = MontgomeryPoint(*dest_public.as_bytes())
+                    .to_edwards(0)
+                    .map(|point| std::sync::Arc::new(EdwardsBasepointTable::create(&point)));
+                self.destination = DestinationMultiplication::Prepared(*dest_public, table);
+            }
+            _ => self.destination = DestinationMultiplication::Observed(*dest_public),
+        }
+    }
+
     pub fn encrypt<R: RngCore>(
+        &mut self,
         rng: &mut R,
         dest_public: &X25519Public,
         plaintext: &[u8],
-    ) -> (X25519Public, Vec<u8>) {
+    ) -> Vec<u8> {
         let ephemeral = EphemeralKeyPair::generate(rng);
-        let shared = ephemeral.ecdh(dest_public);
+        self.prepare(dest_public);
+        let shared = match &self.destination {
+            DestinationMultiplication::Prepared(_, Some(table)) => table
+                .mul_base_clamped(ephemeral.secret.to_bytes())
+                .to_montgomery()
+                .to_bytes(),
+            _ => ephemeral.ecdh(dest_public),
+        };
 
         let mut iv = [0u8; AES_IV_LEN];
         rng.fill_bytes(&mut iv);
 
         let key = derive_key(&shared, &iv);
-        let mut ciphertext = iv.to_vec();
-        ciphertext.extend(encrypt_aes256(&key, &iv, plaintext));
+        encrypt_aes256_token(&key, &iv, plaintext, ephemeral.public.as_bytes())
+    }
+}
 
-        (ephemeral.public, ciphertext)
+pub(crate) struct X25519Key(aws_lc_rs::agreement::PrivateKey);
+
+impl Clone for X25519Key {
+    fn clone(&self) -> Self {
+        Self::from_bytes(self.seed())
+    }
+}
+
+impl X25519Key {
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(
+            aws_lc_rs::agreement::PrivateKey::from_private_key(
+                &aws_lc_rs::agreement::X25519,
+                &bytes,
+            )
+            .expect("32-byte X25519 private key"),
+        )
+    }
+
+    fn seed(&self) -> [u8; 32] {
+        use aws_lc_rs::encoding::{AsBigEndian, Curve25519SeedBin};
+        let seed: Curve25519SeedBin = self.0.as_be_bytes().expect("X25519 seed export");
+        seed.as_ref().try_into().expect("32-byte X25519 seed")
+    }
+
+    pub(crate) fn public_key(&self) -> X25519Public {
+        let public = self.0.compute_public_key().expect("X25519 public key");
+        X25519Public::from(
+            <[u8; 32]>::try_from(public.as_ref()).expect("32-byte X25519 public key"),
+        )
     }
 
     pub fn decrypt(
-        dest_secret: &StaticSecret,
+        &self,
         sender_ephemeral_public: &X25519Public,
         ciphertext: &[u8],
     ) -> Option<Vec<u8>> {
@@ -152,9 +195,18 @@ impl SingleDestEncryption {
         let iv: [u8; AES_IV_LEN] = ciphertext[..AES_IV_LEN].try_into().ok()?;
         let encrypted = &ciphertext[AES_IV_LEN..];
 
-        let shared = dest_secret
-            .diffie_hellman(sender_ephemeral_public)
-            .to_bytes();
+        use aws_lc_rs::agreement::{UnparsedPublicKey, X25519, agree};
+        let shared = agree(
+            &self.0,
+            UnparsedPublicKey::new(&X25519, sender_ephemeral_public.as_bytes()),
+            (),
+            |shared| shared.try_into().map_err(|_| ()),
+        )
+        .unwrap_or_else(|()| {
+            StaticSecret::from(self.seed())
+                .diffie_hellman(sender_ephemeral_public)
+                .to_bytes()
+        });
         let key = derive_key(&shared, &iv);
 
         decrypt_aes256(&key, &iv, encrypted)
@@ -182,11 +234,7 @@ impl LinkEncryption {
         let mut iv = [0u8; AES_IV_LEN];
         rng.fill_bytes(&mut iv);
 
-        let ciphertext = encrypt_aes256(&keys.encryption_key, &iv, plaintext);
-
-        let mut signed_parts = Vec::with_capacity(AES_IV_LEN + ciphertext.len());
-        signed_parts.extend_from_slice(&iv);
-        signed_parts.extend_from_slice(&ciphertext);
+        let signed_parts = encrypt_aes256_token(&keys.encryption_key, &iv, plaintext, &[]);
 
         let hmac = hmac_sha256(&keys.signing_key, &signed_parts);
 
@@ -252,16 +300,137 @@ mod tests {
     }
 
     #[test]
+    fn prepared_receiver_matches_dalek() {
+        let mut rng = test_rng();
+        for _ in 0..64 {
+            let mut bytes = [0; 32];
+            rng.fill_bytes(&mut bytes);
+            let secret = StaticSecret::from(bytes);
+            let receiver = X25519Key::from_bytes(bytes);
+            assert_eq!(receiver.public_key(), X25519Public::from(&secret));
+            assert_eq!(receiver.clone().public_key(), receiver.public_key());
+            let mut arbitrary = [0; 32];
+            rng.fill_bytes(&mut arbitrary);
+            let mut one = [0; 32];
+            one[0] = 1;
+            let mut minus_one = [255; 32];
+            minus_one[0] = 236;
+            minus_one[31] = 127;
+            for public in [[0; 32], one, minus_one, [255; 32], arbitrary] {
+                let public = X25519Public::from(public);
+                let shared = secret.diffie_hellman(&public).to_bytes();
+                for length in [0, 9, 16, 256, 383] {
+                    let body = vec![42; length];
+                    let iv = [9; 16];
+                    let key = derive_key(&shared, &iv);
+                    let token = encrypt_aes256_token(&key, &iv, &body, &[]);
+                    assert_eq!(receiver.decrypt(&public, &token), Some(body));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn precomputed_datagrams_match_existing_wire_bytes() {
+        let mut rng = test_rng();
+        let mut encryption = SingleDestEncryption::default();
+        let mut keys = vec![[0; 32], [255; 32]];
+        for first in 0..32 {
+            let mut key = [255; 32];
+            key[0] = first;
+            keys.push(key);
+        }
+        for _ in 0..64 {
+            let mut key = [0; 32];
+            rng.fill_bytes(&mut key);
+            keys.push(key);
+            keys.push(*EphemeralKeyPair::generate(&mut rng).public.as_bytes());
+        }
+        for bytes in keys {
+            let public = X25519Public::from(bytes);
+            for length in [0, 9, 16, 256, 383] {
+                let body = vec![0x42; length];
+                let mut reference = rng.clone();
+                let pair = EphemeralKeyPair::generate(&mut reference);
+                let shared = pair.secret.diffie_hellman(&public).to_bytes();
+                let mut iv = [0; 16];
+                reference.fill_bytes(&mut iv);
+                let key = derive_key(&shared, &iv);
+                let expected = encrypt_aes256_token(&key, &iv, &body, &[]);
+                encryption.prepare(&public);
+                let mut copied = encryption.clone();
+                let mut copied_rng = rng.clone();
+                let ciphertext = encryption.encrypt(&mut rng, &public, &body);
+                assert_eq!(copied.encrypt(&mut copied_rng, &public, &body), ciphertext);
+                assert_eq!(&ciphertext[..32], pair.public.as_bytes());
+                assert_eq!(ciphertext[32..], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn aes256_matches_nist_cbc_vector() {
+        let key = hex::decode("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let iv = hex::decode("000102030405060708090a0b0c0d0e0f")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let plaintext = hex::decode("6bc1bee22e409f96e93d7e117393172a").unwrap();
+        let token = encrypt_aes256_token(&key, &iv, &plaintext, &[]);
+        assert_eq!(&token[..16], &iv);
+        let ciphertext = &token[16..];
+        assert_eq!(
+            hex::encode(&ciphertext[..16]),
+            "f58c4c04d6e5f1ba779eabfb5f7bfbd6"
+        );
+        assert_eq!(ciphertext.len(), 32);
+        assert_eq!(decrypt_aes256(&key, &iv, ciphertext), Some(plaintext));
+    }
+
+    #[test]
+    fn aes256_padding_boundaries_and_malformed_blocks() {
+        let key = [7; 32];
+        let iv = [9; 16];
+        for length in 0..=64 {
+            let plaintext = vec![0x42; length];
+            let token = encrypt_aes256_token(&key, &iv, &plaintext, &[]);
+            assert_eq!(&token[..16], &iv);
+            let ciphertext = &token[16..];
+            assert_eq!(ciphertext.len(), (length / 16 + 1) * 16);
+            assert_eq!(decrypt_aes256(&key, &iv, ciphertext), Some(plaintext));
+        }
+        for length in 0..16 {
+            assert_eq!(decrypt_aes256(&key, &iv, &vec![0; length]), None);
+        }
+        for padding in 0..=255 {
+            let mut block = [16; 16];
+            block[15] = padding;
+            let ciphertext =
+                cbc::Encryptor::<aes::Aes256>::new((&key).into(), (&iv).into())
+                    .encrypt_padded_vec_mut::<aes::cipher::block_padding::NoPadding>(&block);
+            let expected = match padding {
+                1 => Some(vec![16; 15]),
+                16 => Some(Vec::new()),
+                _ => None,
+            };
+            assert_eq!(decrypt_aes256(&key, &iv, &ciphertext), expected);
+        }
+    }
+
+    #[test]
     fn single_destination_ecdh_encrypts_payload() {
         let mut rng = test_rng();
         let dest_keypair = EphemeralKeyPair::generate(&mut rng);
         let plaintext = b"hello world";
 
-        let (ephemeral_pub, ciphertext) =
-            SingleDestEncryption::encrypt(&mut rng, &dest_keypair.public, plaintext);
+        let ciphertext =
+            SingleDestEncryption::default().encrypt(&mut rng, &dest_keypair.public, plaintext);
 
-        assert_ne!(&ciphertext[AES_IV_LEN..], plaintext);
-        assert!(!ephemeral_pub.as_bytes().iter().all(|&b| b == 0));
+        assert_ne!(&ciphertext[32 + AES_IV_LEN..], plaintext);
+        assert!(!ciphertext[..32].iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -270,10 +439,12 @@ mod tests {
         let dest_keypair = EphemeralKeyPair::generate(&mut rng);
         let plaintext = b"test data";
 
-        let (ephemeral_pub, _ciphertext) =
-            SingleDestEncryption::encrypt(&mut rng, &dest_keypair.public, plaintext);
+        let mut reference = rng.clone();
+        let expected = EphemeralKeyPair::generate(&mut reference);
+        let ciphertext =
+            SingleDestEncryption::default().encrypt(&mut rng, &dest_keypair.public, plaintext);
 
-        assert_eq!(ephemeral_pub.as_bytes().len(), 32);
+        assert_eq!(&ciphertext[..32], expected.public.as_bytes());
     }
 
     #[test]
@@ -282,12 +453,12 @@ mod tests {
         let dest_keypair = EphemeralKeyPair::generate(&mut rng);
         let plaintext = b"test";
 
-        let (ephemeral1, _) =
-            SingleDestEncryption::encrypt(&mut rng, &dest_keypair.public, plaintext);
-        let (ephemeral2, _) =
-            SingleDestEncryption::encrypt(&mut rng, &dest_keypair.public, plaintext);
+        let first =
+            SingleDestEncryption::default().encrypt(&mut rng, &dest_keypair.public, plaintext);
+        let second =
+            SingleDestEncryption::default().encrypt(&mut rng, &dest_keypair.public, plaintext);
 
-        assert_ne!(ephemeral1.as_bytes(), ephemeral2.as_bytes());
+        assert_ne!(first[..32], second[..32]);
     }
 
     #[test]
@@ -296,12 +467,13 @@ mod tests {
         let dest_keypair = EphemeralKeyPair::generate(&mut rng);
         let plaintext = b"secret message";
 
-        let (ephemeral_pub, ciphertext) =
-            SingleDestEncryption::encrypt(&mut rng, &dest_keypair.public, plaintext);
+        let ciphertext =
+            SingleDestEncryption::default().encrypt(&mut rng, &dest_keypair.public, plaintext);
 
-        let decrypted =
-            SingleDestEncryption::decrypt(&dest_keypair.secret, &ephemeral_pub, &ciphertext)
-                .expect("decryption should succeed");
+        let ephemeral = X25519Public::from(<[u8; 32]>::try_from(&ciphertext[..32]).unwrap());
+        let decrypted = X25519Key::from_bytes(dest_keypair.secret.to_bytes())
+            .decrypt(&ephemeral, &ciphertext[32..])
+            .expect("decryption should succeed");
 
         assert_eq!(decrypted, plaintext);
     }

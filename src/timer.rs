@@ -1,8 +1,8 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 
-use crate::MonoTime;
 use crate::node::{ProtocolTimer, ScheduledTimer};
+use std::time::Instant;
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 enum TimerKey {
@@ -13,7 +13,7 @@ enum TimerKey {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct TimerEntry {
-    at: MonoTime,
+    at: Instant,
     key: TimerKey,
 }
 
@@ -42,7 +42,7 @@ impl PartialOrd for TimerEntry {
 #[derive(Default)]
 pub(crate) struct TimerQueue {
     heap: BinaryHeap<TimerEntry>,
-    deadlines: BTreeMap<TimerKey, MonoTime>,
+    deadlines: BTreeMap<TimerKey, Instant>,
 }
 
 impl TimerQueue {
@@ -53,7 +53,7 @@ impl TimerQueue {
 
     pub(crate) fn schedule_inbound_request(
         &mut self,
-        at: MonoTime,
+        at: Instant,
         link: [u8; 16],
         request: [u8; 16],
     ) {
@@ -65,21 +65,21 @@ impl TimerQueue {
             .remove(&TimerKey::InboundRequest(link, request));
     }
 
-    pub(crate) fn schedule_shutdown(&mut self, at: MonoTime) {
+    pub(crate) fn schedule_shutdown(&mut self, at: Instant) {
         self.insert(at, TimerKey::Shutdown);
     }
 
-    fn insert(&mut self, at: MonoTime, key: TimerKey) {
+    fn insert(&mut self, at: Instant, key: TimerKey) {
         self.deadlines.insert(key, at);
         self.heap.push(TimerEntry { at, key });
     }
 
-    pub(crate) fn next_deadline(&mut self) -> Option<MonoTime> {
+    pub(crate) fn next_deadline(&mut self) -> Option<Instant> {
         self.discard_superseded();
         self.heap.peek().map(|entry| entry.at)
     }
 
-    pub(crate) fn pop_due(&mut self, now: MonoTime) -> Option<TimerEvent> {
+    pub(crate) fn pop_due(&mut self, now: Instant) -> Option<TimerEvent> {
         self.discard_superseded();
         let entry = self.heap.peek().copied()?;
         if entry.at > now {

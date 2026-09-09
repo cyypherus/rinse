@@ -5,6 +5,7 @@ pkg/
 dist/
 traces/
 *.DS_Store
-.cargo/
+.cargo/*
+!.cargo/config.toml
 .rinse*
 ref/

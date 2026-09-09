@@ -4,15 +4,16 @@ use bytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::{Rng, RngCore};
 use sha2::{Digest, Sha256};
-use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
+use x25519_dalek::PublicKey as X25519Public;
 
+use crate::NodeError;
 use crate::ServiceEvent;
 use crate::announce::{AnnounceBuilder, AnnounceData};
 use crate::api::ServiceId;
 use crate::channel::{ChannelMessage, QueueChannelError};
-use crate::crypto::{EphemeralKeyPair, sha256};
-use crate::runtime::{NodeOwner, ReceiveQueue};
-use crate::{MonoTime, NodeError, TimeSpan};
+use crate::crypto::{EphemeralKeyPair, X25519Key, sha256};
+use crate::runtime::{NodeTask, ReceiveQueue};
+use std::time::{Duration, Instant};
 
 pub(crate) const LINK_MDU: usize = 431;
 use crate::link::{EstablishedLink, LinkId, LinkProof, LinkRequest, LinkResponder, PendingLink};
@@ -26,8 +27,8 @@ const DEFAULT_RETRY_DELAY_MS: u64 = 4000;
 const LOCAL_REBROADCASTS_MAX: u8 = 2;
 const PATHFINDER_RW_MS: u64 = 500;
 const PATH_REQUEST_TIMEOUT_SECS: u64 = 60;
-const PATH_TIMEOUT: TimeSpan = TimeSpan::from_secs(7 * 24 * 60 * 60);
-const REVERSE_TIMEOUT: TimeSpan = TimeSpan::from_secs(8 * 60);
+const PATH_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const REVERSE_TIMEOUT: Duration = Duration::from_secs(8 * 60);
 const RETAINED_RATCHETS: usize = 512;
 
 fn take_timed_out_link(
@@ -91,27 +92,25 @@ mod tests {
 pub(crate) struct ServiceState {
     address: DestinationAddress,
     name_hash: [u8; 10],
-    encryption_secret: StaticSecret,
+    encryption_secret: X25519Key,
     signing_key: SigningKey,
     registered_paths: HashMap<PathHash, String>,
-    pub(crate) ratchets: Vec<StaticSecret>,
-    pub(crate) events: ReceiveQueue<ServiceEvent, NodeError>,
+    pub(crate) ratchets: Vec<X25519Key>,
+    pub(crate) events: std::sync::Arc<std::sync::Mutex<ReceiveQueue<ServiceEvent, NodeError>>>,
+}
+
+impl Drop for ServiceState {
+    fn drop(&mut self) {
+        self.events.lock().unwrap().close(NodeError::NodeStopping);
+    }
 }
 
 impl ServiceState {
     fn decrypt(&self, ephemeral: &X25519Public, ciphertext: &[u8]) -> Option<Vec<u8>> {
         self.ratchets
             .iter()
-            .find_map(|ratchet| {
-                crate::crypto::SingleDestEncryption::decrypt(ratchet, ephemeral, ciphertext)
-            })
-            .or_else(|| {
-                crate::crypto::SingleDestEncryption::decrypt(
-                    &self.encryption_secret,
-                    ephemeral,
-                    ciphertext,
-                )
-            })
+            .find_map(|ratchet| ratchet.decrypt(ephemeral, ciphertext))
+            .or_else(|| self.encryption_secret.decrypt(ephemeral, ciphertext))
     }
 }
 
@@ -122,7 +121,7 @@ pub(crate) struct Receipt {
 
 #[derive(Clone)]
 pub(crate) struct PathEntry {
-    timestamp: MonoTime,
+    timestamp: Instant,
     next_hop: DestinationAddress,
     hops: u8,
     receiving_interface: usize,
@@ -146,12 +145,12 @@ pub(crate) struct PendingAnnounce {
     has_ratchet: bool,
     data: Vec<u8>,
     retries_remaining: u8,
-    retry_at: MonoTime,
+    retry_at: Instant,
     local_rebroadcasts: u8,
 }
 
 pub(crate) struct LinkTableEntry {
-    timestamp: MonoTime,
+    timestamp: Instant,
     receiving_interface: usize,
     next_hop_interface: usize,
     remaining_hops: u8,
@@ -159,7 +158,7 @@ pub(crate) struct LinkTableEntry {
 }
 
 pub(crate) struct ReverseTableEntry {
-    timestamp: MonoTime,
+    timestamp: Instant,
     receiving_interface: usize,
 }
 
@@ -171,14 +170,19 @@ pub(crate) struct PendingInboundLink {
 }
 
 pub(crate) struct PreparedInbound {
-    packet: Packet,
+    pub(crate) packet: Packet,
     packet_hash: [u8; 32],
     source: usize,
 }
 
+pub(crate) struct DatagramDelivery {
+    service: usize,
+    ciphertext: Bytes,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ScheduledTimer {
-    pub(crate) at: MonoTime,
+    pub(crate) at: Instant,
     pub(crate) event: ProtocolTimer,
 }
 
@@ -238,7 +242,7 @@ pub(crate) struct PreparedRequest {
     link: LinkId,
     wire: WireRequestId,
     local: RequestId,
-    deadline: MonoTime,
+    deadline: Instant,
 }
 
 pub(crate) struct PreparedResponse {
@@ -254,12 +258,12 @@ struct PreparedResponseResource {
 pub(crate) struct PreparedAnnouncement {
     pub(crate) outbounds: Vec<ProtocolOutbound>,
     service: ServiceId,
-    ratchets: Option<Vec<StaticSecret>>,
+    ratchets: Option<Vec<X25519Key>>,
     restart_ratchet: Option<crate::RatchetSecret>,
 }
 
-impl NodeOwner {
-    fn schedule_timer(&mut self, at: MonoTime, event: ProtocolTimer) {
+impl NodeTask {
+    fn schedule_timer(&mut self, at: Instant, event: ProtocolTimer) {
         self.timers.schedule(ScheduledTimer { at, event });
     }
 
@@ -269,7 +273,7 @@ impl NodeOwner {
                 entry
                     .timestamp
                     .checked_add(PATH_TIMEOUT)
-                    .and_then(|at| at.checked_add(TimeSpan::from_micros(1)))
+                    .and_then(|at| at.checked_add(Duration::from_micros(1)))
                     .expect("path expiry overflow"),
                 ProtocolTimer::PathExpiry(destination),
             );
@@ -281,7 +285,7 @@ impl NodeOwner {
             .established_links
             .get(&link)
             .map(|link| link.rtt)
-            .unwrap_or(TimeSpan::from_millis(25));
+            .unwrap_or(Duration::from_millis(25));
         if let Some(retry_at) = self
             .established_links
             .get(&link)
@@ -300,14 +304,14 @@ impl NodeOwner {
         }
     }
 
-    fn link_maintenance_at(link: &EstablishedLink) -> Option<MonoTime> {
+    fn link_maintenance_at(link: &EstablishedLink) -> Option<Instant> {
         let stale_at = link.pending_requests.is_empty().then(|| {
             link.last_inbound
-                .checked_add(TimeSpan::from_secs(link.stale_time_secs()))
+                .checked_add(Duration::from_secs(link.stale_time_secs()))
                 .expect("link stale deadline overflow")
         });
         let keepalive_at = link.is_initiator().then(|| {
-            let keepalive = TimeSpan::from_secs(link.keepalive_interval_secs());
+            let keepalive = Duration::from_secs(link.keepalive_interval_secs());
             link.last_inbound
                 .checked_add(keepalive)
                 .expect("link keepalive deadline overflow")
@@ -338,10 +342,14 @@ impl NodeOwner {
         let Some(entry) = self.services.get_mut(service.0) else {
             return Vec::new();
         };
-        let Some(mut removed) = entry.take() else {
+        let Some(removed) = entry.take() else {
             return Vec::new();
         };
-        removed.events.close(NodeError::ResourceClosed);
+        removed
+            .events
+            .lock()
+            .unwrap()
+            .close(NodeError::ResourceClosed);
         self.pending_inbound_links
             .retain(|_, pending| pending.service != service);
         self.established_links
@@ -355,8 +363,8 @@ impl NodeOwner {
         link_id: LinkId,
         path: &str,
         data: &[u8],
-        now: MonoTime,
-        timeout: TimeSpan,
+        now: Instant,
+        timeout: Duration,
     ) -> Result<PreparedRequest, NodeError> {
         if !self.established_links.contains_key(&link_id) {
             log::warn!("Request on non-existent link {}", hex::encode(link_id));
@@ -522,17 +530,17 @@ impl NodeOwner {
         }
     }
 
-    pub fn add_service(
+    pub(crate) fn add_service(
         &mut self,
         name: &str,
         paths: &[&str],
         identity: &crate::identity::PrivateIdentity,
         restart_ratchet: Option<crate::RatchetSecret>,
-        events: ReceiveQueue<ServiceEvent, NodeError>,
+        events: std::sync::Arc<std::sync::Mutex<ReceiveQueue<ServiceEvent, NodeError>>>,
     ) -> ServiceId {
         let name_hash: [u8; 10] = sha256(name.as_bytes())[..10].try_into().unwrap();
 
-        let encryption_secret = StaticSecret::from(*identity.encryption_secret.as_bytes());
+        let encryption_secret = X25519Key::from_bytes(*identity.encryption_secret.as_bytes());
         let signing_key = SigningKey::from_bytes(identity.signing_key.as_bytes());
 
         let identity_hash = identity.hash();
@@ -573,7 +581,7 @@ impl NodeOwner {
             signing_key,
             registered_paths,
             ratchets: restart_ratchet
-                .map(|secret| StaticSecret::from(secret.to_bytes()))
+                .map(|secret| X25519Key::from_bytes(secret.to_bytes()))
                 .into_iter()
                 .collect(),
             events,
@@ -600,7 +608,7 @@ impl NodeOwner {
                 entry
                     .ratchets
                     .first()
-                    .map(|secret| *X25519Public::from(secret).as_bytes()),
+                    .map(|secret| *secret.public_key().as_bytes()),
                 None,
                 None,
             ),
@@ -612,21 +620,16 @@ impl NodeOwner {
                         break;
                     }
                 }
-                let next = StaticSecret::from(bytes);
+                let next = X25519Key::from_bytes(bytes);
                 let restart_ratchet = crate::RatchetSecret::from_bytes(bytes)?;
-                let ratchet_public = *X25519Public::from(&next).as_bytes();
-                let mut prospective =
+                let ratchet_public = *next.public_key().as_bytes();
+                let mut prospective: Vec<X25519Key> =
                     Vec::with_capacity(RETAINED_RATCHETS.min(entry.ratchets.len() + 1));
-                for secret in core::iter::once(next).chain(
-                    entry
-                        .ratchets
-                        .iter()
-                        .map(|secret| StaticSecret::from(secret.to_bytes())),
-                ) {
-                    let public = *X25519Public::from(&secret).as_bytes();
+                for secret in core::iter::once(next).chain(entry.ratchets.iter().cloned()) {
+                    let public = *secret.public_key().as_bytes();
                     if prospective
                         .iter()
-                        .all(|stored| *X25519Public::from(stored).as_bytes() != public)
+                        .all(|stored| *stored.public_key().as_bytes() != public)
                     {
                         prospective.push(secret);
                         if prospective.len() == RETAINED_RATCHETS {
@@ -648,7 +651,7 @@ impl NodeOwner {
         self.rng.fill_bytes(&mut random_hash);
 
         let mut builder = AnnounceBuilder::new(
-            *X25519Public::from(&entry.encryption_secret).as_bytes(),
+            *entry.encryption_secret.public_key().as_bytes(),
             entry.signing_key.clone(),
             entry.name_hash,
             random_hash,
@@ -694,11 +697,11 @@ impl NodeOwner {
         announcement.restart_ratchet
     }
 
-    pub fn has_path(&self, destination: DestinationAddress) -> bool {
+    pub(crate) fn has_path(&self, destination: DestinationAddress) -> bool {
         self.path_table.contains_key(&destination)
     }
 
-    pub fn request_path(&mut self, destination: DestinationAddress, now: MonoTime) {
+    pub(crate) fn request_path(&mut self, destination: DestinationAddress, now: Instant) {
         log::info!(
             "Sending path request for <{}> on {} interface(s)",
             hex::encode(destination),
@@ -706,7 +709,7 @@ impl NodeOwner {
         );
         self.pending_path_requests.insert(destination, now);
         self.schedule_timer(
-            now.checked_add(TimeSpan::from_secs(PATH_REQUEST_TIMEOUT_SECS))
+            now.checked_add(Duration::from_secs(PATH_REQUEST_TIMEOUT_SECS))
                 .expect("path request deadline overflow"),
             ProtocolTimer::PathRequestTimeout(destination),
         );
@@ -735,30 +738,36 @@ impl NodeOwner {
         destination: DestinationAddress,
         data: &[u8],
     ) -> Result<ProtocolOutbound, NodeError> {
-        if !self.path_table.contains_key(&destination) {
-            return Err(NodeError::NoRoute);
-        }
-        use crate::crypto::SingleDestEncryption;
-        let entry = &self.path_table[&destination];
-        let target_key = entry.encryption_key();
-        let (ephemeral_pub, ciphertext) =
-            SingleDestEncryption::encrypt(&mut self.rng, &target_key, data);
-        let mut payload = ephemeral_pub.as_bytes().to_vec();
-        payload.extend(ciphertext);
+        let (interface, destination, target_key) = self.datagram_target(destination)?;
+        let ciphertext = self
+            .datagram_encryption
+            .encrypt(&mut self.rng, &target_key, data);
         let packet = Packet::SingleData {
             hops: 0,
-            destination: if entry.hops > 1 {
-                RoutedDestination::via(entry.next_hop, destination)
-            } else {
-                RoutedDestination::direct(destination)
-            },
-            ciphertext: payload.into(),
+            destination,
+            ciphertext: ciphertext.into(),
         };
         Ok(ProtocolOutbound {
-            interface: entry.receiving_interface,
+            interface,
             packet,
             priority: 0,
         })
+    }
+
+    pub(crate) fn datagram_target(
+        &self,
+        destination: DestinationAddress,
+    ) -> Result<(usize, RoutedDestination, X25519Public), NodeError> {
+        let entry = self
+            .path_table
+            .get(&destination)
+            .ok_or(NodeError::NoRoute)?;
+        let routed = if entry.hops > 1 {
+            RoutedDestination::via(entry.next_hop, destination)
+        } else {
+            RoutedDestination::direct(destination)
+        };
+        Ok((entry.receiving_interface, routed, entry.encryption_key()))
     }
 
     pub(crate) fn prepare_link_datagram(
@@ -781,11 +790,11 @@ impl NodeOwner {
         })
     }
 
-    pub fn try_queue_channel_message(
+    pub(crate) fn try_queue_channel_message(
         &mut self,
         link: LinkId,
         message: &ChannelMessage,
-        now: MonoTime,
+        now: Instant,
     ) -> Result<[u8; 32], QueueChannelError> {
         self.send_channel_data(link, message.message_type().get(), message.body(), now)
     }
@@ -794,7 +803,7 @@ impl NodeOwner {
         &mut self,
         link: LinkId,
         raw: &[u8],
-        now: MonoTime,
+        now: Instant,
     ) -> Result<[u8; 32], QueueChannelError> {
         self.send_channel_data(link, crate::buffer::STREAM_MESSAGE_TYPE, raw, now)
     }
@@ -804,7 +813,7 @@ impl NodeOwner {
         link_id: LinkId,
         message_type: u16,
         data: &[u8],
-        now: MonoTime,
+        now: Instant,
     ) -> Result<[u8; 32], QueueChannelError> {
         let link = self
             .established_links
@@ -832,7 +841,7 @@ impl NodeOwner {
         Ok(hash)
     }
 
-    pub fn remove_link_state(&mut self, link: LinkId) -> Option<Vec<RequestId>> {
+    pub(crate) fn remove_link_state(&mut self, link: LinkId) -> Option<Vec<RequestId>> {
         let existed = self.established_links.contains_key(&link)
             || self.pending_outbound_links.contains_key(&link);
         if let Some(established) = self.established_links.get(&link) {
@@ -881,7 +890,7 @@ impl NodeOwner {
             .get(service.0)
             .and_then(Option::as_ref)
             .ok_or(NodeError::ResourceClosed)?;
-        let encryption_public = *X25519Public::from(&service.encryption_secret).as_bytes();
+        let encryption_public = *service.encryption_secret.public_key().as_bytes();
         let mut public_keys = [0; 64];
         public_keys[..32].copy_from_slice(&encryption_public);
         public_keys[32..].copy_from_slice(service.signing_key.verifying_key().as_bytes());
@@ -924,8 +933,8 @@ impl NodeOwner {
     pub(crate) fn begin_outbound_link(
         &mut self,
         destination: DestinationAddress,
-        now: MonoTime,
-        handshake_timeout: TimeSpan,
+        now: Instant,
+        handshake_timeout: Duration,
         open: crate::runtime::PendingOpenLink,
     ) -> LinkId {
         let path_entry = self
@@ -988,7 +997,7 @@ impl NodeOwner {
         link_id
     }
 
-    pub(crate) fn accept_incoming_link(&mut self, link_id: LinkId, now: MonoTime) -> bool {
+    pub(crate) fn accept_incoming_link(&mut self, link_id: LinkId, now: Instant) -> bool {
         let Some(pending) = self.pending_inbound_links.remove(&link_id) else {
             return false;
         };
@@ -1096,11 +1105,15 @@ impl NodeOwner {
 
     fn inbound(
         &mut self,
-        mut packet: Packet,
-        packet_hash: [u8; 32],
-        interface_index: usize,
-        now: MonoTime,
+        received: PreparedInbound,
+        now: Instant,
+        datagrams: &mut Vec<DatagramDelivery>,
     ) {
+        let PreparedInbound {
+            mut packet,
+            packet_hash,
+            source: interface_index,
+        } = received;
         let destination_hash = packet.destination_hash();
         let link_id: LinkId = destination_hash;
         let remember_packet_hash =
@@ -1150,7 +1163,7 @@ impl NodeOwner {
                 self.rng.fill_bytes(&mut random_hash);
 
                 let builder = AnnounceBuilder::new(
-                    *X25519Public::from(&entry.encryption_secret).as_bytes(),
+                    *entry.encryption_secret.public_key().as_bytes(),
                     entry.signing_key.clone(),
                     entry.name_hash,
                     random_hash,
@@ -1262,7 +1275,7 @@ impl NodeOwner {
                         self.timers.schedule(ScheduledTimer {
                             at: now
                                 .checked_add(REVERSE_TIMEOUT)
-                                .and_then(|at| at.checked_add(TimeSpan::from_micros(1)))
+                                .and_then(|at| at.checked_add(Duration::from_micros(1)))
                                 .expect("reverse path expiry overflow"),
                             event: ProtocolTimer::ReversePathExpiry(destination_hash),
                         });
@@ -1277,7 +1290,7 @@ impl NodeOwner {
                         self.timers.schedule(ScheduledTimer {
                             at: now
                                 .checked_add(PATH_TIMEOUT)
-                                .and_then(|at| at.checked_add(TimeSpan::from_micros(1)))
+                                .and_then(|at| at.checked_add(Duration::from_micros(1)))
                                 .expect("path expiry overflow"),
                             event: ProtocolTimer::PathExpiry(dest),
                         });
@@ -1474,7 +1487,7 @@ impl NodeOwner {
                         self.schedule_path_expiry(destination_hash);
                         let application_data = bytes::Bytes::from(application_data);
                         for service in self.services.iter_mut().flatten() {
-                            let _ = service.events.push(
+                            let _ = service.events.lock().unwrap().push(
                                 ServiceEvent::Announce(crate::DiscoveredService {
                                     destination: crate::Destination::from_bytes(destination_hash),
                                     service_hash: crate::ServiceHash::from_bytes(service_hash),
@@ -1487,7 +1500,7 @@ impl NodeOwner {
                         if !is_path_response && self.relays_packets {
                             let delay_ms = self.rng.gen_range(0..=PATHFINDER_RW_MS);
                             let retry_at = now
-                                .checked_add(TimeSpan::from_millis(delay_ms))
+                                .checked_add(Duration::from_millis(delay_ms))
                                 .expect("announce retry deadline overflow");
                             self.pending_announces
                                 .retain(|pending| pending.destination != destination_hash);
@@ -1833,19 +1846,10 @@ impl NodeOwner {
                         .iter()
                         .position(|s| s.as_ref().is_some_and(|s| s.address == destination_hash))
                 {
-                    let service = &self.services[service_idx]
-                        .as_ref()
-                        .expect("located service");
-
-                    let ephemeral_public =
-                        X25519Public::from(<[u8; 32]>::try_from(&ciphertext[..32]).unwrap());
-                    if let Some(data) = service.decrypt(&ephemeral_public, &ciphertext[32..]) {
-                        let _ = self.services[service_idx]
-                            .as_mut()
-                            .expect("located service")
-                            .events
-                            .push(ServiceEvent::Datagram(data.into()), 0);
-                    }
+                    datagrams.push(DatagramDelivery {
+                        service: service_idx,
+                        ciphertext,
+                    });
                 }
             }
             Packet::GroupData { .. } | Packet::PathRequest { .. } => {}
@@ -2130,7 +2134,7 @@ impl NodeOwner {
         })
     }
 
-    fn outbound(&mut self, mut packet: Packet, attached_interface: Option<usize>, now: MonoTime) {
+    fn outbound(&mut self, mut packet: Packet, attached_interface: Option<usize>, now: Instant) {
         let destination_hash = packet.destination_hash();
         let hops = packet.hops();
 
@@ -2200,21 +2204,87 @@ impl NodeOwner {
         }
     }
 
-    pub(crate) fn handle_packet(&mut self, now: MonoTime, received: PreparedInbound) {
-        let PreparedInbound {
-            packet,
-            packet_hash,
-            source,
-        } = received;
-        log::trace!("[RECV] interface={source} {packet:?}");
-        self.inbound(packet, packet_hash, source, now);
+    pub(crate) fn handle_packet(
+        &mut self,
+        now: Instant,
+        received: PreparedInbound,
+        datagrams: &mut Vec<DatagramDelivery>,
+    ) {
+        log::trace!("[RECV] interface={} {:?}", received.source, received.packet);
+        self.inbound(received, now, datagrams);
 
         for (link_id, hash) in std::mem::take(&mut self.pending_resource_requests) {
             self.send_resource_request(link_id, hash);
         }
     }
 
-    pub(crate) fn handle_timer(&mut self, now: MonoTime, scheduled: ScheduledTimer) {
+    pub(crate) async fn deliver_datagrams(&mut self, datagrams: &mut Vec<DatagramDelivery>) {
+        let decrypt = |job: &DatagramDelivery| {
+            let service = self.services[job.service]
+                .as_ref()
+                .expect("service retained during batch");
+            let ephemeral = X25519Public::from(
+                <[u8; 32]>::try_from(&job.ciphertext[..32]).expect("validated ephemeral key"),
+            );
+            service.decrypt(&ephemeral, &job.ciphertext[32..])
+        };
+        let plaintexts: Vec<_> = if datagrams.len() < 32 {
+            datagrams.iter().map(decrypt).collect()
+        } else {
+            let keys: Vec<_> = self
+                .services
+                .iter()
+                .map(|service| {
+                    service.as_ref().map(|service| {
+                        (service.encryption_secret.clone(), service.ratchets.clone())
+                    })
+                })
+                .collect();
+            let keys = std::sync::Arc::new(keys);
+            let jobs: Vec<_> = datagrams
+                .iter()
+                .map(|job| {
+                    let service = job.service;
+                    let ciphertext = job.ciphertext.clone();
+                    let keys = keys.clone();
+                    tokio::spawn(async move {
+                        let (secret, ratchets) = keys[service]
+                            .as_ref()
+                            .expect("service retained during batch");
+                        let ephemeral = X25519Public::from(
+                            <[u8; 32]>::try_from(&ciphertext[..32])
+                                .expect("validated ephemeral key"),
+                        );
+                        ratchets
+                            .iter()
+                            .find_map(|key| key.decrypt(&ephemeral, &ciphertext[32..]))
+                            .or_else(|| secret.decrypt(&ephemeral, &ciphertext[32..]))
+                    })
+                })
+                .collect();
+            let mut plaintexts = Vec::with_capacity(datagrams.len());
+            for job in jobs {
+                plaintexts.push(job.await.expect("packet decryption task"));
+            }
+            plaintexts
+        };
+        for (job, plaintext) in datagrams.drain(..).zip(plaintexts) {
+            if let Some(plaintext) = plaintext
+                && self.services[job.service]
+                    .as_mut()
+                    .expect("service retained during batch")
+                    .events
+                    .lock()
+                    .unwrap()
+                    .push(ServiceEvent::Datagram(plaintext.into()), 0)
+                    .is_err()
+            {
+                log::debug!("datagram receive queue full or closed");
+            }
+        }
+    }
+
+    pub(crate) fn handle_timer(&mut self, now: Instant, scheduled: ScheduledTimer) {
         let ScheduledTimer { at, event } = scheduled;
         if now < at {
             return;
@@ -2233,7 +2303,7 @@ impl NodeOwner {
                     pending.retries_remaining -= 1;
                     let next_retry = if pending.retries_remaining > 0 {
                         pending.retry_at = now
-                            .checked_add(TimeSpan::from_millis(DEFAULT_RETRY_DELAY_MS))
+                            .checked_add(Duration::from_millis(DEFAULT_RETRY_DELAY_MS))
                             .expect("announce retry deadline overflow");
                         Some(pending.retry_at)
                     } else {
@@ -2267,7 +2337,7 @@ impl NodeOwner {
                     entry
                         .timestamp
                         .checked_add(PATH_TIMEOUT)
-                        .and_then(|at| at.checked_add(TimeSpan::from_micros(1)))
+                        .and_then(|at| at.checked_add(Duration::from_micros(1)))
                         == Some(at)
                 }) {
                     self.path_table.remove(&destination);
@@ -2278,7 +2348,7 @@ impl NodeOwner {
                     entry
                         .timestamp
                         .checked_add(REVERSE_TIMEOUT)
-                        .and_then(|at| at.checked_add(TimeSpan::from_micros(1)))
+                        .and_then(|at| at.checked_add(Duration::from_micros(1)))
                         == Some(at)
                 }) {
                     self.reverse_table.remove(&destination);
@@ -2289,7 +2359,7 @@ impl NodeOwner {
                     .established_links
                     .get(&link)
                     .map(|link| link.rtt)
-                    .unwrap_or(TimeSpan::from_millis(25));
+                    .unwrap_or(Duration::from_millis(25));
                 let Some(channel) = self
                     .established_links
                     .get_mut(&link)
@@ -2333,7 +2403,7 @@ impl NodeOwner {
                     .pending_path_requests
                     .get(&destination)
                     .is_none_or(|requested| {
-                        requested.checked_add(TimeSpan::from_secs(PATH_REQUEST_TIMEOUT_SECS))
+                        requested.checked_add(Duration::from_secs(PATH_REQUEST_TIMEOUT_SECS))
                             != Some(at)
                     })
                 {
@@ -2362,14 +2432,14 @@ impl NodeOwner {
                     return;
                 }
                 let stale = now.duration_since(link.last_inbound)
-                    >= TimeSpan::from_secs(link.stale_time_secs())
+                    >= Duration::from_secs(link.stale_time_secs())
                     && link.pending_requests.is_empty();
                 let keepalive = link.is_initiator()
                     && now.duration_since(link.last_inbound)
-                        >= TimeSpan::from_secs(link.keepalive_interval_secs())
+                        >= Duration::from_secs(link.keepalive_interval_secs())
                     && link.last_keepalive_sent.is_none_or(|sent| {
                         now.duration_since(sent)
-                            >= TimeSpan::from_secs(link.keepalive_interval_secs())
+                            >= Duration::from_secs(link.keepalive_interval_secs())
                     });
                 if stale {
                     let destination = link.destination;
@@ -2464,7 +2534,7 @@ impl NodeOwner {
             && !link.is_initiator()
         {
             let rtt_ms = (rtt_secs * 1000.0) as u64;
-            link.rtt = TimeSpan::from_millis(rtt_ms);
+            link.rtt = Duration::from_millis(rtt_ms);
         }
     }
 
@@ -2530,7 +2600,7 @@ impl NodeOwner {
         link_id: LinkId,
         context: LinkContext,
         plaintext: &[u8],
-        now: MonoTime,
+        now: Instant,
     ) {
         use crate::resource::MAPHASH_LEN;
 
@@ -2693,7 +2763,7 @@ impl NodeOwner {
         }
     }
 
-    fn complete_resource(&mut self, link_id: LinkId, hash: [u8; 32], _now: MonoTime) {
+    fn complete_resource(&mut self, link_id: LinkId, hash: [u8; 32], _now: Instant) {
         use crate::packet::{ProofContext, ProofDestination};
 
         log::debug!(

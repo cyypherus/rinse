@@ -4,14 +4,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
+#[cfg(feature = "tcp")]
+use rinse::TcpHdlcInterface;
 use rinse::{
     BufferChunk, ChannelMessage, ChannelReceive, InboundPacket, Interface, InterfaceError,
     InterfaceLimits, Link, LinkEvent, MessageType, NodeBuilder, NodeConfig, NodeError,
     OutboundPacket, PrivateIdentity, RatchetAction, RequestPath, Service, ServiceConfig,
-    ServiceEvent, ServiceName, StreamId
+    ServiceEvent, ServiceName, StreamId,
 };
-#[cfg(feature = "tcp")]
-use rinse::TcpHdlcInterface;
 
 struct MemoryInterface {
     inbound: Pin<Box<async_channel::Receiver<Vec<u8>>>>,
@@ -102,6 +102,156 @@ async fn dropping_the_last_client_stops_the_node() {
     let (node, task) = node(interface);
     drop(node);
     task.run().await.unwrap();
+}
+
+#[tokio::test]
+async fn service_receive_survives_cancellation_and_finishes_when_node_stops() {
+    for abort in [false, true] {
+        let (left, _right, _) = connected_interfaces();
+        let (node, task) = node(left);
+        let running = tokio::spawn(task.run());
+        let mut service = service(&node, "receive.lifecycle", &[]).await;
+        {
+            let mut canceled = Box::pin(service.receive());
+            assert!(futures_util::poll!(&mut canceled).is_pending());
+        }
+        let mut receive = Box::pin(service.receive());
+        assert!(futures_util::poll!(&mut receive).is_pending());
+        if abort {
+            running.abort();
+            assert!(running.await.unwrap_err().is_cancelled());
+            assert!(matches!(receive.await, Err(NodeError::NodeStopping)));
+        } else {
+            node.shutdown().await;
+            running.await.unwrap().unwrap();
+            assert!(matches!(receive.await, Err(NodeError::ResourceClosed)));
+        }
+        assert!(matches!(
+            service.receive().await,
+            Err(NodeError::NodeStopping)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn concurrent_sends_report_each_admission_failure() {
+    let (left, right, _) = connected_interfaces();
+    let (sender, sender_task) = NodeBuilder::new(NodeConfig::endpoint())
+        .interface(left, InterfaceLimits::new(65_535, 4, 1_048_576).unwrap())
+        .build()
+        .unwrap();
+    let (receiver, receiver_task) = node(right);
+    let sender_task = tokio::spawn(sender_task.run());
+    let receiver_task = tokio::spawn(receiver_task.run());
+    let mut client = service(&sender, "admission.client", &[]).await;
+    let mut server = service(&receiver, "admission.server", &[]).await;
+    server
+        .announce(Bytes::new(), RatchetAction::Keep)
+        .await
+        .unwrap();
+    while !matches!(client.receive().await.unwrap(), ServiceEvent::Announce(_)) {}
+    let results = futures_util::future::join_all((0..64u8).map(|index| {
+        sender.send(
+            if index == 63 {
+                rinse::Destination::from_bytes([0; 16])
+            } else {
+                server.destination()
+            },
+            Bytes::from(vec![index]),
+        )
+    }))
+    .await;
+    for (index, result) in results.into_iter().enumerate() {
+        assert_eq!(
+            result,
+            match index {
+                0..4 => Ok(()),
+                63 => Err(NodeError::NoRoute),
+                _ => Err(NodeError::InterfaceUnavailable),
+            }
+        );
+    }
+    for index in 0..4u8 {
+        let event = tokio::time::timeout(Duration::from_secs(30), server.receive())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, ServiceEvent::Datagram(body) if body.as_ref() == [index]));
+    }
+    sender.shutdown().await;
+    receiver.shutdown().await;
+    sender_task.await.unwrap().unwrap();
+    receiver_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_sends_preserve_contents_order_and_results() {
+    let (left, right, _) = connected_interfaces();
+    let (sender, sender_task) = NodeBuilder::new(NodeConfig::endpoint())
+        .interface(
+            left,
+            InterfaceLimits::new(65_535, 16384, 16_777_216).unwrap(),
+        )
+        .build()
+        .unwrap();
+    let (receiver, receiver_task) = node(right);
+    let sender_task = tokio::spawn(sender_task.run());
+    let receiver_task = tokio::spawn(receiver_task.run());
+    let mut client = service(&sender, "parallel.client", &[]).await;
+    let mut server = receiver
+        .register_service(
+            ServiceConfig::new(
+                ServiceName::new("parallel.server").unwrap(),
+                PrivateIdentity::from_secret_bytes([23; 64]).unwrap(),
+                [],
+                None,
+            )
+            .unwrap()
+            .event_capacity(std::num::NonZeroUsize::new(16384).unwrap()),
+        )
+        .await
+        .unwrap();
+    for ratchet in [RatchetAction::Keep, RatchetAction::Rotate] {
+        server.announce(Bytes::new(), ratchet).await.unwrap();
+        while !matches!(client.receive().await.unwrap(), ServiceEvent::Announce(_)) {}
+        assert_eq!(
+            sender
+                .send(server.destination(), Bytes::from(vec![0; 384]))
+                .await,
+            Err(NodeError::InvalidInput)
+        );
+        let bodies: Vec<_> = (0..16384u32)
+            .map(|index| {
+                let mut body = vec![index as u8; [4, 9, 16, 256, 383][index as usize % 5]];
+                body[..4].copy_from_slice(&index.to_le_bytes());
+                Bytes::from(body)
+            })
+            .collect();
+        for window in bodies.chunks(4096) {
+            for result in futures_util::future::join_all(
+                window
+                    .iter()
+                    .map(|body| sender.send(server.destination(), body.clone())),
+            )
+            .await
+            {
+                result.unwrap();
+            }
+        }
+        for expected in bodies {
+            let event = tokio::time::timeout(Duration::from_secs(30), server.receive())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(event, ServiceEvent::Datagram(body) if body == expected));
+        }
+    }
+    drop(client);
+    drop(server);
+    sender.shutdown().await;
+    receiver.shutdown().await;
+    sender_task.await.unwrap().unwrap();
+    receiver_task.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -339,6 +489,7 @@ async fn relay_forwards_service_routes_between_interfaces() {
 
 #[cfg(feature = "tcp")]
 #[tokio::test]
+#[cfg(feature = "tcp")]
 async fn tcp_relay_forwards_service_routes_between_interfaces() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -435,6 +586,7 @@ async fn tcp_relay_forwards_service_routes_between_interfaces() {
 
 #[cfg(feature = "tcp")]
 #[tokio::test]
+#[cfg(feature = "tcp")]
 async fn tcp_relay_opens_parallel_links_to_one_service() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

@@ -104,6 +104,7 @@ impl InterfaceLimits {
 }
 
 pub struct ServiceConfig {
+    pub(crate) event_capacity: std::num::NonZeroUsize,
     pub(crate) name: ServiceName,
     pub(crate) identity: PrivateIdentity,
     pub(crate) accepted_request_paths: BTreeSet<RequestPath>,
@@ -111,6 +112,10 @@ pub struct ServiceConfig {
 }
 
 impl ServiceConfig {
+    pub fn event_capacity(mut self, capacity: std::num::NonZeroUsize) -> Self {
+        self.event_capacity = capacity;
+        self
+    }
     pub fn new(
         name: ServiceName,
         identity: PrivateIdentity,
@@ -126,6 +131,7 @@ impl ServiceConfig {
         }
         Some(Self {
             name,
+            event_capacity: std::num::NonZeroUsize::new(128).unwrap(),
             identity,
             accepted_request_paths: paths,
             restart_ratchet,

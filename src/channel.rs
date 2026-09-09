@@ -1,6 +1,6 @@
 pub(crate) use crate::model::ChannelMessage;
-use crate::{MonoTime, TimeSpan};
 use std::collections::{BTreeMap, VecDeque};
+use std::time::{Duration, Instant};
 
 pub(crate) const CHANNEL_MDU: usize = 425;
 const MAX_WINDOW: u16 = 48;
@@ -15,7 +15,7 @@ pub(crate) enum QueueChannelError {
 
 struct OutboundEnvelope {
     packet: crate::packet::Packet,
-    sent_at: MonoTime,
+    sent_at: Instant,
     tries: u8,
 }
 
@@ -57,7 +57,7 @@ impl ChannelState {
         Ok(raw)
     }
 
-    pub(crate) fn track(&mut self, packet: crate::packet::Packet, now: MonoTime) {
+    pub(crate) fn track(&mut self, packet: crate::packet::Packet, now: Instant) {
         self.outbound.push_back(OutboundEnvelope {
             packet,
             sent_at: now,
@@ -107,16 +107,16 @@ impl ChannelState {
         messages
     }
 
-    fn retry_timeout(tries: u8, rtt: TimeSpan, ring_len: usize) -> TimeSpan {
-        let base = rtt.mul_f64(2.5).max(TimeSpan::from_millis(25));
+    fn retry_timeout(tries: u8, rtt: Duration, ring_len: usize) -> Duration {
+        let base = rtt.mul_f64(2.5).max(Duration::from_millis(25));
         base.mul_f64(1.5_f64.powi(tries.saturating_sub(1) as i32))
             .mul_f64(ring_len as f64 + 1.5)
     }
 
     pub(crate) fn retries(
         &mut self,
-        now: MonoTime,
-        rtt: TimeSpan,
+        now: Instant,
+        rtt: Duration,
     ) -> (Vec<crate::packet::Packet>, bool) {
         let ring_len = self.outbound.len();
         let mut retry = Vec::new();
@@ -136,7 +136,7 @@ impl ChannelState {
         (retry, failed)
     }
 
-    pub(crate) fn next_retry(&self, rtt: TimeSpan) -> Option<MonoTime> {
+    pub(crate) fn next_retry(&self, rtt: Duration) -> Option<Instant> {
         let ring_len = self.outbound.len();
         self.outbound
             .iter()
