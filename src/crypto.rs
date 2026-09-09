@@ -97,20 +97,33 @@ impl EphemeralKeyPair {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 enum DestinationMultiplication {
     #[default]
     Unseen,
     Observed(X25519Public),
-    Prepared(X25519Public, Option<Box<EdwardsBasepointTable>>),
+    Prepared(X25519Public, Option<std::sync::Arc<EdwardsBasepointTable>>),
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SingleDestEncryption {
     destination: DestinationMultiplication,
 }
 
 impl SingleDestEncryption {
+    pub(crate) fn prepare(&mut self, dest_public: &X25519Public) {
+        match &self.destination {
+            DestinationMultiplication::Prepared(key, _) if key == dest_public => {}
+            DestinationMultiplication::Observed(key) if key == dest_public => {
+                let table = MontgomeryPoint(*dest_public.as_bytes())
+                    .to_edwards(0)
+                    .map(|point| std::sync::Arc::new(EdwardsBasepointTable::create(&point)));
+                self.destination = DestinationMultiplication::Prepared(*dest_public, table);
+            }
+            _ => self.destination = DestinationMultiplication::Observed(*dest_public),
+        }
+    }
+
     pub fn encrypt<R: RngCore>(
         &mut self,
         rng: &mut R,
@@ -118,16 +131,7 @@ impl SingleDestEncryption {
         plaintext: &[u8],
     ) -> Vec<u8> {
         let ephemeral = EphemeralKeyPair::generate(rng);
-        match &self.destination {
-            DestinationMultiplication::Prepared(key, _) if key == dest_public => {}
-            DestinationMultiplication::Observed(key) if key == dest_public => {
-                let table = MontgomeryPoint(*dest_public.as_bytes())
-                    .to_edwards(0)
-                    .map(|point| Box::new(EdwardsBasepointTable::create(&point)));
-                self.destination = DestinationMultiplication::Prepared(*dest_public, table);
-            }
-            _ => self.destination = DestinationMultiplication::Observed(*dest_public),
-        }
+        self.prepare(dest_public);
         let shared = match &self.destination {
             DestinationMultiplication::Prepared(_, Some(table)) => table
                 .mul_base_clamped(ephemeral.secret.to_bytes())
@@ -353,7 +357,11 @@ mod tests {
                 reference.fill_bytes(&mut iv);
                 let key = derive_key(&shared, &iv);
                 let expected = encrypt_aes256_token(&key, &iv, &body, &[]);
+                encryption.prepare(&public);
+                let mut copied = encryption.clone();
+                let mut copied_rng = rng.clone();
                 let ciphertext = encryption.encrypt(&mut rng, &public, &body);
+                assert_eq!(copied.encrypt(&mut copied_rng, &public, &body), ciphertext);
                 assert_eq!(&ciphertext[..32], pair.public.as_bytes());
                 assert_eq!(ciphertext[32..], expected);
             }

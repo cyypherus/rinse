@@ -9,19 +9,20 @@ use futures_util::{FutureExt, StreamExt};
 use rand_core::{RngCore, SeedableRng};
 use zeroize::Zeroize;
 
+use crate::PrivateIdentity;
 use crate::api::*;
 use crate::channel::QueueChannelError;
 use crate::interface::{AttachedInterface, OutboundPacket};
 use crate::model::*;
 use crate::timer::{TimerEvent, TimerQueue};
-use crate::{MonoTime, PrivateIdentity};
+use std::time::{Duration, Instant};
 
-const LINK_HANDSHAKE_TIMEOUT: crate::TimeSpan = crate::TimeSpan::from_secs(15);
-const REQUEST_TIMEOUT: crate::TimeSpan = crate::TimeSpan::from_secs(30);
-const SHUTDOWN_GRACE: crate::TimeSpan = crate::TimeSpan::from_secs(5);
+const LINK_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const KEEP_STREAM_OPEN: bool = false;
 const FINISH_STREAM: bool = true;
-const COMMAND_CAPACITY: usize = 256;
+const COMMAND_CAPACITY: usize = 4096;
 const EVENT_CAPACITY: usize = 128;
 const CHANNEL_QUEUE_CAPACITY: usize = 64;
 const MAXIMUM_INTERFACES: usize = 16;
@@ -104,50 +105,42 @@ impl NodeBuilder {
             shutdown,
         };
         let task = NodeTask {
-            started: tokio::time::Instant::now(),
-            owner: NodeOwner {
-                rng,
-                datagram_encryption: crate::crypto::SingleDestEncryption::default(),
-                relays_packets: relay,
-                relay_address,
-                path_table: HashMap::new(),
-                pending_announces: Vec::new(),
-                seen_packets: crate::packet_hashlist::PacketHashlist::new(DUPLICATE_PACKET_HASHES),
-                reverse_table: HashMap::new(),
-                receipts: Vec::new(),
-                pending_outbound_links: HashMap::new(),
-                pending_inbound_links: HashMap::new(),
-                established_links: HashMap::new(),
-                link_table: HashMap::new(),
-                outbound_resources: HashMap::new(),
-                inbound_resources: HashMap::new(),
-                destination_links: HashMap::new(),
-                pending_path_requests: HashMap::new(),
-                discovery_path_requests: HashMap::new(),
-                pending_resource_requests: HashSet::new(),
-                command_receiver: Some(command_receiver),
-                commands_for_new_clients,
-                resource_drop_receiver: Some(resource_drop_receiver),
-                resource_drops_for_new_clients,
-                interfaces,
-                send_operations: FuturesUnordered::new(),
-                close_operations: FuturesUnordered::new(),
-                inbound_packets: VecDeque::new(),
-                timers: TimerQueue::default(),
-                shutdown_tx: Some(shutdown_tx),
-                phase: NodePhase::Running,
-                services: Vec::new(),
-                outbound_request_replies: HashMap::new(),
-                route_waits: HashMap::new(),
-            },
+            rng,
+            datagram_encryption: crate::crypto::SingleDestEncryption::default(),
+            relays_packets: relay,
+            relay_address,
+            path_table: HashMap::new(),
+            pending_announces: Vec::new(),
+            seen_packets: crate::packet_hashlist::PacketHashlist::new(DUPLICATE_PACKET_HASHES),
+            reverse_table: HashMap::new(),
+            receipts: Vec::new(),
+            pending_outbound_links: HashMap::new(),
+            pending_inbound_links: HashMap::new(),
+            established_links: HashMap::new(),
+            link_table: HashMap::new(),
+            outbound_resources: HashMap::new(),
+            inbound_resources: HashMap::new(),
+            destination_links: HashMap::new(),
+            pending_path_requests: HashMap::new(),
+            discovery_path_requests: HashMap::new(),
+            pending_resource_requests: HashSet::new(),
+            command_receiver: Some(command_receiver),
+            commands_for_new_clients,
+            resource_drop_receiver: Some(resource_drop_receiver),
+            resource_drops_for_new_clients,
+            interfaces,
+            send_operations: FuturesUnordered::new(),
+            close_operations: FuturesUnordered::new(),
+            inbound_packets: VecDeque::new(),
+            timers: TimerQueue::default(),
+            shutdown_tx: Some(shutdown_tx),
+            phase: NodePhase::Running,
+            services: Vec::new(),
+            outbound_request_replies: HashMap::new(),
+            route_waits: HashMap::new(),
         };
         Ok((handle, task))
     }
-}
-
-pub struct NodeTask {
-    started: tokio::time::Instant,
-    owner: NodeOwner,
 }
 
 enum NodePhase {
@@ -264,7 +257,7 @@ impl<T, E: Clone> ReceiveQueue<T, E> {
         Ok(())
     }
 
-    fn receive(&mut self, reply: oneshot::Sender<Result<T, E>>) {
+    pub(crate) fn receive(&mut self, reply: oneshot::Sender<Result<T, E>>) {
         if let Some(waiting) = self.waiting_receiver_reply.take()
             && !waiting.is_canceled()
         {
@@ -330,9 +323,7 @@ impl InterfaceSlot {
         self.outbound_bytes += bytes;
         let position = self
             .outbound
-            .iter()
-            .position(|(queued, _)| *queued > priority)
-            .unwrap_or(self.outbound.len());
+            .partition_point(|(queued, _)| *queued <= priority);
         self.outbound.insert(position, (priority, packet));
         Ok(())
     }
@@ -367,7 +358,7 @@ impl InterfaceSlot {
 
 type InterfaceOperation = BoxFuture<'static, (InterfaceId, Result<(), crate::InterfaceError>)>;
 
-pub(crate) struct NodeOwner {
+pub struct NodeTask {
     pub(crate) datagram_encryption: crate::crypto::SingleDestEncryption,
     pub(crate) rng: rand_chacha::ChaCha20Rng,
     pub(crate) relays_packets: bool,
@@ -385,7 +376,7 @@ pub(crate) struct NodeOwner {
     pub(crate) outbound_resources: HashMap<[u8; 32], ([u8; 16], crate::resource::OutboundResource)>,
     pub(crate) inbound_resources: HashMap<[u8; 32], ([u8; 16], crate::resource::InboundResource)>,
     pub(crate) destination_links: HashMap<crate::packet::DestinationAddress, [u8; 16]>,
-    pub(crate) pending_path_requests: HashMap<crate::packet::DestinationAddress, MonoTime>,
+    pub(crate) pending_path_requests: HashMap<crate::packet::DestinationAddress, Instant>,
     pub(crate) discovery_path_requests: HashMap<crate::packet::DestinationAddress, usize>,
     pub(crate) pending_resource_requests: HashSet<([u8; 16], [u8; 32])>,
     command_receiver: Option<async_channel::Receiver<Command>>,
@@ -470,9 +461,30 @@ async fn receive_if_present<T>(
     }
 }
 
+fn poll_inbound(
+    streams: &mut VecDeque<BoxStream<'static, Result<ReceivedPacket, InterfaceId>>>,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<Result<ReceivedPacket, InterfaceId>> {
+    for _ in 0..streams.len() {
+        let mut stream = streams.pop_front().unwrap();
+        let packet = stream.poll_next_unpin(cx);
+        if !matches!(packet, std::task::Poll::Ready(None)) {
+            streams.push_back(stream);
+        }
+        if let std::task::Poll::Ready(Some(packet)) = packet {
+            return std::task::Poll::Ready(packet);
+        }
+    }
+    std::task::Poll::Pending
+}
+
 impl NodeTask {
     pub async fn run(self) -> Result<(), NodeRunError> {
-        let NodeTask { started, mut owner } = self;
+        let mut owner = self;
+        let mut datagrams = Vec::new();
+        let mut packets = Vec::new();
+        let mut deferred_command = None;
+        let mut sends = Vec::new();
         loop {
             owner.schedule_readers();
             owner.schedule_sends();
@@ -481,35 +493,19 @@ impl NodeTask {
                 return result;
             }
             let deadline = owner.timers.next_deadline();
-            let event = {
+            let event = if let Some(command) = deferred_command.take() {
+                RuntimeEvent::Command(Ok(command))
+            } else {
                 let command = receive_if_present(owner.command_receiver.as_ref()).fuse();
                 let resource_dropped =
                     receive_if_present(owner.resource_drop_receiver.as_ref()).fuse();
                 let send = next_operation(&mut owner.send_operations).fuse();
                 let close = next_operation(&mut owner.close_operations).fuse();
-                let inbound = std::future::poll_fn(|cx| {
-                    for _ in 0..owner.inbound_packets.len() {
-                        let mut stream = owner.inbound_packets.pop_front().unwrap();
-                        let packet = stream.poll_next_unpin(cx);
-                        if !matches!(packet, std::task::Poll::Ready(None)) {
-                            owner.inbound_packets.push_back(stream);
-                        }
-                        if let std::task::Poll::Ready(Some(packet)) = packet {
-                            return std::task::Poll::Ready(packet);
-                        }
-                    }
-                    std::task::Poll::Pending
-                })
-                .fuse();
+                let inbound =
+                    std::future::poll_fn(|cx| poll_inbound(&mut owner.inbound_packets, cx)).fuse();
                 let timer = async {
                     match deadline {
-                        Some(deadline) => {
-                            let now = MonoTime::from_micros(started.elapsed().as_micros() as u64);
-                            tokio::time::sleep(
-                                deadline.checked_duration_since(now).unwrap_or_default(),
-                            )
-                            .await
-                        }
+                        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
                         None => std::future::pending().await,
                     }
                 }
@@ -524,8 +520,79 @@ impl NodeTask {
                     _ = timer => RuntimeEvent::Timer,
                 }
             };
-            let now = MonoTime::from_micros(started.elapsed().as_micros() as u64);
+            let now = tokio::time::Instant::now().into_std();
             match event {
+                RuntimeEvent::Command(Ok(Command::SendDestination {
+                    destination,
+                    body,
+                    reply,
+                })) => {
+                    sends.push((destination.into_bytes(), body, reply));
+                    if let Some(receiver) = owner.command_receiver.as_ref() {
+                        while sends.len() < COMMAND_CAPACITY {
+                            match receiver.try_recv() {
+                                Ok(Command::SendDestination {
+                                    destination,
+                                    body,
+                                    reply,
+                                }) => sends.push((destination.into_bytes(), body, reply)),
+                                Ok(command) => {
+                                    deferred_command = Some(command);
+                                    break;
+                                }
+                                Err(
+                                    async_channel::TryRecvError::Empty
+                                    | async_channel::TryRecvError::Closed,
+                                ) => break,
+                            }
+                        }
+                    }
+                    if sends.len() < 32 {
+                        for (destination, body, reply) in sends.drain(..) {
+                            owner.send_destination(destination, body, reply);
+                        }
+                        continue;
+                    }
+                    let jobs: Vec<_> = sends
+                        .drain(..)
+                        .map(|(destination, body, reply)| {
+                            let target = owner.datagram_target(destination);
+                            let mut encryption = owner.datagram_encryption.clone();
+                            if let Ok((_, _, key)) = &target {
+                                owner.datagram_encryption.prepare(key);
+                            }
+                            let mut rng = rand_chacha::ChaCha20Rng::from_rng(&mut owner.rng)
+                                .expect("node random generator");
+                            tokio::spawn(async move {
+                                let outbound = target.map(|(interface, destination, key)| {
+                                    crate::node::ProtocolOutbound {
+                                        interface,
+                                        priority: 0,
+                                        packet: crate::packet::Packet::SingleData {
+                                            hops: 0,
+                                            destination,
+                                            ciphertext: encryption
+                                                .encrypt(&mut rng, &key, &body)
+                                                .into(),
+                                        },
+                                    }
+                                });
+                                (outbound, reply)
+                            })
+                        })
+                        .collect();
+                    for job in jobs {
+                        let (outbound, reply) = job.await.expect("packet encryption task");
+                        let result = outbound.and_then(|outbound| {
+                            owner
+                                .admit_outbound(&outbound)
+                                .map_err(|_| NodeError::InterfaceUnavailable)
+                        });
+                        if reply.send(result).is_err() {
+                            log::debug!("datagram caller dropped");
+                        }
+                    }
+                }
                 RuntimeEvent::Command(Ok(command)) => owner.handle_command(command, now),
                 RuntimeEvent::Command(Err(_)) => {
                     owner.command_receiver = None;
@@ -547,11 +614,31 @@ impl NodeTask {
                     slot.fail();
                 }
                 RuntimeEvent::Inbound(Ok(inbound)) => {
-                    if let Some(packet) =
-                        crate::node::PreparedInbound::parse(inbound.bytes, inbound.interface.0)
-                    {
-                        owner.handle_packet(now, packet);
-                    }
+                    packets.push(Ok(inbound));
+                    std::future::poll_fn(|cx| {
+                        while packets.len() < 8192 {
+                            match poll_inbound(&mut owner.inbound_packets, cx) {
+                                std::task::Poll::Ready(packet) => packets.push(packet),
+                                std::task::Poll::Pending => break,
+                            }
+                        }
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+                    owner
+                        .handle_packets(
+                            packets.drain(..).filter_map(|packet| match packet {
+                                Ok(packet) => crate::node::PreparedInbound::parse(
+                                    packet.bytes,
+                                    packet.interface.0,
+                                )
+                                .map(Ok),
+                                Err(interface) => Some(Err(interface)),
+                            }),
+                            now,
+                            &mut datagrams,
+                        )
+                        .await?;
                 }
                 RuntimeEvent::Timer => owner.expire_timers(now),
             }
@@ -559,7 +646,32 @@ impl NodeTask {
     }
 }
 
-impl NodeOwner {
+impl NodeTask {
+    async fn handle_packets(
+        &mut self,
+        packets: impl IntoIterator<Item = Result<crate::node::PreparedInbound, InterfaceId>>,
+        now: Instant,
+        datagrams: &mut Vec<crate::node::DatagramDelivery>,
+    ) -> Result<(), NodeRunError> {
+        for packet in packets {
+            match packet {
+                Ok(packet) => {
+                    if !matches!(packet.packet, crate::packet::Packet::SingleData { .. }) {
+                        self.deliver_datagrams(datagrams).await;
+                    }
+                    self.handle_packet(now, packet, datagrams);
+                }
+                Err(interface) => self
+                    .interfaces
+                    .get_mut(interface.0)
+                    .ok_or(NodeRunError(()))?
+                    .fail(),
+            }
+        }
+        self.deliver_datagrams(datagrams).await;
+        Ok(())
+    }
+
     fn new_client(&self) -> Option<NodeClient> {
         Some(NodeClient {
             commands: self.commands_for_new_clients.upgrade()?,
@@ -752,7 +864,7 @@ impl NodeOwner {
         }
     }
 
-    fn expire_timers(&mut self, now: MonoTime) {
+    fn expire_timers(&mut self, now: Instant) {
         for _ in 0..COMMAND_CAPACITY {
             let Some(timer) = self.timers.pop_due(now) else {
                 break;
@@ -780,7 +892,7 @@ impl NodeOwner {
         }
     }
 
-    fn handle_command(&mut self, command: Command, now: MonoTime) {
+    fn handle_command(&mut self, command: Command, now: Instant) {
         if !matches!(self.phase, NodePhase::Running) {
             return;
         }
@@ -802,6 +914,7 @@ impl NodeOwner {
             }
             Command::RegisterService { config, reply } => {
                 let ServiceConfig {
+                    event_capacity,
                     name,
                     identity,
                     accepted_request_paths: paths,
@@ -813,18 +926,22 @@ impl NodeOwner {
                 }
                 let destination = identity.destination(&name);
                 let path_values: Vec<_> = paths.iter().map(|path| path.as_str()).collect();
-                let events = ReceiveQueue::new(EVENT_CAPACITY, usize::MAX);
+                let events = Arc::new(std::sync::Mutex::new(ReceiveQueue::new(
+                    event_capacity.get(),
+                    usize::MAX,
+                )));
                 let id = self.add_service(
                     name.as_str(),
                     &path_values,
                     &identity,
                     restart_ratchet,
-                    events,
+                    events.clone(),
                 );
                 let client = self
                     .new_client()
                     .expect("node client disappeared while registering service");
                 let _ = reply.send(Ok(Service {
+                    events,
                     id,
                     destination,
                     registration: ResourceRegistration::new(
@@ -832,13 +949,6 @@ impl NodeOwner {
                         RegisteredResource::Service(id),
                     ),
                 }));
-            }
-            Command::ReceiveService { service, reply } => {
-                if let Some(service) = self.services.get_mut(service.0).and_then(Option::as_mut) {
-                    service.events.receive(reply);
-                } else {
-                    let _ = reply.send(Err(NodeError::ResourceClosed));
-                }
             }
             Command::Announce {
                 service,
@@ -1169,7 +1279,7 @@ impl NodeOwner {
         &mut self,
         destination: [u8; 16],
         reply: oneshot::Sender<Result<Link, NodeError>>,
-        now: MonoTime,
+        now: Instant,
     ) {
         if reply.is_canceled() {
             return;
@@ -1212,7 +1322,7 @@ impl NodeOwner {
         input: bytes::Bytes,
         finish_stream: bool,
         reply: oneshot::Sender<Result<BufferQueued, NodeError>>,
-        now: MonoTime,
+        now: Instant,
     ) {
         if !self
             .established_links
@@ -1257,7 +1367,7 @@ impl NodeOwner {
         }
     }
 
-    fn retry_waiting_operations(&mut self, link: [u8; 16], now: MonoTime) {
+    fn retry_waiting_operations(&mut self, link: [u8; 16], now: Instant) {
         let Some(channel) = self
             .established_links
             .get_mut(&link)
@@ -1291,7 +1401,7 @@ impl NodeOwner {
         link: [u8; 16],
         packet_id: [u8; 32],
         delivery_confirmed: bool,
-        now: MonoTime,
+        now: Instant,
     ) {
         let reply = self
             .established_links
@@ -1339,6 +1449,8 @@ impl NodeOwner {
             .is_some_and(|service| {
                 service
                     .events
+                    .lock()
+                    .unwrap()
                     .push(ServiceEvent::IncomingLink(incoming), 0)
                     .is_ok()
             });
@@ -1391,7 +1503,7 @@ impl NodeOwner {
         request: crate::RequestId,
         path: String,
         body: Vec<u8>,
-        now: MonoTime,
+        now: Instant,
     ) {
         let Some(path) = RequestPath::new(path) else {
             self.close_link(link, LinkCloseReason::ProtocolViolation);
@@ -1454,12 +1566,7 @@ impl NodeOwner {
         }
     }
 
-    pub(crate) fn resolve_route(
-        &mut self,
-        destination: [u8; 16],
-        route_found: bool,
-        now: MonoTime,
-    ) {
+    pub(crate) fn resolve_route(&mut self, destination: [u8; 16], route_found: bool, now: Instant) {
         if let Some(waiters) = self.route_waits.remove(&destination) {
             for reply in waiters {
                 if route_found {
@@ -1583,7 +1690,7 @@ impl NodeOwner {
         }
     }
 
-    fn begin_shutdown(&mut self, now: MonoTime) {
+    fn begin_shutdown(&mut self, now: Instant) {
         if !matches!(self.phase, NodePhase::Running) {
             return;
         }
@@ -1591,7 +1698,11 @@ impl NodeOwner {
             commands.close();
         }
         for service in self.services.iter_mut().flatten() {
-            service.events.close(NodeError::ResourceClosed);
+            service
+                .events
+                .lock()
+                .unwrap()
+                .close(NodeError::ResourceClosed);
         }
         let links = self
             .established_links

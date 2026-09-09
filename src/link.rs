@@ -1,4 +1,4 @@
-use crate::{MonoTime, TimeSpan};
+use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use rand::RngCore;
@@ -188,7 +188,7 @@ pub(crate) struct PendingLink {
     pub responder_signing_key: VerifyingKey,
     pub destination: DestinationAddress,
     pub local_service: Option<ServiceId>,
-    pub request_time: MonoTime,
+    pub request_time: Instant,
     pub(crate) open: Option<crate::runtime::PendingOpenLink>,
 }
 
@@ -213,11 +213,11 @@ pub(crate) enum LocalIdentityState {
 
 pub(crate) struct EstablishedLink {
     pub destination: DestinationAddress,
-    pub(crate) rtt: TimeSpan,
+    pub(crate) rtt: Duration,
     role: ActiveLinkRole,
-    pub last_inbound: MonoTime,
-    pub last_outbound: MonoTime,
-    pub last_keepalive_sent: Option<MonoTime>,
+    pub last_inbound: Instant,
+    pub last_outbound: Instant,
+    pub last_keepalive_sent: Option<Instant>,
     pub remote_identity: Option<DestinationAddress>,
     pub(crate) local_identity: LocalIdentityState,
     pub receiving_interface: usize,
@@ -238,7 +238,7 @@ impl EstablishedLink {
         pending: PendingLink,
         responder_public: &X25519Public,
         receiving_interface: usize,
-        now: MonoTime,
+        now: Instant,
     ) -> Self {
         let shared_key = pending
             .initiator_encryption_secret
@@ -248,7 +248,7 @@ impl EstablishedLink {
         let rtt_ms = now.duration_since(pending.request_time).as_millis() as u64;
         Self {
             destination: pending.destination,
-            rtt: TimeSpan::from_millis(rtt_ms),
+            rtt: Duration::from_millis(rtt_ms),
             role: ActiveLinkRole::Initiator {
                 local_service: pending.local_service,
             },
@@ -273,7 +273,7 @@ impl EstablishedLink {
         initiator_public: &X25519Public,
         initiator_signing_key: VerifyingKey,
         receiving_interface: usize,
-        now: MonoTime,
+        now: Instant,
     ) -> Self {
         let shared_key = responder
             .encryption_secret
@@ -282,7 +282,7 @@ impl EstablishedLink {
         let keys = LinkEncryption::derive_keys(&shared_key, &link_id);
         Self {
             destination: responder.destination,
-            rtt: TimeSpan::from_millis(0),
+            rtt: Duration::from_millis(0),
             role: ActiveLinkRole::Responder {
                 local_service: responder.service,
             },
@@ -409,7 +409,7 @@ mod tests {
         let responder_signing_key = SigningKey::generate(&mut rng);
         let dest: DestinationAddress = [0xAB; 16];
         let link_id: LinkId = [0xCD; 16];
-        let now = MonoTime::from_micros(1_000_000);
+        let now = Instant::now();
 
         let pending = PendingLink {
             link_id,
@@ -456,7 +456,7 @@ mod tests {
         use crate::packet::{Packet, RoutedDestination};
 
         let mut rng = test_rng();
-        let now = MonoTime::from_micros(1_000_000);
+        let now = Instant::now();
 
         let initiator_enc = EphemeralKeyPair::generate(&mut rng);
         let initiator_sig = SigningKey::generate(&mut rng);
@@ -547,8 +547,8 @@ mod tests {
         let dest: DestinationAddress = [0xAB; 16];
         let link_id: LinkId = [0xCD; 16];
 
-        let request_time = MonoTime::from_micros(1_000_000);
-        let proof_time = request_time.checked_add(TimeSpan::from_millis(10)).unwrap();
+        let request_time = Instant::now();
+        let proof_time = request_time.checked_add(Duration::from_millis(10)).unwrap();
 
         let pending = PendingLink {
             link_id,
@@ -564,7 +564,7 @@ mod tests {
         let link =
             EstablishedLink::from_initiator(pending, &responder_keypair.public, 0, proof_time);
 
-        assert!(link.rtt >= TimeSpan::from_millis(10));
+        assert!(link.rtt >= Duration::from_millis(10));
     }
 
     #[test]
@@ -576,7 +576,7 @@ mod tests {
         let responder_signing_key = SigningKey::generate(&mut rng);
         let dest: DestinationAddress = [0xAB; 16];
         let link_id: LinkId = [0xCD; 16];
-        let now = MonoTime::from_micros(1_000_000);
+        let now = Instant::now();
 
         let pending = PendingLink {
             link_id,
@@ -591,13 +591,13 @@ mod tests {
 
         let mut link = EstablishedLink::from_initiator(pending, &responder_keypair.public, 0, now);
 
-        link.rtt = TimeSpan::from_millis(0);
+        link.rtt = Duration::from_millis(0);
         assert_eq!(link.keepalive_interval_secs(), KEEPALIVE_MIN_SECS);
 
-        link.rtt = TimeSpan::from_millis(1750);
+        link.rtt = Duration::from_millis(1750);
         assert_eq!(link.keepalive_interval_secs(), KEEPALIVE_MAX_SECS);
 
-        link.rtt = TimeSpan::from_millis(875);
+        link.rtt = Duration::from_millis(875);
         assert_eq!(link.keepalive_interval_secs(), 180);
 
         assert_eq!(link.stale_time_secs(), 360);

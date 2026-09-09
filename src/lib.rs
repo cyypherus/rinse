@@ -1,6 +1,3 @@
-#[cfg(not(target_os = "macos"))]
-compile_error!("rinse currently supports only macOS");
-
 mod announce;
 mod api;
 mod aspect;
@@ -19,7 +16,6 @@ mod resource;
 mod runtime;
 #[cfg(feature = "tcp")]
 mod tcp;
-mod time;
 mod timer;
 
 #[cfg(feature = "config")]
@@ -41,4 +37,3 @@ pub(crate) use request::WireRequestId;
 pub use runtime::{NodeBuilder, NodeTask};
 #[cfg(feature = "tcp")]
 pub use tcp::TcpHdlcInterface;
-pub(crate) use time::{MonoTime, TimeSpan};

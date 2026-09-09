@@ -48,38 +48,67 @@ fn interfaces() -> (MemoryInterface, MemoryInterface) {
     )
 }
 
-fn node(interface: MemoryInterface) -> (rinse::NodeHandle, rinse::NodeTask) {
-    NodeBuilder::new(NodeConfig::endpoint())
-        .interface(
-            interface,
-            InterfaceLimits::new(65_535, 256, 1_048_576).unwrap(),
+fn node(interface: MemoryInterface, batch_size: usize) -> NodeBuilder {
+    NodeBuilder::new(NodeConfig::endpoint()).interface(
+        interface,
+        InterfaceLimits::new(
+            65_535,
+            batch_size.max(256),
+            (batch_size * 512).max(1_048_576),
         )
-        .build()
-        .unwrap()
+        .unwrap(),
+    )
+}
+
+async fn profile_future<F: std::future::Future>(name: &'static str, future: F) -> F::Output {
+    if std::env::var_os("RINSE_ASYNC_PROFILE").is_none() {
+        return future.await;
+    }
+    let mut future = std::pin::pin!(future);
+    let started = Instant::now();
+    let mut busy = std::time::Duration::ZERO;
+    let mut polls = 0u64;
+    let mut pending = 0u64;
+    let result = std::future::poll_fn(|cx| {
+        let entered = Instant::now();
+        let result = future.as_mut().poll(cx);
+        busy += entered.elapsed();
+        polls += 1;
+        pending += u64::from(result.is_pending());
+        result
+    })
+    .await;
+    eprintln!(
+        "async {name}: elapsed={:?} busy={busy:?} polls={polls} pending={pending}",
+        started.elapsed()
+    );
+    result
 }
 
 fn throughput(criterion: &mut Criterion) {
-    datagram_throughput(
-        criterion,
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap(),
-        "single_thread",
-    );
-    datagram_throughput(
-        criterion,
-        tokio::runtime::Runtime::new().unwrap(),
-        "runtime",
-    );
+    for (name, concurrency) in [("sequential", 1), ("concurrent", 16384)] {
+        datagram_throughput(
+            criterion,
+            tokio::runtime::Runtime::new().unwrap(),
+            name,
+            concurrency,
+        );
+    }
 }
 
-fn datagram_throughput(criterion: &mut Criterion, runtime: tokio::runtime::Runtime, name: &str) {
+fn datagram_throughput(
+    criterion: &mut Criterion,
+    runtime: tokio::runtime::Runtime,
+    name: &str,
+    window: usize,
+) {
     let (client_interface, server_interface) = interfaces();
-    let (client_node, client_task) = node(client_interface);
-    let (server_node, server_task) = node(server_interface);
-    let client_running = runtime.spawn(client_task.run());
-    let server_running = runtime.spawn(server_task.run());
+    let client_builder = node(client_interface, window);
+    let server_builder = node(server_interface, window);
+    let (client_node, client_task) = client_builder.build().unwrap();
+    let (server_node, server_task) = server_builder.build().unwrap();
+    let client_running = runtime.spawn(profile_future("client", client_task.run()));
+    let server_running = runtime.spawn(profile_future("server", server_task.run()));
     let (client_service, mut server_service) = runtime.block_on(async {
         let mut client_service = client_node
             .register_service(
@@ -89,7 +118,8 @@ fn datagram_throughput(criterion: &mut Criterion, runtime: tokio::runtime::Runti
                     [],
                     None,
                 )
-                .unwrap(),
+                .unwrap()
+                .event_capacity(std::num::NonZeroUsize::new(window.max(128)).unwrap()),
             )
             .await
             .unwrap();
@@ -101,7 +131,8 @@ fn datagram_throughput(criterion: &mut Criterion, runtime: tokio::runtime::Runti
                     [],
                     None,
                 )
-                .unwrap(),
+                .unwrap()
+                .event_capacity(std::num::NonZeroUsize::new(window.max(128)).unwrap()),
             )
             .await
             .unwrap();
@@ -120,7 +151,7 @@ fn datagram_throughput(criterion: &mut Criterion, runtime: tokio::runtime::Runti
         (client_service, server_service)
     });
     let destination = server_service.destination();
-    let (inflight, delivered) = async_channel::bounded(32);
+    let (inflight, delivered) = async_channel::bounded(window.max(32));
     let mut group = criterion.benchmark_group(name);
     group.throughput(Throughput::Elements(1));
     for size in [9, 256, rinse::NodeHandle::MAX_DATAGRAM_BYTES] {
@@ -134,9 +165,22 @@ fn datagram_throughput(criterion: &mut Criterion, runtime: tokio::runtime::Runti
                         let started = Instant::now();
                         tokio::join!(
                             async {
-                                for _ in 0..packets {
-                                    inflight.send(()).await.unwrap();
-                                    client_node.send(destination, body.clone()).await.unwrap();
+                                if window == 1 {
+                                    for _ in 0..packets {
+                                        inflight.send(()).await.unwrap();
+                                        client_node.send(destination, body.clone()).await.unwrap();
+                                    }
+                                    return;
+                                }
+                                use futures_util::StreamExt;
+                                let mut sends = futures_util::stream::iter(0..packets)
+                                    .map(|_| async {
+                                        inflight.send(()).await.unwrap();
+                                        client_node.send(destination, body.clone()).await
+                                    })
+                                    .buffer_unordered(window);
+                                while let Some(result) = sends.next().await {
+                                    result.unwrap();
                                 }
                             },
                             async {
